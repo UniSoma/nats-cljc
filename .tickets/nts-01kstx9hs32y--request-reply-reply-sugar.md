@@ -6,9 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:19.427377383Z'
-updated: '2026-05-29T22:22:19.427377383Z'
-tags:
-- needs-triage
+updated: '2026-05-29T22:34:54.905678172Z'
 acceptance:
 - title: '`(nats/request conn subject data opts)` resolves to a decoded `Message` on all three platforms'
   done: false

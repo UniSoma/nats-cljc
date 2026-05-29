@@ -6,9 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:23:00.986432509Z'
-updated: '2026-05-29T22:23:00.986432509Z'
-tags:
-- needs-triage
+updated: '2026-05-29T23:03:12.862107666Z'
 acceptance:
 - title: Each canonical error `:type` is reproduced and asserted with identical shape on both `io.nats:jnats` and `@nats-io/nats-core`
   done: false
@@ -21,7 +19,8 @@ acceptance:
 deps:
 - nts-01kstx9hs32y
 - nts-01kstx9pbqe5
-- nts-01kstxa377qb
+- nts-01kstzmd6d2v
+- nts-01kstzmd96ms
 ---
 
 ## Description

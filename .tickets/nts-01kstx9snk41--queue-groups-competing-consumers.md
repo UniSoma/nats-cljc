@@ -6,9 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:27.507161086Z'
-updated: '2026-05-29T22:22:27.507161086Z'
-tags:
-- needs-triage
+updated: '2026-05-29T22:34:55.069565150Z'
 acceptance:
 - title: Multiple subscriptions sharing a `:queue` group each receive a disjoint share — each message delivered to exactly one member
   done: false

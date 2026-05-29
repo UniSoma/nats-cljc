@@ -6,9 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:24.119127883Z'
-updated: '2026-05-29T22:22:24.119127883Z'
-tags:
-- needs-triage
+updated: '2026-05-29T22:34:54.990175609Z'
 acceptance:
 - title: Each built-in codec (`:transit` `:json` `:edn` `:string` `:bytes`) round-trips a representative value on all three platforms
   done: false

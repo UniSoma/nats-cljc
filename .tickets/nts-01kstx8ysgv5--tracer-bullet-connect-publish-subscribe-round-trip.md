@@ -6,9 +6,7 @@ type: feature
 priority: 0
 mode: afk
 created: '2026-05-29T22:21:59.983903495Z'
-updated: '2026-05-29T22:21:59.983903495Z'
-tags:
-- needs-triage
+updated: '2026-05-29T22:34:54.822577572Z'
 acceptance:
 - title: '`(nats/connect {:servers ...})` resolves to a `Connection` on JVM, browser, and Node'
   done: false
