@@ -1,0 +1,12 @@
+/target
+/out
+/.cpcache
+/.shadow-cljs
+/node_modules
+/.nrepl-port
+*.log
+
+# tool caches
+/.clj-kondo/.cache
+/.clj-kondo/imports
+/.lsp

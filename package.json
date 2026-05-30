@@ -1,0 +1,15 @@
+{
+  "name": "nats-cljc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Dev/test toolchain for nats-cljc (shadow-cljs + karma).",
+  "dependencies": {
+    "@nats-io/nats-core": "3.3.1"
+  },
+  "devDependencies": {
+    "shadow-cljs": "3.4.11",
+    "karma": "6.4.4",
+    "karma-chrome-launcher": "3.2.0",
+    "karma-cljs-test": "0.1.0"
+  }
+}

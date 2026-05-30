@@ -1,25 +1,25 @@
 ---
 id: nts-01kstx8jppcc
 title: Project scaffold + green CI skeleton
-status: open
+status: in_progress
 type: chore
 priority: 0
 mode: afk
 created: '2026-05-29T22:21:47.606541012Z'
-updated: '2026-05-30T01:38:42.255223682Z'
+updated: '2026-05-30T01:50:54.658043381Z'
 acceptance:
 - title: 'JVM build: `deps.edn` resolves `io.nats:jnats` 2.x + promesa and the `tools.build` script produces a jar'
-  done: false
+  done: true
 - title: 'CLJS build: `shadow-cljs` compiles the `:browser` and `:node` test targets'
-  done: false
+  done: true
 - title: '`deps.cljs` declares the npm dependency `@nats-io/nats-core`'
-  done: false
+  done: true
 - title: CI matrix runs JVM + Node + browser-headless jobs, each starting a `nats-server` with the websocket listener enabled (`ws://`)
   done: false
 - title: CI is green on a trivial build across all three jobs
   done: false
 - title: '`LICENSE` is Apache-2.0 and the build coordinate is `io.github.UniSoma/nats-cljc`'
-  done: false
+  done: true
 - title: The browser-headless CI job runs cljs.test under the shadow-cljs :karma target on headless Chrome (karma-chrome-launcher), green
   done: false
 ---
@@ -67,3 +67,15 @@ License metadata for the pom (so Clojars/Maven display Apache-2.0, not just a LI
                               [:distribution "repo"]]]]})
 
 LICENSE (Apache-2.0, verbatim from apache.org) and NOTICE (Copyright 2026 UniSoma) already committed at repo root.
+
+**2026-05-30T01:50:54.658043381Z**
+
+Scaffold implemented and verified locally (clojure 1.12.5 / Java 25 / Node 24):
+- clj -T:build jar -> target/nats-cljc-0.1.0-SNAPSHOT.jar; pom carries Apache-2.0 license + coordinate io.github.UniSoma/nats-cljc.
+- clj -X:test green (1/1).
+- shadow-cljs :node target compiles + 'node target/node-tests.js' green (1/1).
+- shadow-cljs :browser (:karma) target compiles; output target/karma-test.js has shadow.test.karma init.
+- clj-kondo clean (0/0). Remote org is github.com:UniSoma -> coordinate case matches.
+Files: deps.edn, build.clj, shadow-cljs.edn, src/deps.cljs, package.json, karma.conf.js, ci/nats.conf, .github/workflows/ci.yml, src+test trivial ns, .gitignore.
+
+Remaining 3 ACs (CI matrix runs; all-three green; browser-headless karma green on Chrome) need an actual CI run — local box has no Chrome and CI hasn't run yet. Pending first push.

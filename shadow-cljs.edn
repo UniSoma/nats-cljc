@@ -1,0 +1,16 @@
+;; ClojureScript build. Classpath + deps come from deps.edn's :cljs alias.
+{:deps {:aliases [:cljs]}
+
+ :builds
+ {;; Node test target: `shadow-cljs compile node` -> `node target/node-tests.js`
+  :node
+  {:target    :node-test
+   :output-to "target/node-tests.js"
+   :ns-regexp "-test$"}
+
+  ;; Browser test target: runs cljs.test under headless Chrome via karma
+  ;; (`shadow-cljs compile browser` -> `karma start --single-run`).
+  :browser
+  {:target    :karma
+   :output-to "target/karma-test.js"
+   :ns-regexp "-test$"}}}
