@@ -1,12 +1,13 @@
 ---
 id: nts-01kstx8jppcc
 title: Project scaffold + green CI skeleton
-status: in_progress
+status: closed
 type: chore
 priority: 0
 mode: afk
 created: '2026-05-29T22:21:47.606541012Z'
-updated: '2026-05-30T01:50:54.658043381Z'
+updated: '2026-05-30T01:56:33.319121800Z'
+closed: '2026-05-30T01:56:33.319121800Z'
 acceptance:
 - title: 'JVM build: `deps.edn` resolves `io.nats:jnats` 2.x + promesa and the `tools.build` script produces a jar'
   done: true
@@ -15,13 +16,13 @@ acceptance:
 - title: '`deps.cljs` declares the npm dependency `@nats-io/nats-core`'
   done: true
 - title: CI matrix runs JVM + Node + browser-headless jobs, each starting a `nats-server` with the websocket listener enabled (`ws://`)
-  done: false
+  done: true
 - title: CI is green on a trivial build across all three jobs
-  done: false
+  done: true
 - title: '`LICENSE` is Apache-2.0 and the build coordinate is `io.github.UniSoma/nats-cljc`'
   done: true
 - title: The browser-headless CI job runs cljs.test under the shadow-cljs :karma target on headless Chrome (karma-chrome-launcher), green
-  done: false
+  done: true
 ---
 
 ## Description
@@ -79,3 +80,7 @@ Scaffold implemented and verified locally (clojure 1.12.5 / Java 25 / Node 24):
 Files: deps.edn, build.clj, shadow-cljs.edn, src/deps.cljs, package.json, karma.conf.js, ci/nats.conf, .github/workflows/ci.yml, src+test trivial ns, .gitignore.
 
 Remaining 3 ACs (CI matrix runs; all-three green; browser-headless karma green on Chrome) need an actual CI run — local box has no Chrome and CI hasn't run yet. Pending first push.
+
+**2026-05-30T01:56:33.319121800Z**
+
+Scaffold + green CI shipped (merged to main as 46eb802). JVM (jnats 2.25.3 + promesa 11.0.678, tools.build jar with Apache-2.0 pom + io.github.UniSoma/nats-cljc), CLJS shadow-cljs :node + :browser/:karma targets, deps.cljs npm @nats-io/nats-core 3.3.1. 3-job CI matrix (jvm/node/browser-headless), each starting nats-server v2.14.1 with the ws:// listener; all green on GitHub. No NATS behavior yet — substrate for the tracer bullet.

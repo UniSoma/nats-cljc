@@ -40,3 +40,18 @@ RUN bbin install https://github.com/realgenekim/clj-surgeon.git --git/sha "${CLJ
 ARG KNOT_VERSION=0.6.0
 RUN bbin install https://github.com/UniSoma/knot.git --tag "v${KNOT_VERSION}"
 # <<< clojure-dev stuff (managed) <<<
+
+# nats-server (ws:// listener) for local integration tests — pinned to CI's version.
+ARG NATS_SERVER_VERSION=2.14.1
+RUN curl -fsSL "https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/nats-server-v${NATS_SERVER_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp; \
+    mv "/tmp/nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server" /usr/local/bin/; \
+    rm -rf "/tmp/nats-server-v${NATS_SERVER_VERSION}-linux-amd64"; \
+    nats-server --version
+
+# nats CLI for poking the server during development/debugging.
+ARG NATS_CLI_VERSION=0.4.0
+RUN curl -fsSL "https://github.com/nats-io/natscli/releases/download/v${NATS_CLI_VERSION}/nats-${NATS_CLI_VERSION}-linux-amd64.zip" -o /tmp/nats-cli.zip; \
+    unzip -q /tmp/nats-cli.zip -d /tmp; \
+    mv "/tmp/nats-${NATS_CLI_VERSION}-linux-amd64/nats" /usr/local/bin/; \
+    rm -rf /tmp/nats-cli.zip "/tmp/nats-${NATS_CLI_VERSION}-linux-amd64"; \
+    nats --version
