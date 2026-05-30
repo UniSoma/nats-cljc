@@ -31,12 +31,12 @@ jobs:
             node: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Cache resolved Clojure deps (Maven artifacts + git libs) across runs.
       # All three jobs hit the JVM toolchain, so every job benefits.
       - name: Cache Clojure deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.m2/repository
@@ -56,16 +56,16 @@ jobs:
           echo "nats-server started with ws:// listener on :8080"
 
       # shadow-cljs and tools.build both run on the JVM, so all jobs need it.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
 
-      - uses: DeLaGuardo/setup-clojure@12.5
+      - uses: DeLaGuardo/setup-clojure@13.6.1
         with:
           cli: latest
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         if: matrix.node
         with:
           node-version: '20'
