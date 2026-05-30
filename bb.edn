@@ -28,7 +28,7 @@
    :task (shell "clj-kondo --lint src test")}
 
   pre_start
-  {:doc "Start dev daemons (idempotent) — nREPL :7888 + the anon/token/user-pass nats-servers. Backs `bb pre_start` in .aishell/config.yaml."
+  {:doc "Start dev daemons (idempotent) — nREPL :7888 + the anon/token/users/jwt nats-servers. Backs `bb pre_start` in .aishell/config.yaml."
    :requires ([babashka.process :as p]
               [clojure.string :as str])
    :task (let [listening? (fn [port]
@@ -42,4 +42,5 @@
            (daemon 7888 ["bb" "nrepl-server" "7888"])
            (daemon 4222 ["nats-server" "-c" "ci/nats.conf"])
            (daemon 4223 ["nats-server" "-c" "ci/nats-token.conf"])
-           (daemon 4224 ["nats-server" "-c" "ci/nats-userpass.conf"]))}}}
+           (daemon 4224 ["nats-server" "-c" "ci/nats-users.conf"])
+           (daemon 4225 ["nats-server" "-c" "ci/nats-jwt.conf"]))}}}

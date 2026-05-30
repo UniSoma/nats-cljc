@@ -12,6 +12,9 @@
   ;; awaits one-shot promises with it. Dev-scoped — never reaches the pom.
   :test
   {:extra-paths ["test"]
+   ;; Silences JDK 24+ native-access warnings from jnats' BouncyCastle (Ed25519,
+   ;; used by the nkey/JWT legs). Exists since JDK 16, so a no-op on CI's JDK 21.
+   :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
    :extra-deps  {io.github.cognitect-labs/test-runner
                  {:git/tag "v0.5.1"
                   :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}

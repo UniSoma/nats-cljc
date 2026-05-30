@@ -55,3 +55,13 @@ RUN curl -fsSL "https://github.com/nats-io/natscli/releases/download/v${NATS_CLI
     mv "/tmp/nats-${NATS_CLI_VERSION}-linux-amd64/nats" /usr/local/bin/; \
     rm -rf /tmp/nats-cli.zip "/tmp/nats-${NATS_CLI_VERSION}-linux-amd64"; \
     nats --version
+
+# nsc generates the nkey / JWT / creds fixtures for the advanced-auth test legs
+# (one-time, at fixture-authoring time — CI only starts nats-server against the
+# checked-in ci/nats-*.conf, so it needs nsc nowhere).
+ARG NSC_VERSION=2.14.0
+RUN curl -fsSL "https://github.com/nats-io/nsc/releases/download/v${NSC_VERSION}/nsc-linux-amd64.zip" -o /tmp/nsc.zip; \
+    unzip -q /tmp/nsc.zip -d /tmp/nsc; \
+    mv /tmp/nsc/nsc /usr/local/bin/; \
+    rm -rf /tmp/nsc.zip /tmp/nsc; \
+    nsc --version

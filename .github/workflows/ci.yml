@@ -45,20 +45,23 @@ jobs:
           key: ${{ runner.os }}-cljdeps-${{ hashFiles('deps.edn') }}
           restore-keys: ${{ runner.os }}-cljdeps-
 
-      # Every job runs three NATS servers, each WebSocket-enabled on its own
-      # ports: anonymous (4222/8080), token (4223/8081), and user/password
-      # (4224/8082). One auth method per server, so the auth legs each get a
-      # dedicated server (see ci/nats-*.conf).
-      - name: Install and start nats-servers (anonymous + token + user/pass)
+      # Every job runs four NATS servers, each WebSocket-enabled on its own
+      # ports: anonymous (4222/8080), token (4223/8081), static users
+      # (4224/8082), and JWT/operator (4225/8083). NATS forces anonymous, token,
+      # and operator/JWT auth onto separate servers, but static users combine —
+      # so the user/password and nkey legs share ci/nats-users.conf, and the jwt
+      # server serves both the {:jwt :seed} and {:creds} legs (see ci/nats-*.conf).
+      - name: Install and start nats-servers (anon + token + users + jwt)
         run: |
           curl -sSL https://github.com/nats-io/nats-server/releases/download/v2.14.1/nats-server-v2.14.1-linux-amd64.tar.gz | tar xz
           sudo mv nats-server-v2.14.1-linux-amd64/nats-server /usr/local/bin/nats-server
           nats-server --version
-          nats-server -c ci/nats.conf          > nats-server.log          2>&1 &
-          nats-server -c ci/nats-token.conf    > nats-server-token.log     2>&1 &
-          nats-server -c ci/nats-userpass.conf > nats-server-userpass.log  2>&1 &
+          nats-server -c ci/nats.conf       > nats-server.log        2>&1 &
+          nats-server -c ci/nats-token.conf > nats-server-token.log  2>&1 &
+          nats-server -c ci/nats-users.conf > nats-server-users.log  2>&1 &
+          nats-server -c ci/nats-jwt.conf   > nats-server-jwt.log    2>&1 &
           sleep 1
-          echo "nats-servers started: anon :8080, token :8081, user/pass :8082 (ws)"
+          echo "nats-servers started: anon :8080, token :8081, users :8082, jwt :8083 (ws)"
 
       # shadow-cljs and tools.build both run on the JVM, so all jobs need it.
       - uses: actions/setup-java@v5
