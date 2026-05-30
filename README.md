@@ -25,7 +25,7 @@ There are good NATS wrappers for the JVM (e.g. [clj-nats](https://github.com/cjo
 io.github.UniSoma/nats-cljc {:mvn/version "0.1.0"}
 ```
 
-That coordinate pulls in nats-cljc's runtime dependencies transitively — **[promesa](https://github.com/funcool/promesa)** (the async value your own code awaits), the JVM client **`io.nats:jnats`**, and **Transit** (`com.cognitect/transit-clj` / `transit-cljs`, required by the default `:transit` codec). Of these, promesa is the only one your code touches directly. On ClojureScript you additionally install the JS client yourself (shadow-cljs reads it from our `deps.cljs`):
+That coordinate pulls in only the JVM client **`io.nats:jnats`** transitively. It deliberately forces **no other runtime dependency** — no async library (one-shot operations return the platform-native promise; see [Composing results](#composing-results)) and no serialization library (the default `:edn` codec uses only Clojure core; see [Codecs](#codecs)). On ClojureScript you additionally install the JS client yourself (shadow-cljs reads it from our `deps.cljs`):
 
 ```
 npm install @nats-io/nats-core
@@ -35,7 +35,21 @@ npm install @nats-io/nats-core
 
 - **One-shot operations return a promise** (`connect`, `request`, `flush`, `drain`, `close`). It's the platform-native promise — a `js/Promise` on CLJS, a `CompletableFuture` on the JVM — so portable code awaits it with [promesa](https://github.com/funcool/promesa), and CLJS-only code can `await` the *same* value natively.
 - **Subscriptions deliver to a handler** — `(fn [message] …)` — called once per message.
-- **Everything is data.** Payloads are encoded through a **codec** (`:transit` by default); messages are plain maps; errors are `ex-info` with a canonical `:type`.
+- **Everything is data.** Payloads are encoded through a **codec** (`:edn` by default); messages are plain maps; errors are `ex-info` with a canonical `:type`.
+
+---
+
+## Composing results
+
+One-shot operations return the **platform-native promise** — a `js/Promise` on ClojureScript, a `CompletableFuture` on the JVM. nats-cljc bundles **no** async library to compose them, so you pick the style you want; because the return type is native (not a promesa type), these interoperate freely and the choice is never imposed by the library:
+
+- **Portable (recommended) — [promesa](https://github.com/funcool/promesa).** One source that awaits on every platform. Add it to your own deps:
+  ```clojure
+  funcool/promesa {:mvn/version "11.0.678"}
+  ```
+  then use `p/let` / `p/catch` as shown throughout this README.
+- **ClojureScript only — native `await`** (1.12.145+), on the very same value — see [below](#clojurescript-only-native-await).
+- **JVM only — `deref`.** `@(nats/connect …)` blocks for the result; or use the [blocking convenience layer](#jvm-only-blocking-convenience-layer) for synchronous ergonomics throughout.
 
 ---
 
@@ -79,7 +93,7 @@ npm install @nats-io/nats-core
 (nats/connect
   {:servers   ["wss://a:8443" "wss://b:8443"]  ; string or vector (a cluster)
    :name      "orders-service"
-   :codec     :transit                         ; default codec for this connection
+   :codec     :edn                             ; default codec for this connection
    :auth      {:token "…"}                      ; or {:user … :pass …} / {:nkey … :seed …}
                                                 ; / {:jwt … :seed …} / {:creds "<string content>"}
    :reconnect {:max 10 :wait-ms 2000 :jitter-ms 100}
@@ -123,15 +137,27 @@ A delivered or published message is a plain map. `:data` is the **decoded** valu
 
 ## Codecs
 
-Default is `:transit`. Override per connection or per call. Built-ins: `:transit` · `:json` · `:edn` · `:string` · `:bytes`.
+The default is **`:edn`** — structured Clojure data round-trips with zero added dependencies. Override per connection or per call.
+
+**Built-in (dependency-free):** `:edn` (default) · `:string` (UTF-8) · `:bytes` (passthrough — `:data` is the platform-native byte type).
+
+**Opt-in (add the dependency, then require the codec namespace):** `:transit` and `:json` are not forced on consumers (see ADR 0004); you bring the dependency only if you use them.
 
 ```clojure
-;; a subject shared with a non-Clojure service: speak plain JSON / raw bytes
-(nats/publish conn "metrics.report" {:cpu 0.7} {:codec :json})
+;; deps.edn — for :transit
+com.cognitect/transit-clj {:mvn/version "1.0.333"}   ; CLJS: com.cognitect/transit-cljs
+
+;; require the codec ns once at startup so the keyword resolves
+(require 'nats-cljc.codec.transit)
+(nats/publish conn "metrics.report" {:cpu 0.7} {:codec :transit})
+```
+
+```clojure
+;; a subject shared with a non-Clojure service: speak raw bytes / UTF-8
 (nats/subscribe conn "sensor.raw" handle-bytes {:codec :bytes})
 ```
 
-Custom codecs implement a small protocol (`encode`/`decode`) and can be passed wherever a codec keyword is accepted.
+Custom codecs implement a small protocol (`encode`/`decode`) and can be passed wherever a codec keyword is accepted — the same registry the opt-in codecs use.
 
 ## Connection status & errors
 

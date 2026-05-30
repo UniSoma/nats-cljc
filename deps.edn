@@ -1,16 +1,21 @@
 {:paths ["src"]
 
+ ;; Runtime deps only. promesa is NOT here on purpose (ADR 0002): the library
+ ;; returns platform-native promises and never composes them internally, so it
+ ;; forces no async dependency on consumers. promesa is a test/dev dep below.
  :deps {org.clojure/clojure {:mvn/version "1.12.5"}
-        io.nats/jnats        {:mvn/version "2.25.3"}
-        funcool/promesa      {:mvn/version "11.0.678"}}
+        io.nats/jnats        {:mvn/version "2.25.3"}}
 
  :aliases
  {;; JVM tests: clj -X:test
+  ;; promesa appears in test aliases only: the portable .cljc round-trip suite
+  ;; awaits one-shot promises with it. Dev-scoped — never reaches the pom.
   :test
   {:extra-paths ["test"]
    :extra-deps  {io.github.cognitect-labs/test-runner
                  {:git/tag "v0.5.1"
-                  :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
+                  :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}
+                 funcool/promesa {:mvn/version "11.0.678"}}
    :main-opts   ["-m" "cognitect.test-runner"]
    :exec-fn     cognitect.test-runner.api/test}
 
@@ -18,7 +23,8 @@
   :cljs
   {:extra-paths ["test"]
    :extra-deps  {org.clojure/clojurescript {:mvn/version "1.12.145"}
-                 thheller/shadow-cljs      {:mvn/version "3.4.11"}}}
+                 thheller/shadow-cljs      {:mvn/version "3.4.11"}
+                 funcool/promesa           {:mvn/version "11.0.678"}}}
 
   ;; Build/jar: clj -T:build jar
   :build

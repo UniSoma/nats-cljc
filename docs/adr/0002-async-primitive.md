@@ -1,11 +1,11 @@
-# promesa promises for one-shots, callback handlers for subscriptions
+# Native promises for one-shots, callback handlers for subscriptions
 
 The portable non-blocking core (ADR 0001) needs a cross-platform async primitive, and NATS operations come in two distinct shapes. We split them:
 
-- **One-shot operations** (`connect`, `request`, `publish`-with-ack, `flush`, `close`, …) return a **promise**. It is the platform-native promise type — `js/Promise` on ClojureScript, `CompletableFuture` on the JVM — and therefore promesa-compatible on both, and natively `await`-able on ClojureScript (see below).
+- **One-shot operations** (`connect`, `request`, `publish`-with-ack, `flush`, `close`, …) return a **promise**. It is the platform-native promise type — `js/Promise` on ClojureScript, `CompletableFuture` on the JVM — natively `await`-able on ClojureScript (see below), `deref`-able on the JVM, and composable across both platforms with promesa (which operates *on* these native types).
 - **Subscriptions** deliver each message to a **handler** callback, `(fn [msg] …)`, for as long as the subscription is active.
 
-core.async and missionary are **not** the core primitive; they are planned as **opt-in adapters** layered on top later.
+**The library forces no async dependency on consumers.** Because the return type is the *native* promise — not a promesa type — the library never needs promesa to build or compose it: every internal transform (decode a `request` reply, normalize an error) is native interop quarantined in the per-platform `impl.*` namespaces (ADR 0005). promesa is therefore a **recommended, not required**, way to consume the API portably, declared only in the library's test/dev aliases (it drives the portable `.cljc` round-trip suite). A consumer who wants one-source-for-both-platforms composition adds `funcool/promesa` themselves; a CLJS-only consumer can use native `await`, a JVM-only consumer `deref`, and core.async/missionary remain **opt-in adapters** layered on top later. None of these is imposed by depending on nats-cljc.
 
 ## Considered options
 
@@ -15,6 +15,7 @@ core.async and missionary are **not** the core primitive; they are planned as **
 
 ## Consequences
 
-- The consumer dependency floor is **promesa** (one cross-platform dependency); core.async is never forced on anyone.
+- The consumer dependency floor is **just the native NATS client** (`jnats` on the JVM, `@nats-io/nats-core` on CLJS). No async library — not promesa, not core.async — is forced on anyone; promesa is the documented *recommendation* for portable composition, brought in by the consumer when wanted.
+- Owning a recommendation we don't ship means it must stay documented and version-tested: the README shows the promesa path alongside the native `await`/`deref` fallbacks, and the test aliases pin the promesa version the suite runs against.
 - The returned promise composes with ClojureScript 1.12.145's native `^:async`/`await`, so CLJS-only code gets a zero-ceremony native consumption path on the very same object that portable code awaits via promesa macros.
 - A bare callback cannot carry backpressure. JetStream **pull** consumers (Phase 2) will therefore be delivered through a channel/missionary adapter rather than a plain handler, because flow control matters there.
