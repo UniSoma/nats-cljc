@@ -1,0 +1,45 @@
+;; Babashka task runner: a thin orchestration layer over the existing test/lint
+;; commands (docs/agents/running-tests.md). bb only shells out — JVM tests and
+;; shadow-cljs still run on the real JVM. `bb tasks` lists everything.
+;;
+;; Local dev runs the JVM + Node legs; the browser leg is CI-only (ADR 0010), so
+;; `test` is jvm + node and `test:browser` is a CI-facing / opt-in wrapper.
+{:tasks
+ {test:jvm
+  {:doc "JVM test leg — clojure -X:test (needs a ws-enabled nats-server)."
+   :task (shell "clojure -X:test")}
+
+  test:node
+  {:doc "Node test leg — shadow-cljs compile + node (needs a ws-enabled nats-server)."
+   :task (do (shell "npx shadow-cljs -A:silence-unsafe compile node")
+             (shell "node target/node-tests.js"))}
+
+  test:browser
+  {:doc "Browser-headless leg — karma (CI-facing/opt-in; needs Chrome, honors $CHROME_BIN). Not part of `test` (ADR 0010)."
+   :task (do (shell "npx shadow-cljs -A:silence-unsafe compile browser")
+             (shell "npx karma start --single-run"))}
+
+  test
+  {:doc "Local legs: JVM + Node (browser is CI-only, ADR 0010)."
+   :depends [test:jvm test:node]}
+
+  lint
+  {:doc "Lint src + test with clj-kondo."
+   :task (shell "clj-kondo --lint src test")}
+
+  pre_start
+  {:doc "Start dev daemons (idempotent) — nREPL :7888 + the anon/token/user-pass nats-servers. Backs `bb pre_start` in .aishell/config.yaml."
+   :requires ([babashka.process :as p]
+              [clojure.string :as str])
+   :task (let [listening? (fn [port]
+                            (try (.close (java.net.Socket. "127.0.0.1" (int port))) true
+                                 (catch java.io.IOException _ false)))
+               daemon     (fn [port cmd]
+                            (if (listening? port)
+                              (println (str "pre_start: :" port " already listening — skip"))
+                              (do (println (str "pre_start: starting " (str/join " " cmd)))
+                                  (p/process cmd {:out :inherit :err :inherit}))))]
+           (daemon 7888 ["bb" "nrepl-server" "7888"])
+           (daemon 4222 ["nats-server" "-c" "ci/nats.conf"])
+           (daemon 4223 ["nats-server" "-c" "ci/nats-token.conf"])
+           (daemon 4224 ["nats-server" "-c" "ci/nats-userpass.conf"]))}}}

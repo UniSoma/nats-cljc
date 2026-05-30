@@ -26,6 +26,15 @@
                  thheller/shadow-cljs      {:mvn/version "3.4.11"}
                  funcool/promesa           {:mvn/version "11.0.678"}}}
 
+  ;; Opt-in JVM flag for shadow-cljs runs (the bb test:node / test:browser tasks
+  ;; layer it on with `-A:silence-unsafe`). shadow-cljs' bundled closure-compiler
+  ;; calls deprecated sun.misc.Unsafe methods; JDK 23+ warns on first use, and
+  ;; explicitly allowing it silences the warning. Kept OUT of :cljs on purpose:
+  ;; the flag does not exist before JDK 23, so CI (JDK 21) — which runs plain
+  ;; `npx shadow-cljs` without this alias — would reject it.
+  :silence-unsafe
+  {:jvm-opts ["--sun-misc-unsafe-memory-access=allow"]}
+
   ;; Build/jar: clj -T:build jar
   :build
   {:deps       {io.github.clojure/tools.build {:mvn/version "0.10.14"}}

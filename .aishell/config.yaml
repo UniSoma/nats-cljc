@@ -1,7 +1,7 @@
 env:
   NREPL_PORT: 7888
 
-pre_start: "bb nrepl-server 7888 & nats-server -c ci/nats.conf &"
+pre_start: "bb pre_start"
 
 mounts:
   - $HOME/.m2
