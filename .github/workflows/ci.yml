@@ -87,8 +87,22 @@ jobs:
           npx shadow-cljs compile node
           node target/node-tests.js
 
+      # CI is the single source of browser truth (ADR 0010), so provision Chrome
+      # explicitly and version-pinned instead of leaning on whatever Chrome the
+      # ubuntu-latest image happens to ship. Pin the major version (latest patch
+      # within it) for reproducible behavior that survives runner-image bumps.
+      - name: Set up Chrome
+        if: matrix.platform == 'browser'
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: '149'
+
       - name: Browser-headless test (karma)
         if: matrix.platform == 'browser'
+        # Point karma-chrome-launcher at the provisioned binary, not PATH.
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: |
           npx shadow-cljs compile browser
           npx karma start --single-run
