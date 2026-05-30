@@ -17,11 +17,20 @@
                                  (handler {:subject (.-subject msg)
                                            :bytes   (.-data msg)}))})))
 
+(defn- with-auth
+  "Merge the `:auth` connect-option into the nats-core options map. The auth seam
+   the advanced-auth slices extend."
+  [opts {:keys [token user pass]}]
+  (cond-> opts
+    token (assoc :token token)
+    user  (assoc :user user :pass pass)))
+
 (defn connect
   "Open a WebSocket connection to `:servers`, returning a js/Promise that resolves
-   to a JsConnection (ADR 0002). `:codec` defaults to :edn."
-  [{:keys [servers codec] :or {codec :edn}}]
-  (-> (nats-core/wsconnect (clj->js {:servers servers}))
+   to a JsConnection (ADR 0002). `:codec` defaults to :edn. `:auth` selects an auth
+   method (e.g. `{:token ...}`)."
+  [{:keys [servers codec auth] :or {codec :edn}}]
+  (-> (nats-core/wsconnect (clj->js (with-auth {:servers servers} auth)))
       (.then (fn [nc] (->JsConnection nc codec)))
       (.catch (fn [e]
                 (throw (ex-info "Failed to connect to NATS"

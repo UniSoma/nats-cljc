@@ -10,6 +10,22 @@
   #?(:clj  "nats://127.0.0.1:4222"
      :cljs "ws://127.0.0.1:8080"))
 
+;; Auth legs each talk to their own auth-configured server on distinct ports
+;; (one auth method per server). Creds match ci/nats-token.conf and
+;; ci/nats-userpass.conf.
+(def ^:private token-server-url
+  #?(:clj  "nats://127.0.0.1:4223"
+     :cljs "ws://127.0.0.1:8081"))
+
+(def ^:private token "s3cr3t-token")
+
+(def ^:private userpass-server-url
+  #?(:clj  "nats://127.0.0.1:4224"
+     :cljs "ws://127.0.0.1:8082"))
+
+(def ^:private user "app")
+(def ^:private pass "app-pass")
+
 (def ^:private subject "tracer.roundtrip")
 (def ^:private payload {:hello "world" :n 42 :nested [1 2 {:k :v}]})
 
@@ -31,6 +47,40 @@
                           (is (some? conn) "connect resolves to a non-nil Connection")
                           (close! conn)))
                 (p/catch (fn [e] (is false (str "connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+(deftest auth-with-token-connects
+  #?(:clj
+     (let [conn @(nats/connect {:servers [token-server-url]
+                                :auth    {:token token}})]
+       (try
+         (is (some? conn) ":auth {:token ...} connects against a token-configured server")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [token-server-url]
+                               :auth    {:token token}})
+                (p/then (fn [conn]
+                          (is (some? conn) ":auth {:token ...} connects against a token-configured server")
+                          (close! conn)))
+                (p/catch (fn [e] (is false (str "token auth connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+(deftest auth-with-user-pass-connects
+  #?(:clj
+     (let [conn @(nats/connect {:servers [userpass-server-url]
+                                :auth    {:user user :pass pass}})]
+       (try
+         (is (some? conn) ":auth {:user ... :pass ...} connects against a user/password-configured server")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [userpass-server-url]
+                               :auth    {:user user :pass pass}})
+                (p/then (fn [conn]
+                          (is (some? conn) ":auth {:user ... :pass ...} connects against a user/password-configured server")
+                          (close! conn)))
+                (p/catch (fn [e] (is false (str "user/pass auth connect failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 
 (deftest publish-subscribe-round-trip

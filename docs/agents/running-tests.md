@@ -2,12 +2,14 @@
 
 One portable `.cljc` suite (`test/nats_cljc/`) runs on every platform. **Locally you run the JVM and Node legs; the browser leg is CI-only** (ADR 0010).
 
-## Prerequisite: a websocket-enabled nats-server
+## Prerequisite: websocket-enabled nats-servers
 
-Every leg talks to a real server — no mocks. Start one with the CI config (TCP `:4222` + `ws://:8080`):
+Every leg talks to a real server — no mocks. The auth suite needs one server per auth method (a NATS server has a single auth config), so start all three:
 
 ```bash
-nats-server -c ci/nats.conf &
+nats-server -c ci/nats.conf          &   # anonymous  — TCP :4222 / ws :8080
+nats-server -c ci/nats-token.conf    &   # token      — TCP :4223 / ws :8081
+nats-server -c ci/nats-userpass.conf &   # user/pass  — TCP :4224 / ws :8082
 ```
 
 `nats-server` ships in the dev image. The JVM leg uses TCP; Node uses `ws://` (ADR 0001).
