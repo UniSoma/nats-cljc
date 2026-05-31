@@ -68,6 +68,55 @@
 ;; own slice; here we reach the record's client field directly.
 (defn- close! [conn] (.close (:client conn)))
 
+;; Test-only trigger for a real link drop: both native clients expose a public
+;; force-reconnect that genuinely drops the socket (firing the native
+;; DISCONNECTED / "disconnect" event) before re-establishing it. The reconnect
+;; itself belongs to a sibling slice; here it is just how we provoke a faithful
+;; :disconnected without cycling the server.
+(defn- force-drop! [conn]
+  #?(:clj  (.forceReconnect (:client conn))
+     :cljs (.reconnect ^js (:client conn))))
+
+;; Status events arrive on the native client's own schedule (a jnats listener
+;; thread; the CLJS status() loop turn). A status collector + a JVM poll-until
+;; helper let the assertions wait for a type rather than race it.
+#?(:clj
+   (defn- wait-for
+     "Poll `pred` until truthy or `timeout-ms` elapses; return the last value."
+     [pred timeout-ms]
+     (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+       (loop []
+         (or (pred)
+             (when (< (System/currentTimeMillis) deadline)
+               (Thread/sleep 20)
+               (recur))))))
+   :cljs
+   (defn- wait-for
+     "Promise resolving to true once `pred` is truthy (polling every 25ms), or
+      false at `timeout-ms` — the async-friendly twin of the JVM poll."
+     [pred timeout-ms]
+     (p/create
+      (fn [resolve _reject]
+        (let [deadline (+ (js/Date.now) timeout-ms)]
+          (letfn [(check []
+                    (cond
+                      (pred)                     (resolve true)
+                      (< (js/Date.now) deadline) (js/setTimeout check 25)
+                      :else                      (resolve false)))]
+            (check)))))))
+
+(defn- status-collector
+  "An :on-status handler closing over an atom of the status maps it receives."
+  []
+  (let [seen (atom [])]
+    [seen (fn [s] (swap! seen conj s))]))
+
+;; Test-only check that a subscription has been ended (by drain/close). Reaches
+;; the native handle subscribe returns — a jnats Subscription / a nats.js Sub.
+(defn- sub-ended? [sub]
+  #?(:clj  (not (.isActive sub))
+     :cljs (.isClosed ^js sub)))
+
 (deftest connect-resolves-to-a-connection
   #?(:clj
      (let [conn @(nats/connect {:servers [server-url]})]
@@ -215,4 +264,158 @@
                                           (is (= payload (:data msg)) "handler receives EDN-decoded :data")))
                                 (p/finally (fn [_ _] (close! conn)))))))
                 (p/catch (fn [e] (is false (str "round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+(deftest status-connected-delivered
+  #?(:clj
+     (let [[seen on-status] (status-collector)
+           conn @(nats/connect {:servers   [server-url]
+                                :on-status on-status})]
+       (try
+         (is (wait-for #(some #{{:type :connected}} @seen) 2000)
+             ":connected reaches :on-status as a {:type ...} map")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (let [[seen on-status] (status-collector)]
+              (-> (nats/connect {:servers   [server-url]
+                                 :on-status on-status})
+                  (p/then (fn [conn]
+                            (is (some #{{:type :connected}} @seen)
+                                ":connected reaches :on-status as a {:type ...} map")
+                            (close! conn)))
+                  (p/catch (fn [e] (is false (str "connect failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+(deftest close-settles-fires-closed-and-ends-subs
+  #?(:clj
+     (let [[seen on-status] (status-collector)
+           conn      @(nats/connect {:servers [server-url] :on-status on-status})
+           sub       (nats/subscribe conn subject (fn [_] nil))
+           close-ret (nats/close conn)]
+       (is (not= ::timeout (deref close-ret 2000 ::timeout))
+           "close returns a promise that settles")
+       (is (wait-for #(some #{{:type :closed}} @seen) 2000)
+           ":closed reaches :on-status")
+       (is (wait-for #(sub-ended? sub) 2000)
+           "close ends the connection's subscriptions"))
+     :cljs
+     (async done
+            (let [[seen on-status] (status-collector)]
+              (-> (nats/connect {:servers [server-url] :on-status on-status})
+                  (p/then (fn [conn]
+                            (let [sub       (nats/subscribe conn subject (fn [_] nil))
+                                  close-ret (nats/close conn)]
+                              (is (some? close-ret) "close returns a promise")
+                              (-> close-ret
+                                  (p/then (fn [_] (p/delay 100)))
+                                  (p/then (fn [_]
+                                            (is (some #{{:type :closed}} @seen)
+                                                ":closed reaches :on-status")
+                                            (is (sub-ended? sub)
+                                                "close ends the connection's subscriptions")))))))
+                  (p/catch (fn [e] (is false (str "close test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+(deftest disconnected-fires-on-drop
+  #?(:clj
+     (let [[seen on-status] (status-collector)
+           conn @(nats/connect {:servers [server-url] :on-status on-status})]
+       (try
+         (force-drop! conn)
+         (is (wait-for #(some #{{:type :disconnected}} @seen) 5000)
+             ":disconnected reaches :on-status on a real link drop")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (let [[seen on-status] (status-collector)]
+              (-> (nats/connect {:servers [server-url] :on-status on-status})
+                  (p/then (fn [conn]
+                            (force-drop! conn)
+                            (-> (wait-for #(some #{{:type :disconnected}} @seen) 5000)
+                                (p/then (fn [hit?]
+                                          (is hit? ":disconnected reaches :on-status on a real link drop")
+                                          (close! conn))))))
+                  (p/catch (fn [e] (is false (str "disconnect test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+(deftest flush-settles
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})]
+       (try
+         (nats/publish conn subject payload)
+         (let [flush-ret (nats/flush conn)]
+           (is (not= ::timeout (deref flush-ret 5000 ::timeout))
+               "flush returns a promise that settles"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (nats/publish conn subject payload)
+                          (let [flush-ret (nats/flush conn)]
+                            (is (some? flush-ret) "flush returns a promise")
+                            ;; reaching this then means the promise settled
+                            (-> flush-ret
+                                (p/then (fn [_] (is true "flush settles")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "flush test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+(deftest drain-connection-settles-and-ends-subs
+  #?(:clj
+     (let [conn      @(nats/connect {:servers [server-url]})
+           sub       (nats/subscribe conn subject (fn [_] nil))
+           drain-ret (nats/drain conn)]
+       (try
+         (is (not= ::timeout (deref drain-ret 5000 ::timeout))
+             "drain returns a promise that settles")
+         (is (wait-for #(sub-ended? sub) 2000)
+             "drain ends the connection's subscriptions")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [sub       (nats/subscribe conn subject (fn [_] nil))
+                                drain-ret (nats/drain conn)]
+                            (is (some? drain-ret) "drain returns a promise")
+                            (-> drain-ret
+                                (p/then (fn [_] (wait-for #(sub-ended? sub) 2000)))
+                                (p/then (fn [ended?]
+                                          (is ended? "drain ends the connection's subscriptions")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "drain test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+(deftest drain-subscription-settles-and-ends-only-it
+  #?(:clj
+     (let [conn      @(nats/connect {:servers [server-url]})
+           sub-a     (nats/subscribe conn (str subject ".a") (fn [_] nil))
+           sub-b     (nats/subscribe conn (str subject ".b") (fn [_] nil))
+           drain-ret (nats/drain sub-a)]
+       (try
+         (is (not= ::timeout (deref drain-ret 5000 ::timeout))
+             "subscription drain returns a promise that settles")
+         (is (wait-for #(sub-ended? sub-a) 2000)
+             "draining a subscription ends it")
+         (is (not (sub-ended? sub-b))
+             "draining one subscription leaves the connection's others active")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [sub-a     (nats/subscribe conn (str subject ".a") (fn [_] nil))
+                                sub-b     (nats/subscribe conn (str subject ".b") (fn [_] nil))
+                                drain-ret (nats/drain sub-a)]
+                            (is (some? drain-ret) "subscription drain returns a promise")
+                            (-> drain-ret
+                                (p/then (fn [_] (wait-for #(sub-ended? sub-a) 2000)))
+                                (p/then (fn [ended?]
+                                          (is ended? "draining a subscription ends it")
+                                          (is (not (sub-ended? sub-b))
+                                              "draining one subscription leaves the connection's others active")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "subscription drain test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))

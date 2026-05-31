@@ -15,10 +15,47 @@
     (.subscribe ^js client subject
                 #js {:callback (fn [_err ^js msg]
                                  (handler {:subject (.-subject msg)
-                                           :bytes   (.-data msg)}))})))
+                                           :bytes   (.-data msg)}))}))
+  (-flush [_]
+    ;; nats.js flush already returns a Promise that settles once the server has
+    ;; processed the buffer.
+    (.flush ^js client))
+  (-drain [_]
+    ;; nats.js drain already returns a Promise; draining ends the connection's
+    ;; subscriptions and closes it (the "close" status event still flows).
+    (.drain ^js client))
+  (-close [_]
+    ;; nats.js close already returns a Promise; the "close" status event reaches
+    ;; :on-status via the status() pump as the connection tears down.
+    (.close ^js client)))
 
 (defn- ->bytes [s]
   (.encode (js/TextEncoder.) s))
+
+;; Baseline status spine (ADR 0006/0009): map nats.js' native status names onto
+;; the canonical status :type set. nats.js emits no event for the initial
+;; connection (:connected is synthesized at connect); unmapped names are dropped
+;; — reconnect- and server-driven types are added by their own slice.
+(def ^:private status->type
+  {"disconnect" :disconnected
+   "close"      :closed})
+
+(defn- pump-status!
+  "Drain nats.js' status() async-iterable, forwarding each mapped event to
+   `on-status` as a plain `{:type ...}` map. The iterable ends when the
+   connection closes."
+  [^js nc on-status]
+  (let [iterable (.status nc)
+        iter     (.call (unchecked-get iterable js/Symbol.asyncIterator) iterable)]
+    (letfn [(step []
+              (-> (.next iter)
+                  (.then (fn [^js res]
+                           (when-not (.-done res)
+                             (when-let [t (status->type (.. res -value -type))]
+                               (on-status {:type t}))
+                             (step))))
+                  (.catch (fn [_] nil))))]
+      (step))))
 
 (defn- nkey-authenticator
   "nats-core nkey authenticator over `seed`. When the public `nkey` is given,
@@ -49,17 +86,31 @@
   "Open a WebSocket connection to `:servers`, returning a js/Promise that resolves
    to a JsConnection (ADR 0002). `:codec` defaults to :edn. `:auth` selects an auth
    method (e.g. `{:token ...}`)."
-  [{:keys [servers codec auth] :or {codec :edn}}]
+  [{:keys [servers codec auth on-status] :or {codec :edn}}]
   ;; A client-side auth error (e.g. an :nkey/seed mismatch) thrown while building
   ;; the options rejects the returned promise — with its own ex-info, unwrapped —
   ;; rather than throwing synchronously from connect (ADR 0002/0006: connect
   ;; rejects its promise). Only the wsconnect failure is wrapped as :connect-failed.
   (try
     (-> (nats-core/wsconnect (clj->js (with-auth {:servers servers} auth)))
-        (.then (fn [nc] (->JsConnection nc codec)))
+        (.then (fn [nc]
+                 ;; nats.js emits no event for the initial connection, so the
+                 ;; baseline :connected is synthesized here — before the
+                 ;; connection promise resolves — to match the jnats listener.
+                 (when on-status
+                   (on-status {:type :connected})
+                   (pump-status! nc on-status))
+                 (->JsConnection nc codec)))
         (.catch (fn [e]
                   (throw (ex-info "Failed to connect to NATS"
                                   {:type :connect-failed :servers servers}
                                   e)))))
     (catch :default e
       (js/Promise.reject e))))
+
+(defn drain-subscription
+  "Drain a single native Subscription, returning the Promise nats.js' sub.drain()
+   yields. The facade's `drain` routes here when handed a subscription rather than
+   a connection."
+  [^js sub]
+  (.drain sub))
