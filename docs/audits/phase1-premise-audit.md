@@ -7,6 +7,28 @@ auth, reconnect, and connect-error normalization.
 **Goal:** inventory every behavioral premise the shipped code bakes in about the underlying
 clients, and ground each against the *pinned* versions of those clients — or mark it ASSUMED.
 
+> **Resolution (2026-05-31, commit `929a482`).** The ledger below is the point-in-time snapshot;
+> the follow-ups were walked and dispositioned the same day. Where a finding reads as drift, check
+> here first — several were fixed in the same commit that landed this audit, so the table cells are
+> not self-updating.
+>
+> - **P0 (A7) — dispatch backlog.** Not reverted; *superseded*. The promise-return contract
+>   (`4d5fc30`, ADR 0007) is correct/CI-green; its manual `tail`-chaining is replaced by the
+>   native-consumption rework (road 2) tracked in **`nts-01kstxatbw6k`** (AC#2/#3/#4 + the rework
+>   are one indivisible change). `:max-pending` is **signal-portable, drop-native** (ADR 0007
+>   updated): the `:slow-consumer` *signal* fires on both legs; the hard drop is JVM-only.
+> - **P1 #2 (H4/F5) — `:auth-invalid`.** ✅ **Done.** Added to the canonical error `:type` set
+>   (CONTEXT.md + ADR 0006) as client-side pre-dial validation, distinct from `:connect-failed`.
+>   The "CONTRADICTED / absent" verdicts in F5 and H4 below are **superseded** by this.
+> - **P1 #3 (H3) — async-error sink.** ADR 0006 kept as the target (not softened); the sink ships
+>   *whole* in `nts-01kstxatbw6k`. `:slow-consumer` routes to the per-sub `:on-error` only (moved
+>   from the status set to the error `:type` set), keeping every `:on-status` event a bare
+>   connection-level `{:type ...}`.
+> - **P1 #4 (§0) — scope drift.** No action — already covered by §0 and the honest README/tickets.
+> - **P2 #5 (A8) — ordering.** ✅ **Done.** ADR 0007 + the ordering test now state the guarantee as
+>   **per-publisher** (no cross-publisher order).
+> - **P2 #6 (E6 cadence), #7 (F4 keys).** Left as documented divergence / confirm-opportunistically.
+
 ## Pinned versions (grounded against THESE)
 
 | Leg | Wrapped client | Version | Source of truth used |
