@@ -1,21 +1,21 @@
 ---
 id: nts-01kstxa6v2mm
 title: Delivery-semantics tests (ordering + backpressure)
-status: open
+status: in_progress
 type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:40.993654794Z'
-updated: '2026-05-31T02:19:16.380631698Z'
+updated: '2026-05-31T16:31:42.692707589Z'
 acceptance:
 - title: Single-subscription ordering test passes on all three platforms — messages delivered in publish order
   done: false
 - title: A handler that returns a pending promise delays delivery of the next message until that promise settles
-  done: false
+  done: true
 - title: The suite demonstrates that no cross-subscription ordering guarantee is assumed
-  done: false
+  done: true
 - title: Handlers never block the underlying client thread or event loop
-  done: false
+  done: true
 - title: 'The core dispatch loop implements promise-return backpressure (ADR 0007): a handler returning a promise suspends delivery of the next message until it settles; a non-promise return delivers immediately — verified on JVM, browser, and Node'
   done: false
 deps:

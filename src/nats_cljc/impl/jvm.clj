@@ -4,8 +4,8 @@
   (:require [nats-cljc.protocol :as proto])
   (:import [io.nats.client Nats Options Options$Builder Connection Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events]
            [java.time Duration]
-           [java.util.concurrent CompletableFuture]
-           [java.util.function Supplier]))
+           [java.util.concurrent CompletableFuture CompletionStage]
+           [java.util.function Supplier Function]))
 
 ;; Upper bound for the blocking flush/drain one-shots; a healthy connection
 ;; settles in milliseconds. Finite (not Duration.ZERO = wait-forever) so a dead
@@ -18,12 +18,35 @@
   (-publish [_ subject bytes]
     (.publish client ^String subject ^bytes bytes))
   (-subscribe [_ subject handler]
-    (let [^Dispatcher dispatcher (.createDispatcher client)]
+    ;; Per-subscription tail: each message's handler invocation is composed onto
+    ;; the previous one's settle, so a handler that returns a CompletionStage
+    ;; suspends delivery of the next message until it settles — promise-return
+    ;; backpressure (ADR 0007). jnats dispatches onMessage serially on this
+    ;; dispatcher's single thread, so the tail mutates without contention and the
+    ;; thread is never blocked (the compose returns immediately). A
+    ;; non-CompletionStage return composes a completed future, delivering the next
+    ;; message at once. `.exceptionally` keeps a throwing/rejecting handler from
+    ;; stalling the chain (error routing is the error-model slice's job).
+    (let [^Dispatcher dispatcher (.createDispatcher client)
+          tail                   (atom (CompletableFuture/completedFuture nil))]
       (.subscribe dispatcher ^String subject
                   (reify MessageHandler
                     (onMessage [_ msg]
-                      (handler {:subject (.getSubject ^Message msg)
-                                :bytes   (.getData ^Message msg)}))))))
+                      (let [m {:subject (.getSubject ^Message msg)
+                               :bytes   (.getData ^Message msg)}]
+                        (swap! tail
+                               (fn [^CompletableFuture prev]
+                                 (-> prev
+                                     (.thenCompose
+                                      (reify Function
+                                        (apply [_ _]
+                                          (let [r (handler m)]
+                                            (if (instance? CompletionStage r)
+                                              r
+                                              (CompletableFuture/completedFuture nil))))))
+                                     (.exceptionally
+                                      (reify Function
+                                        (apply [_ _] nil))))))))))))
   (-flush [_]
     ;; jnats flush blocks until the server has processed the buffer (or the
     ;; timeout elapses, completing the future exceptionally); run it off-thread

@@ -11,11 +11,25 @@
     (.publish ^js client subject bytes))
   (-subscribe [_ subject handler]
     ;; A subscribe with a :callback delivers per-message and returns the
-    ;; Subscription synchronously (instead of becoming an async iterable).
-    (.subscribe ^js client subject
-                #js {:callback (fn [_err ^js msg]
-                                 (handler {:subject (.-subject msg)
-                                           :bytes   (.-data msg)}))}))
+    ;; Subscription synchronously (instead of becoming an async iterable). The
+    ;; per-subscription tail chains each handler invocation onto the previous
+    ;; one's settle, so a handler that returns a promise (a thenable) suspends
+    ;; delivery of the next message until it settles — promise-return backpressure
+    ;; (ADR 0007). The event loop is single-threaded, so the tail mutates without
+    ;; contention and is never blocked. A non-thenable return resolves
+    ;; immediately, delivering the next message at once. `.catch` keeps a
+    ;; rejecting handler from stalling the chain (error routing is the error-model
+    ;; slice's job).
+    (let [tail (atom (js/Promise.resolve))]
+      (.subscribe ^js client subject
+                  #js {:callback (fn [_err ^js msg]
+                                   (let [m {:subject (.-subject msg)
+                                            :bytes   (.-data msg)}]
+                                     (swap! tail
+                                            (fn [^js prev]
+                                              (-> prev
+                                                  (.then (fn [_] (handler m)))
+                                                  (.catch (fn [_] js/undefined)))))))})))
   (-flush [_]
     ;; nats.js flush already returns a Promise that settles once the server has
     ;; processed the buffer.

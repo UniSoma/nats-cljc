@@ -69,6 +69,13 @@
 (def ^:private subject "tracer.roundtrip")
 (def ^:private payload {:hello "world" :n 42 :nested [1 2 {:k :v}]})
 
+;; Delivery-semantics subjects (ADR 0007). Distinct per behavior so the shared
+;; servers don't cross-feed between tests.
+(def ^:private order-subject "delivery.order")
+(def ^:private backpressure-subject "delivery.backpressure")
+(def ^:private indep-a-subject "delivery.indep.a")
+(def ^:private indep-b-subject "delivery.indep.b")
+
 ;; Test-only teardown: close the native client so jnats' non-daemon threads (and
 ;; the CLJS ws connection) don't outlive the test. A public close/drain is its
 ;; own slice; here we reach the record's client field directly.
@@ -540,4 +547,143 @@
                                               "draining one subscription leaves the connection's others active")))
                                 (p/finally (fn [_ _] (close! conn)))))))
                 (p/catch (fn [e] (is false (str "subscription drain test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Delivery semantics (ADR 0007). Within one subscription, messages are delivered
+;; in publish order, one at a time. SUB and the PUBs share one connection, so the
+;; server registers the subscription before any message arrives — no flush needed.
+(deftest single-subscription-delivers-in-order
+  (let [n 50]
+    #?(:clj
+       (let [conn  @(nats/connect {:servers [server-url]})
+             order (atom [])]
+         (try
+           (nats/subscribe conn order-subject (fn [msg] (swap! order conj (:data msg))))
+           (dotimes [i n] (nats/publish conn order-subject i))
+           (is (wait-for #(= n (count @order)) 5000) "all messages delivered")
+           (is (= (vec (range n)) @order)
+               "a single subscription delivers messages in publish order")
+           (finally (close! conn))))
+       :cljs
+       (async done
+              (-> (nats/connect {:servers [server-url]})
+                  (p/then (fn [conn]
+                            (let [order (atom [])]
+                              (nats/subscribe conn order-subject (fn [msg] (swap! order conj (:data msg))))
+                              (dotimes [i n] (nats/publish conn order-subject i))
+                              (-> (wait-for #(= n (count @order)) 5000)
+                                  (p/then (fn [hit?]
+                                            (is hit? "all messages delivered")
+                                            (is (= (vec (range n)) @order)
+                                                "a single subscription delivers messages in publish order")))
+                                  (p/finally (fn [_ _] (close! conn)))))))
+                  (p/catch (fn [e] (is false (str "ordering test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+;; Promise-return backpressure (ADR 0007): a handler that returns a pending
+;; promise suspends delivery of the next message until it settles; a non-promise
+;; return delivers immediately. The handler returns a gate promise only for the
+;; first message, so the second must wait until the gate settles. The gate is a
+;; platform-native promise the test controls — a CompletableFuture on the JVM, a
+;; promesa deferred on CLJS — exactly the shape a real async handler would return.
+(deftest pending-promise-handler-applies-backpressure
+  #?(:clj
+     (let [conn  @(nats/connect {:servers [server-url]})
+           order (atom [])
+           gate  (java.util.concurrent.CompletableFuture.)]
+       (try
+         (nats/subscribe conn backpressure-subject
+                         (fn [msg]
+                           (swap! order conj (:data msg))
+                           (when (= 1 (:data msg)) gate)))
+         (nats/publish conn backpressure-subject 1)
+         (nats/publish conn backpressure-subject 2)
+         (is (wait-for #(= [1] @order) 5000) "the first message is delivered")
+         (Thread/sleep 300)
+         (is (= [1] @order)
+             "a pending-promise handler suspends delivery of the next message")
+         (.complete gate nil)
+         (is (wait-for #(= [1 2] @order) 5000)
+             "the next message is delivered once the promise settles")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [order (atom [])
+                                gate  (p/deferred)]
+                            (nats/subscribe conn backpressure-subject
+                                            (fn [msg]
+                                              (swap! order conj (:data msg))
+                                              (when (= 1 (:data msg)) gate)))
+                            (nats/publish conn backpressure-subject 1)
+                            (nats/publish conn backpressure-subject 2)
+                            (-> (wait-for #(= [1] @order) 5000)
+                                (p/then (fn [hit?]
+                                          (is hit? "the first message is delivered")))
+                                (p/then (fn [_] (p/delay 300)))
+                                (p/then (fn [_]
+                                          (is (= [1] @order)
+                                              "a pending-promise handler suspends delivery of the next message")
+                                          (p/resolve! gate nil)))
+                                (p/then (fn [_] (wait-for #(= [1 2] @order) 5000)))
+                                (p/then (fn [hit?]
+                                          (is hit? "the next message is delivered once the promise settles")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "backpressure test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; No cross-subscription coupling (ADR 0007): backpressure is per-subscription,
+;; and a handler that returns a pending promise must never block the underlying
+;; client thread or event loop. Sub-A is held on a pending-promise handler while
+;; sub-B keeps delivering — so a backpressured subscription neither stalls another
+;; nor freezes the loop. The suite asserts nothing about A-vs-B ordering: there is
+;; no cross-subscription ordering guarantee to assume.
+(deftest subscriptions-are-independent
+  #?(:clj
+     (let [conn    @(nats/connect {:servers [server-url]})
+           a-order (atom [])
+           b-order (atom [])
+           gate    (java.util.concurrent.CompletableFuture.)]
+       (try
+         (nats/subscribe conn indep-a-subject
+                         (fn [msg]
+                           (swap! a-order conj (:data msg))
+                           (when (= :a1 (:data msg)) gate)))
+         (nats/subscribe conn indep-b-subject
+                         (fn [msg] (swap! b-order conj (:data msg))))
+         (nats/publish conn indep-a-subject :a1)
+         (nats/publish conn indep-a-subject :a2)
+         (nats/publish conn indep-b-subject :b1)
+         (is (wait-for #(and (= [:a1] @a-order) (= [:b1] @b-order)) 5000)
+             "a second subscription delivers while the first is backpressured (no cross-subscription coupling)")
+         (.complete gate nil)
+         (is (wait-for #(= [:a1 :a2] @a-order) 5000)
+             "the backpressured subscription resumes once its promise settles")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [a-order (atom [])
+                                b-order (atom [])
+                                gate    (p/deferred)]
+                            (nats/subscribe conn indep-a-subject
+                                            (fn [msg]
+                                              (swap! a-order conj (:data msg))
+                                              (when (= :a1 (:data msg)) gate)))
+                            (nats/subscribe conn indep-b-subject
+                                            (fn [msg] (swap! b-order conj (:data msg))))
+                            (nats/publish conn indep-a-subject :a1)
+                            (nats/publish conn indep-a-subject :a2)
+                            (nats/publish conn indep-b-subject :b1)
+                            (-> (wait-for #(and (= [:a1] @a-order) (= [:b1] @b-order)) 5000)
+                                (p/then (fn [hit?]
+                                          (is hit? "a second subscription delivers while the first is backpressured (no cross-subscription coupling)")
+                                          (p/resolve! gate nil)))
+                                (p/then (fn [_] (wait-for #(= [:a1 :a2] @a-order) 5000)))
+                                (p/then (fn [hit?]
+                                          (is hit? "the backpressured subscription resumes once its promise settles")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "independence test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
