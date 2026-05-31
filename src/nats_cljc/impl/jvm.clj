@@ -27,6 +27,11 @@
     ;; non-CompletionStage return composes a completed future, delivering the next
     ;; message at once. `.exceptionally` keeps a throwing/rejecting handler from
     ;; stalling the chain (error routing is the error-model slice's job).
+    ;; NB: under a sustained-slow handler the undelivered backlog grows UNBOUNDED
+    ;; in this chain — onMessage returns at once, so jnats' dispatcher queue stays
+    ;; empty and its native slow-consumer (setPendingLimits/slowConsumerDetected)
+    ;; never trips. Honoring :max-pending + surfacing :slow-consumer is
+    ;; nts-01kstxatbw6k AC#4 (likely a rework to a blocking-dispatcher model).
     (let [^Dispatcher dispatcher (.createDispatcher client)
           tail                   (atom (CompletableFuture/completedFuture nil))]
       (.subscribe dispatcher ^String subject

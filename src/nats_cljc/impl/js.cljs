@@ -20,6 +20,11 @@
     ;; immediately, delivering the next message at once. `.catch` keeps a
     ;; rejecting handler from stalling the chain (error routing is the error-model
     ;; slice's job).
+    ;; NB: under a sustained-slow handler the undelivered backlog grows UNBOUNDED
+    ;; in this chain — nats.js' native slow-consumer is iterator-only and throws
+    ;; for a :callback sub, so nothing signals or bounds it. Honoring :max-pending
+    ;; + surfacing :slow-consumer is nts-01kstxatbw6k AC#4 (likely a rework to the
+    ;; async-iterator + await-handler model, where nats.js buffers and signals).
     (let [tail (atom (js/Promise.resolve))]
       (.subscribe ^js client subject
                   #js {:callback (fn [_err ^js msg]
