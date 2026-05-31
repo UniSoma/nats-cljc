@@ -6,7 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:24.119127883Z'
-updated: '2026-05-30T19:11:17.632532970Z'
+updated: '2026-05-31T02:19:16.380631698Z'
 acceptance:
 - title: A per-call `:codec` option overrides the connection default on publish, subscribe, and request
   done: false
@@ -20,6 +20,8 @@ acceptance:
   done: false
 deps:
 - nts-01kstx8ysgv5
+links:
+- nts-01ksxx84gzkf
 ---
 
 ## Description

@@ -6,7 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:40.993654794Z'
-updated: '2026-05-29T22:34:55.500085908Z'
+updated: '2026-05-31T02:19:16.380631698Z'
 acceptance:
 - title: Single-subscription ordering test passes on all three platforms — messages delivered in publish order
   done: false
@@ -20,6 +20,8 @@ acceptance:
   done: false
 deps:
 - nts-01kstx8ysgv5
+links:
+- nts-01ksxx84gzkf
 ---
 
 ## Description
