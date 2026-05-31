@@ -31,7 +31,7 @@ The value `connect` returns: a native client wrapped together with a default cod
 _Avoid_: client, session
 
 **Status event**:
-A normalized connection-lifecycle notification delivered to an `:on-status` handler, identical in shape on every platform. Canonical `:type`s: `:connected`, `:disconnected`, `:reconnecting`, `:reconnected`, `:closed`, `:error`, `:slow-consumer`, `:lame-duck`, `:servers-changed`.
+A normalized connection-lifecycle notification delivered to an `:on-status` handler, identical in shape on every platform. Canonical `:type`s: `:connected`, `:disconnected`, `:reconnecting`, `:reconnected`, `:closed`, `:error`, `:lame-duck`, `:servers-changed`. (`:slow-consumer` is *not* here: it is inherently per-subscription, so it is an *Error* `:type` routed to the subscription's `:on-error`, keeping every `:on-status` event a bare connection-level `{:type ...}`.)
 The contract normalizes *shape*, not *cadence*: each delivered event is a bare `{:type ...}` map drawn from the canonical set, but the count, ordering, and trigger conditions follow each underlying client's native strategy and may differ per platform (see ADR 0006). Known divergences: a single connection loss yields one `:reconnecting` on the JVM (synthesized) but one per dial attempt on Node/browser (nats.js' native signal); `:servers-changed` fires only when genuinely new servers are gossiped on the JVM, but on essentially every server INFO on Node/browser. Portable consumers should treat each `:type` as an edge to react to, not a counter.
 _Avoid_: connection listener, notification
 
@@ -40,7 +40,7 @@ The client's automatic re-establishment of a dropped connection, configured with
 _Avoid_: retry, redial
 
 **Error**:
-A failure surfaced as an `ex-info` carrying a canonical `:type` and structured data, identical in shape on every platform (so portable code reads `(:type (ex-data e))` rather than branching on host exception types). Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`. One-shot operations reject their promise with it; async failures (a throwing handler, a decode failure, a slow consumer, a protocol error) reach the connection's `:on-status` `:error` sink, or a per-subscription `:on-error`.
+A failure surfaced as an `ex-info` carrying a canonical `:type` and structured data, identical in shape on every platform (so portable code reads `(:type (ex-data e))` rather than branching on host exception types). Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`, `:slow-consumer`, `:auth-invalid`. `:auth-invalid` is client-side credential validation failing *before* any dial (e.g. an nkey that does not match its seed), distinct from `:connect-failed` (the server-side connect attempt failed); it rejects the `connect` promise. One-shot operations reject their promise with it; async failures reach a sink: a throwing handler, a decode failure, or a protocol error reaches the connection's `:on-status` `:error` sink (overridable per-subscription with `:on-error`), while `:slow-consumer` — being per-subscription — reaches the subscription's `:on-error` only.
 _Avoid_: failure, fault (a bare host *exception* is what we normalize *into* an Error)
 
 ### Messaging

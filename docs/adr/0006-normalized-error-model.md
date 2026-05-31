@@ -3,11 +3,13 @@
 Failures surface as an **`ex-info`** carrying a canonical **`:type`** keyword plus structured `ex-data`, identical in shape on the JVM and ClojureScript. Portable code inspects `(:type (ex-data e))` instead of branching on `Throwable` vs `js/Error`; native exceptions are normalized into this representation. There are two channels:
 
 - **One-shot operations** (`connect`, `request`, `flush`, `drain`, `close`) **reject their promise** with such an `ex-info`.
-- **Async failures with no call to reject** — a throwing handler (caught, so it never kills the dispatch loop), a **decode failure** (the handler is not called with garbage), a slow consumer, a protocol error — reach the connection's **`:on-status` `:error`** sink, with an optional per-subscription **`:on-error`** override.
+- **Async failures with no call to reject** — a throwing handler (caught, so it never kills the dispatch loop), a **decode failure** (the handler is not called with garbage), a protocol error — reach the connection's **`:on-status` `:error`** sink, with an optional per-subscription **`:on-error`** override. **`:slow-consumer`** is the exception: it is inherently a property of one subscription, so it is delivered **only** to that subscription's `:on-error` (never the connection-level `:on-status`), keeping every `:on-status` event a bare connection-level `{:type ...}`.
 
 `request` distinguishes **`:timeout`** (responders exist, none answered in time) from **`:no-responders`** (NATS 503 — nobody subscribed); both reject rather than resolving to `nil`.
 
-Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`.
+Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`, `:slow-consumer`, `:auth-invalid`.
+
+`:auth-invalid` names **client-side credential validation** failing before any dial — an nkey/seed mismatch today, and the home for future creds/jwt pre-flight checks — as opposed to `:connect-failed`, which is the server-side connect attempt failing. Validation runs while building connect options, so it surfaces by **rejecting the `connect` promise** (the one-shot channel), not via an async sink.
 
 ## Status events: shape, not cadence
 

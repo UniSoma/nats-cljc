@@ -549,9 +549,13 @@
                 (p/catch (fn [e] (is false (str "subscription drain test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 
-;; Delivery semantics (ADR 0007). Within one subscription, messages are delivered
-;; in publish order, one at a time. SUB and the PUBs share one connection, so the
-;; server registers the subscription before any message arrives — no flush needed.
+;; Delivery semantics (ADR 0007). With a SINGLE publisher, a subscription sees that
+;; publisher's messages in publish order, one at a time — that per-publisher order is
+;; the guarantee core NATS gives (it does NOT order across different publishers, so
+;; there is deliberately no cross-publisher ordering test: NATS leaves that
+;; interleaving unspecified, so any assertion on it would be flaky). SUB and the PUBs
+;; share one connection, so the server registers the subscription before any message
+;; arrives — no flush needed.
 (deftest single-subscription-delivers-in-order
   (let [n 50]
     #?(:clj
@@ -562,7 +566,7 @@
            (dotimes [i n] (nats/publish conn order-subject i))
            (is (wait-for #(= n (count @order)) 5000) "all messages delivered")
            (is (= (vec (range n)) @order)
-               "a single subscription delivers messages in publish order")
+               "a single subscription delivers one publisher's messages in publish order")
            (finally (close! conn))))
        :cljs
        (async done
@@ -575,7 +579,7 @@
                                   (p/then (fn [hit?]
                                             (is hit? "all messages delivered")
                                             (is (= (vec (range n)) @order)
-                                                "a single subscription delivers messages in publish order")))
+                                                "a single subscription delivers one publisher's messages in publish order")))
                                   (p/finally (fn [_ _] (close! conn)))))))
                   (p/catch (fn [e] (is false (str "ordering test failed: " e))))
                   (p/finally (fn [_ _] (done))))))))
