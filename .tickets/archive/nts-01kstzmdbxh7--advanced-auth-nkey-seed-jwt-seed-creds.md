@@ -6,7 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T23:03:12.508031084Z'
-updated: '2026-05-30T23:57:08.184676829Z'
+updated: '2026-05-31T01:49:46.387528900Z'
 closed: '2026-05-30T23:57:08.184676829Z'
 parent: nts-01kstxa377qb
 acceptance:
@@ -17,7 +17,7 @@ acceptance:
 - title: ''':auth {:creds "<string content>"}'' connects using credentials passed as string content, not a file path'
   done: true
 - title: Each shape verified on JVM, browser-headless, and Node against an appropriately configured real ws:// nats-server
-  done: false
+  done: true
 - title: CI stands up the nkey, jwt, and creds server configurations
   done: true
 deps:

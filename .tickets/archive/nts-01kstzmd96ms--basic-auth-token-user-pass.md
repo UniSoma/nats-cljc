@@ -6,7 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T23:03:12.421026280Z'
-updated: '2026-05-30T22:59:34.933306951Z'
+updated: '2026-05-31T01:49:46.473086716Z'
 closed: '2026-05-30T22:59:34.933306951Z'
 parent: nts-01kstxa377qb
 acceptance:
@@ -15,7 +15,7 @@ acceptance:
 - title: ''':auth {:user ... :pass ...}'' connects against a user/password-configured server'
   done: true
 - title: Both shapes verified on JVM, browser-headless, and Node against a real ws:// nats-server
-  done: false
+  done: true
 - title: CI stands up the token and user/password server configurations
   done: true
 deps:
