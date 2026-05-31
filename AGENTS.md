@@ -7,7 +7,7 @@ Agent configuration for the `nats-cljc` repo, a [NATS](https://nats.io) for Cloj
 - **Map `.clj` files before reading them.** Run `clj-surgeon :op :ls :file <path>` from the shell (it's a CLI tool with EDN-pair args, *not* a Clojure ns — don't `(require)` it) first on any `.clj` file over ~500 lines, then `Read` only the line ranges you need. ~150× more token-efficient than blind reads. Full op reference: the `clj-surgeon` skill.
 - **Lint before commit.** Run `clj-kondo --lint src test`. See [docs/agents/linting-and-formatting.md](docs/agents/linting-and-formatting.md).
 - **Test on JVM + Node before commit.** Run the suite on both local legs against a ws-enabled `nats-server`; the browser leg is CI-only (ADR 0010). See [docs/agents/running-tests.md](docs/agents/running-tests.md).
-- **Prefer nREPL for evaluation.** `clj-nrepl-eval -p 7888 '<form>'` over `bb -cp src -e '<form>'` for sanity checks and exploration — persistent session (state survives between calls), no JVM cold-start, `:reload`-aware. See [docs/agents/clojure-repl-evaluation.md](docs/agents/clojure-repl-evaluation.md).
+- **Prefer nREPL for evaluation.** `clj-nrepl-eval -p 7888 '<form>'` over `bb -cp src -e '<form>'` for sanity checks and exploration — a warm JVM Clojure REPL with `src` + jnats + `:test` deps loaded, so it runs real JVM interop (which babashka's SCI can't) with no per-call cold-start; persistent session (state survives between calls), `:reload`-aware. See [docs/agents/clojure-repl-evaluation.md](docs/agents/clojure-repl-evaluation.md).
 
 ## Agent skills
 

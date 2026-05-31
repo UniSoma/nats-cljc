@@ -2,7 +2,7 @@
 
 The command `clj-nrepl-eval` is installed on your path for evaluating Clojure code via nREPL.
 
-**Default port: 7888.** The dev container's `.aishell/config.yaml` runs `bb nrepl-server 7888` on entry, so the REPL is normally already up — use it directly without discovery.
+**Default port: 7888.** The dev container's `.aishell/config.yaml` runs `clojure -M:test:nrepl` on entry, so the REPL is normally already up — use it directly without discovery. It's a full JVM Clojure REPL with `src` + jnats + the `:test` deps on the classpath, so project namespaces and real JVM interop (jnats, BouncyCastle) are loadable directly — not a babashka/SCI REPL.
 
 **Evaluate code:**
 
@@ -17,7 +17,7 @@ With timeout (milliseconds):
 If you get connection refused on 7888, start a REPL yourself, then retry:
 
 ```bash
-bb nrepl-server 7888 &
+clojure -M:test:nrepl &
 clj-nrepl-eval -p 7888 "<clojure-code>"
 ```
 

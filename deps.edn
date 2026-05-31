@@ -41,4 +41,12 @@
   ;; Build/jar: clj -T:build jar
   :build
   {:deps       {io.github.clojure/tools.build {:mvn/version "0.10.14"}}
-   :ns-default build}}}
+   :ns-default build}
+
+  ;; Dev nREPL: clojure -M:test:nrepl — a JVM Clojure nREPL on :7888 with jnats
+  ;; (base dep) and the :test deps on the classpath, so JVM interop is checked at
+  ;; a live REPL instead of cold-starting `clojure -M -e`. The dev container
+  ;; launches this on entry (see .aishell/config.yaml).
+  :nrepl
+  {:extra-deps {nrepl/nrepl {:mvn/version "1.3.1"}}
+   :main-opts  ["-m" "nrepl.cmdline" "--port" "7888"]}}}
