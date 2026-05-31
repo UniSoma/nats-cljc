@@ -32,18 +32,31 @@
 (defn- ->bytes [s]
   (.encode (js/TextEncoder.) s))
 
-;; Baseline status spine (ADR 0006/0009): map nats.js' native status names onto
-;; the canonical status :type set. nats.js emits no event for the initial
-;; connection (:connected is synthesized at connect); unmapped names are dropped
-;; — reconnect- and server-driven types are added by their own slice.
+;; Status spine (ADR 0006/0009): map nats.js' native status names onto the
+;; canonical status :type set. nats.js emits no event for the initial connection
+;; (:connected is synthesized at connect); unmapped names are dropped —
+;; :slow-consumer / :error production belong to the delivery / error-model slices.
 (def ^:private status->type
-  {"disconnect" :disconnected
-   "close"      :closed})
+  {"disconnect"   :disconnected
+   "reconnecting" :reconnecting
+   "reconnect"    :reconnected
+   "ldm"          :lame-duck
+   "update"       :servers-changed
+   "close"        :closed})
+
+(defn deliver-status!
+  "Normalize one native nats.js status object; when its type is mapped, deliver
+   it to `on-status` as a plain `{:type ...}` map and return the canonical type,
+   else nil. Unmapped names are ignored."
+  [on-status ^js native]
+  (when-let [t (status->type (.-type native))]
+    (on-status {:type t})
+    t))
 
 (defn- pump-status!
-  "Drain nats.js' status() async-iterable, forwarding each mapped event to
-   `on-status` as a plain `{:type ...}` map. The iterable ends when the
-   connection closes."
+  "Drain nats.js' status() async-iterable, normalizing each event onto
+   `on-status` (see `deliver-status!`). The iterable ends when the connection
+   closes."
   [^js nc on-status]
   (let [iterable (.status nc)
         iter     (.call (unchecked-get iterable js/Symbol.asyncIterator) iterable)]
@@ -51,8 +64,7 @@
               (-> (.next iter)
                   (.then (fn [^js res]
                            (when-not (.-done res)
-                             (when-let [t (status->type (.. res -value -type))]
-                               (on-status {:type t}))
+                             (deliver-status! on-status (.-value res))
                              (step))))
                   (.catch (fn [_] nil))))]
       (step))))
@@ -70,6 +82,15 @@
                           {:type :auth-invalid :nkey nkey :derived pub})))))
     (nats-core/nkeyAuthenticator seed-bytes)))
 
+(defn- with-reconnect
+  "Merge the `:reconnect {:max :wait-ms :jitter-ms}` connect-option into the
+   nats-core options map. Absent keys leave nats.js' own defaults in place."
+  [opts {:keys [max wait-ms jitter-ms]}]
+  (cond-> opts
+    max       (assoc :maxReconnectAttempts max)
+    wait-ms   (assoc :reconnectTimeWait wait-ms)
+    jitter-ms (assoc :reconnectJitter jitter-ms)))
+
 (defn- with-auth
   "Merge the `:auth` connect-option into the nats-core options map. The auth seam
    the advanced-auth slices extend."
@@ -86,13 +107,15 @@
   "Open a WebSocket connection to `:servers`, returning a js/Promise that resolves
    to a JsConnection (ADR 0002). `:codec` defaults to :edn. `:auth` selects an auth
    method (e.g. `{:token ...}`)."
-  [{:keys [servers codec auth on-status] :or {codec :edn}}]
+  [{:keys [servers codec auth on-status reconnect] :or {codec :edn}}]
   ;; A client-side auth error (e.g. an :nkey/seed mismatch) thrown while building
   ;; the options rejects the returned promise — with its own ex-info, unwrapped —
   ;; rather than throwing synchronously from connect (ADR 0002/0006: connect
   ;; rejects its promise). Only the wsconnect failure is wrapped as :connect-failed.
   (try
-    (-> (nats-core/wsconnect (clj->js (with-auth {:servers servers} auth)))
+    (-> (nats-core/wsconnect (clj->js (-> {:servers servers}
+                                          (with-reconnect reconnect)
+                                          (with-auth auth))))
         (.then (fn [nc]
                  ;; nats.js emits no event for the initial connection, so the
                  ;; baseline :connected is synthesized here — before the

@@ -43,22 +43,36 @@
      (reify Runnable
        (run [_] (.close client))))))
 
-;; Baseline status spine (ADR 0006/0009): map jnats' native lifecycle events onto
-;; the canonical status :type set. Unmapped events are dropped — reconnect- and
-;; server-driven types are added by their own slice.
+;; Status spine (ADR 0006/0009): map jnats' native lifecycle events onto the
+;; canonical status :type set. Unmapped events (e.g. RESUBSCRIBED) are dropped;
+;; :slow-consumer / :error production belong to the delivery / error-model slices.
 (def ^:private event->type
-  {ConnectionListener$Events/CONNECTED    :connected
-   ConnectionListener$Events/DISCONNECTED :disconnected
-   ConnectionListener$Events/CLOSED       :closed})
+  {ConnectionListener$Events/CONNECTED          :connected
+   ConnectionListener$Events/DISCONNECTED       :disconnected
+   ConnectionListener$Events/RECONNECTED        :reconnected
+   ConnectionListener$Events/LAME_DUCK          :lame-duck
+   ConnectionListener$Events/DISCOVERED_SERVERS :servers-changed
+   ConnectionListener$Events/CLOSED             :closed})
+
+(defn deliver-status!
+  "Normalize one native jnats lifecycle event; when mapped, deliver it to
+   `on-status` as a plain `{:type ...}` map and return the canonical type, else
+   nil. Unmapped events (e.g. RESUBSCRIBED) are ignored."
+  [on-status ev]
+  (when-let [t (event->type ev)]
+    (on-status {:type t})
+    t))
 
 (defn- status-listener
-  "A ConnectionListener that forwards each mapped lifecycle event to `on-status`
-   as a plain `{:type ...}` map; unmapped events are ignored."
-  ^ConnectionListener [on-status]
+  "A ConnectionListener that normalizes each lifecycle event onto `on-status`
+   (see `deliver-status!`). jnats has no reconnecting event, so when reconnection
+   is enabled a DISCONNECTED is followed by a synthesized `:reconnecting`,
+   matching nats.js' native signal."
+  ^ConnectionListener [on-status reconnect?]
   (reify ConnectionListener
     (connectionEvent [_ _conn ev]
-      (when-let [t (event->type ev)]
-        (on-status {:type t})))))
+      (when (and reconnect? (= :disconnected (deliver-status! on-status ev)))
+        (on-status {:type :reconnecting})))))
 
 (defn- nkey-auth-handler
   "An nkey AuthHandler signing nonces with `seed`. When the public `nkey` is
@@ -74,6 +88,15 @@
       (sign  [_ nonce] (.sign nk nonce))
       (getID [_] (char-array pub))
       (getJWT [_] nil))))
+
+(defn- with-reconnect
+  "Apply the `:reconnect {:max :wait-ms :jitter-ms}` connect-option to the jnats
+   Options builder. Absent keys leave jnats' own defaults in place."
+  ^Options$Builder [^Options$Builder builder {:keys [max wait-ms jitter-ms]}]
+  (cond-> builder
+    max       (.maxReconnects (int max))
+    wait-ms   (.reconnectWait (Duration/ofMillis wait-ms))
+    jitter-ms (.reconnectJitter (Duration/ofMillis jitter-ms))))
 
 (defn- with-auth
   "Apply the `:auth` connect-option to the jnats Options builder. The auth seam
@@ -91,7 +114,7 @@
   "Open a TCP connection to the first of `:servers`, resolving a CompletableFuture
    to a JvmConnection (ADR 0002: connect returns the platform-native promise).
    `:codec` defaults to :edn. `:auth` selects an auth method (e.g. `{:token ...}`)."
-  [{:keys [servers codec auth on-status] :or {codec :edn}}]
+  [{:keys [servers codec auth on-status reconnect] :or {codec :edn}}]
   (CompletableFuture/supplyAsync
    (reify Supplier
      (get [_]
@@ -102,7 +125,8 @@
        ;; Nats/connect is wrapped as :connect-failed.
        (let [^Options opts (-> (Options/builder)
                                (.servers (into-array String servers))
-                               (cond-> on-status (.connectionListener (status-listener on-status)))
+                               (cond-> on-status (.connectionListener (status-listener on-status (not= 0 (:max reconnect)))))
+                               (with-reconnect reconnect)
                                (with-auth auth)
                                (.build))]
          (try

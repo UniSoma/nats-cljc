@@ -2,6 +2,12 @@
   (:require #?(:clj  [clojure.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is async]])
             [nats-cljc.core :as nats]
+            ;; The server-driven status types (:lame-duck / :servers-changed) have
+            ;; no portable client-side trigger, so they are asserted at the real
+            ;; per-platform normalization seam (impl/deliver-status!) rather than
+            ;; against a live server signal/cluster (ADR 0009/0010).
+            #?(:clj  [nats-cljc.impl.jvm :as impl]
+               :cljs [nats-cljc.impl.js :as impl])
             #?(:cljs [promesa.core :as p])))
 
 ;; Transport differs per platform (ADR 0001): TCP on the JVM, WebSocket on CLJS.
@@ -338,6 +344,79 @@
                                           (close! conn))))))
                   (p/catch (fn [e] (is false (str "disconnect test failed: " e))))
                   (p/finally (fn [_ _] (done))))))))
+
+(deftest reconnect-config-drives-reconnection
+  #?(:clj
+     (let [[seen on-status] (status-collector)
+           conn @(nats/connect {:servers   [server-url]
+                                :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
+                                :on-status on-status})]
+       (try
+         (force-drop! conn)
+         (is (wait-for #(some #{{:type :reconnected}} @seen) 5000)
+             ":reconnected reaches :on-status after a real drop when :reconnect is configured")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (let [[seen on-status] (status-collector)]
+              (-> (nats/connect {:servers   [server-url]
+                                 :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
+                                 :on-status on-status})
+                  (p/then (fn [conn]
+                            (force-drop! conn)
+                            (-> (wait-for #(some #{{:type :reconnected}} @seen) 5000)
+                                (p/then (fn [hit?]
+                                          (is hit? ":reconnected reaches :on-status after a real drop when :reconnect is configured")
+                                          (close! conn))))))
+                  (p/catch (fn [e] (is false (str "reconnect test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+(deftest reconnecting-fires-on-drop
+  #?(:clj
+     (let [[seen on-status] (status-collector)
+           conn @(nats/connect {:servers   [server-url]
+                                :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
+                                :on-status on-status})]
+       (try
+         (force-drop! conn)
+         (is (wait-for #(some #{{:type :reconnecting}} @seen) 5000)
+             ":reconnecting reaches :on-status while the client re-establishes the link")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (let [[seen on-status] (status-collector)]
+              (-> (nats/connect {:servers   [server-url]
+                                 :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
+                                 :on-status on-status})
+                  (p/then (fn [conn]
+                            (force-drop! conn)
+                            (-> (wait-for #(some #{{:type :reconnecting}} @seen) 5000)
+                                (p/then (fn [hit?]
+                                          (is hit? ":reconnecting reaches :on-status while the client re-establishes the link")
+                                          (close! conn))))))
+                  (p/catch (fn [e] (is false (str "reconnecting test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+;; The server-driven types have no portable client-side trigger (a lame-duck
+;; needs a server signal; a server-list change needs a cluster), so they are
+;; asserted at the real normalization seam: feed the native event jnats/nats.js
+;; would emit through impl/deliver-status! and check the canonical {:type ...}
+;; reaches :on-status. The native event forks per platform; the result does not.
+(deftest lame-duck-normalized
+  (let [[seen on-status] (status-collector)]
+    (impl/deliver-status! on-status
+                          #?(:clj  io.nats.client.ConnectionListener$Events/LAME_DUCK
+                             :cljs #js {:type "ldm"}))
+    (is (some #{{:type :lame-duck}} @seen)
+        "a server-driven lame-duck event normalizes to {:type :lame-duck} on :on-status")))
+
+(deftest servers-changed-normalized
+  (let [[seen on-status] (status-collector)]
+    (impl/deliver-status! on-status
+                          #?(:clj  io.nats.client.ConnectionListener$Events/DISCOVERED_SERVERS
+                             :cljs #js {:type "update"}))
+    (is (some #{{:type :servers-changed}} @seen)
+        "a server-driven server-list change normalizes to {:type :servers-changed} on :on-status")))
 
 (deftest flush-settles
   #?(:clj
