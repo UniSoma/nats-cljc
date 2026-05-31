@@ -1,15 +1,16 @@
 ---
 id: nts-01kstxa6v2mm
 title: Delivery-semantics tests (ordering + backpressure)
-status: in_progress
+status: closed
 type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:40.993654794Z'
-updated: '2026-05-31T16:31:42.692707589Z'
+updated: '2026-05-31T19:04:43.623757168Z'
+closed: '2026-05-31T19:04:43.623757168Z'
 acceptance:
 - title: Single-subscription ordering test passes on all three platforms — messages delivered in publish order
-  done: false
+  done: true
 - title: A handler that returns a pending promise delays delivery of the next message until that promise settles
   done: true
 - title: The suite demonstrates that no cross-subscription ordering guarantee is assumed
@@ -17,7 +18,7 @@ acceptance:
 - title: Handlers never block the underlying client thread or event loop
   done: true
 - title: 'The core dispatch loop implements promise-return backpressure (ADR 0007): a handler returning a promise suspends delivery of the next message until it settles; a non-promise return delivers immediately — verified on JVM, browser, and Node'
-  done: false
+  done: true
 deps:
 - nts-01kstx8ysgv5
 links:
@@ -41,3 +42,7 @@ Retyped `task` -> `feature` and added an implementation acceptance criterion.
 Rationale: the criterion "a handler that returns a pending promise delays delivery of the next message until it settles" tests the ADR-0007 promise-return backpressure mechanism, but no implementation ticket owned building it (#2 / nts-01kstx8ysgv5 specifies only serial "one call per message" delivery). This slice now both implements and verifies that mechanism, so it is self-contained.
 
 Cleared `needs-triage` -> ready-for-agent (mode afk).
+
+**2026-05-31T19:04:43.623757168Z**
+
+Delivery-semantics suite pins the ADR-0007 contract and is CI-green on all three platforms. Single-subscription in-order delivery (single-subscription-delivers-in-order), promise-return backpressure suspending the next message until the handler's promise settles (pending-promise-handler-applies-backpressure, implemented in the dispatch loop, commit 4d5fc30), no cross-subscription ordering/coupling and handlers never block the client thread or event loop (subscriptions-are-independent). Verified JVM + Node locally, browser via CI.
