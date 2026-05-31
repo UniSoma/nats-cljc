@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Agent configuration for the `nats-cljc` repo, a **[NATS](https://nats.io) for Clojure and ClojureScript under one portable `.cljc` API.
+Agent configuration for the `nats-cljc` repo, a [NATS](https://nats.io) for Clojure and ClojureScript under one portable `.cljc` API.
 
 ## Hard rules (every task)
 
