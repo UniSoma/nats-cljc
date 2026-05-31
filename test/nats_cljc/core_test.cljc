@@ -117,6 +117,17 @@
   (let [seen (atom [])]
     [seen (fn [s] (swap! seen conj s))]))
 
+;; Portable ordering check over a status-collector's `seen` (CLJS vectors have no
+;; .indexOf): true only when a `:type a` event appears before a `:type b` one —
+;; so it also asserts both are present. Used for intra-platform ordering only
+;; (the :on-status contract normalizes shape, not cross-platform cadence).
+(defn- precedes? [seen a b]
+  (let [types (mapv :type seen)
+        idx   (fn [t] (first (keep-indexed (fn [i x] (when (= x t) i)) types)))
+        ia    (idx a)
+        ib    (idx b)]
+    (boolean (and ia ib (< ia ib)))))
+
 ;; Test-only check that a subscription has been ended (by drain/close). Reaches
 ;; the native handle subscribe returns — a jnats Subscription / a nats.js Sub.
 (defn- sub-ended? [sub]
@@ -345,7 +356,13 @@
                   (p/catch (fn [e] (is false (str "disconnect test failed: " e))))
                   (p/finally (fn [_ _] (done))))))))
 
-(deftest reconnect-config-drives-reconnection
+;; One real drop drives the whole disconnect->reconnecting->reconnected cycle, so
+;; both reconnect events are asserted from a single connection. We wait for
+;; :reconnected (the end of the cycle), then assert :reconnecting preceded it —
+;; intra-platform ordering only, per the shape-not-cadence contract (ADR 0006):
+;; the JVM synthesizes one :reconnecting per loss, nats.js emits one per dial
+;; attempt, so the count is not asserted, only that the shape arrives in order.
+(deftest reconnect-cycle-fires-reconnecting-then-reconnected
   #?(:clj
      (let [[seen on-status] (status-collector)
            conn @(nats/connect {:servers   [server-url]
@@ -355,6 +372,8 @@
          (force-drop! conn)
          (is (wait-for #(some #{{:type :reconnected}} @seen) 5000)
              ":reconnected reaches :on-status after a real drop when :reconnect is configured")
+         (is (precedes? @seen :reconnecting :reconnected)
+             ":reconnecting reaches :on-status and precedes :reconnected in the cycle")
          (finally (close! conn))))
      :cljs
      (async done
@@ -367,54 +386,78 @@
                             (-> (wait-for #(some #{{:type :reconnected}} @seen) 5000)
                                 (p/then (fn [hit?]
                                           (is hit? ":reconnected reaches :on-status after a real drop when :reconnect is configured")
+                                          (is (precedes? @seen :reconnecting :reconnected)
+                                              ":reconnecting reaches :on-status and precedes :reconnected in the cycle")
                                           (close! conn))))))
                   (p/catch (fn [e] (is false (str "reconnect test failed: " e))))
                   (p/finally (fn [_ _] (done))))))))
 
-(deftest reconnecting-fires-on-drop
+;; :reconnect {:max -1} is the unlimited sentinel — honored natively on both
+;; platforms (jnats .maxReconnects(-1); nats.js maxReconnectAttempts -1). Can't
+;; assert "never gives up", so this just locks that -1 passes through and connects.
+(deftest reconnect-unlimited-connects
   #?(:clj
-     (let [[seen on-status] (status-collector)
-           conn @(nats/connect {:servers   [server-url]
-                                :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
-                                :on-status on-status})]
-       (try
-         (force-drop! conn)
-         (is (wait-for #(some #{{:type :reconnecting}} @seen) 5000)
-             ":reconnecting reaches :on-status while the client re-establishes the link")
-         (finally (close! conn))))
+     (let [conn @(nats/connect {:servers [server-url] :reconnect {:max -1}})]
+       (is (some? conn) ":reconnect {:max -1} (unlimited) connects without error")
+       (close! conn))
      :cljs
      (async done
-            (let [[seen on-status] (status-collector)]
-              (-> (nats/connect {:servers   [server-url]
-                                 :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
-                                 :on-status on-status})
-                  (p/then (fn [conn]
-                            (force-drop! conn)
-                            (-> (wait-for #(some #{{:type :reconnecting}} @seen) 5000)
-                                (p/then (fn [hit?]
-                                          (is hit? ":reconnecting reaches :on-status while the client re-establishes the link")
-                                          (close! conn))))))
-                  (p/catch (fn [e] (is false (str "reconnecting test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+            (-> (nats/connect {:servers [server-url] :reconnect {:max -1}})
+                (p/then (fn [conn]
+                          (is (some? conn) ":reconnect {:max -1} (unlimited) connects without error")
+                          (close! conn)))
+                (p/catch (fn [e] (is false (str "unlimited reconnect connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Translation pin (CLJS only): :reconnect {:max 0} must disable reconnection via
+;; nats.js' `reconnect` boolean, NOT via maxReconnectAttempts 0 (which leaves
+;; nats.js reconnecting). -1 is unlimited; a positive max is an attempt count.
+;; This is the deterministic guard for finding #1 — a live drop can't test it,
+;; since force-drop! forces a reconnect and bypasses the disable setting.
+#?(:cljs
+   (deftest reconnect-max-0-disables-via-reconnect-boolean
+     (is (= {:reconnect false} (impl/with-reconnect {} {:max 0}))
+         ":max 0 sets nats.js' `reconnect` false, not maxReconnectAttempts 0")
+     (is (= {:maxReconnectAttempts -1} (impl/with-reconnect {} {:max -1}))
+         ":max -1 (unlimited) passes through as maxReconnectAttempts -1")
+     (is (= {:maxReconnectAttempts 5} (impl/with-reconnect {} {:max 5}))
+         "a positive :max passes through as maxReconnectAttempts")
+     (is (= {} (impl/with-reconnect {} {}))
+         "an absent :max leaves nats.js' own default in place")))
+
+;; Regression for the synthesis gate (JVM only — nats.js has no such gate):
+;; disabling reconnection (:reconnect {:max 0} → reconnect? false) must NOT
+;; silence the status spine. Driving the real ConnectionListener with reconnect?
+;; false and asserting a non-reconnect event still arrives locks that delivery is
+;; never short-circuited by the gate.
+#?(:clj
+   (deftest status-delivered-when-reconnect-disabled
+     (let [[seen on-status]                     (status-collector)
+           ^io.nats.client.ConnectionListener l (impl/status-listener on-status false)]
+       (.connectionEvent l nil io.nats.client.ConnectionListener$Events/CLOSED)
+       (is (some #{{:type :closed}} @seen)
+           "status events are delivered even when reconnection is disabled (reconnect? false)"))))
 
 ;; The server-driven types have no portable client-side trigger (a lame-duck
 ;; needs a server signal; a server-list change needs a cluster), so they are
-;; asserted at the real normalization seam: feed the native event jnats/nats.js
-;; would emit through impl/deliver-status! and check the canonical {:type ...}
-;; reaches :on-status. The native event forks per platform; the result does not.
+;; driven through the real per-platform wiring with the native event jnats/nats.js
+;; would emit: the production ConnectionListener on the JVM, and deliver-status!
+;; on CLJS (the status() pump is already live-exercised by disconnected-fires-on-drop;
+;; a fake async-iterable would be disproportionate). The native event forks per
+;; platform; the canonical {:type ...} result does not.
 (deftest lame-duck-normalized
   (let [[seen on-status] (status-collector)]
-    (impl/deliver-status! on-status
-                          #?(:clj  io.nats.client.ConnectionListener$Events/LAME_DUCK
-                             :cljs #js {:type "ldm"}))
+    #?(:clj  (let [^io.nats.client.ConnectionListener l (impl/status-listener on-status true)]
+               (.connectionEvent l nil io.nats.client.ConnectionListener$Events/LAME_DUCK))
+       :cljs (impl/deliver-status! on-status #js {:type "ldm"}))
     (is (some #{{:type :lame-duck}} @seen)
         "a server-driven lame-duck event normalizes to {:type :lame-duck} on :on-status")))
 
 (deftest servers-changed-normalized
   (let [[seen on-status] (status-collector)]
-    (impl/deliver-status! on-status
-                          #?(:clj  io.nats.client.ConnectionListener$Events/DISCOVERED_SERVERS
-                             :cljs #js {:type "update"}))
+    #?(:clj  (let [^io.nats.client.ConnectionListener l (impl/status-listener on-status true)]
+               (.connectionEvent l nil io.nats.client.ConnectionListener$Events/DISCOVERED_SERVERS))
+       :cljs (impl/deliver-status! on-status #js {:type "update"}))
     (is (some #{{:type :servers-changed}} @seen)
         "a server-driven server-list change normalizes to {:type :servers-changed} on :on-status")))
 

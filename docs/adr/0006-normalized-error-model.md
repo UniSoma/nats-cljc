@@ -9,6 +9,18 @@ Failures surface as an **`ex-info`** carrying a canonical **`:type`** keyword pl
 
 Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`.
 
+## Status events: shape, not cadence
+
+The same normalization applies to connection-lifecycle **status events** delivered to `:on-status` (canonical `:type`s in CONTEXT.md). What "identical in shape" guarantees there is deliberately narrower than for errors: each delivered event is a bare `{:type ...}` map drawn from the canonical set, but the **count, ordering, and trigger conditions are not normalized** — they follow each underlying client's native reconnect/gossip strategy. We normalize the vocabulary, not the cadence, because the alternative (collapsing or synthesizing events to make the streams byte-identical) means permanently re-implementing two clients' internal loops, and the events carry no payload a consumer could reconcile anyway (they are bare `{:type ...}`).
+
+Known divergences, accepted under this decision:
+
+- **`:reconnecting` count.** A single connection loss yields exactly one `:reconnecting` on the JVM (jnats fires no native reconnecting event, so the listener synthesizes one after `DISCONNECTED`), but one per dial attempt on Node/browser (nats.js dispatches `reconnecting` inside its dial loop).
+- **`:servers-changed` conditions.** jnats fires `DISCOVERED_SERVERS` only when genuinely new servers are gossiped; nats.js fires `Events.Update` on essentially every server INFO, including unchanged membership.
+- **Default retry count.** With `:reconnect` `:max` absent, each client keeps its own default (JVM 60, Node/browser 10).
+
+Portable consumers treat each `:type` as an edge to react to (dedup if needed), not a counter to compare across platforms.
+
 ## Considered options
 
 - **Pass native exceptions through unchanged** — rejected: `Throwable` vs `js/Error` forces host-specific branching in consumer code, defeating write-once-run-both.

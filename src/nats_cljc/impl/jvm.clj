@@ -63,16 +63,19 @@
     (on-status {:type t})
     t))
 
-(defn- status-listener
+(defn status-listener
   "A ConnectionListener that normalizes each lifecycle event onto `on-status`
    (see `deliver-status!`). jnats has no reconnecting event, so when reconnection
    is enabled a DISCONNECTED is followed by a synthesized `:reconnecting`,
-   matching nats.js' native signal."
+   matching nats.js' native signal. `deliver-status!` runs unconditionally — the
+   `reconnect?` gate guards only the synthesized `:reconnecting`, never the
+   delivery of the underlying event."
   ^ConnectionListener [on-status reconnect?]
   (reify ConnectionListener
     (connectionEvent [_ _conn ev]
-      (when (and reconnect? (= :disconnected (deliver-status! on-status ev)))
-        (on-status {:type :reconnecting})))))
+      (let [t (deliver-status! on-status ev)]
+        (when (and reconnect? (= :disconnected t))
+          (on-status {:type :reconnecting}))))))
 
 (defn- nkey-auth-handler
   "An nkey AuthHandler signing nonces with `seed`. When the public `nkey` is
@@ -91,7 +94,8 @@
 
 (defn- with-reconnect
   "Apply the `:reconnect {:max :wait-ms :jitter-ms}` connect-option to the jnats
-   Options builder. Absent keys leave jnats' own defaults in place."
+   Options builder. `:max 0` disables reconnection, `:max -1` is unlimited (jnats'
+   own sentinels); absent keys leave jnats' own defaults in place."
   ^Options$Builder [^Options$Builder builder {:keys [max wait-ms jitter-ms]}]
   (cond-> builder
     max       (.maxReconnects (int max))
@@ -123,9 +127,13 @@
        ;; ex-info, unwrapped — rather than throwing synchronously from connect
        ;; (ADR 0002/0006: connect rejects its promise). Only the server-side
        ;; Nats/connect is wrapped as :connect-failed.
-       (let [^Options opts (-> (Options/builder)
+       ;; reconnect? gates the synthesized :reconnecting: it is on unless the
+       ;; caller explicitly disabled reconnection with :reconnect {:max 0} (0 is
+       ;; jnats' "off" sentinel; absent :max keeps the client default, which is on).
+       (let [reconnect?    (not= 0 (:max reconnect))
+             ^Options opts (-> (Options/builder)
                                (.servers (into-array String servers))
-                               (cond-> on-status (.connectionListener (status-listener on-status (not= 0 (:max reconnect)))))
+                               (cond-> on-status (.connectionListener (status-listener on-status reconnect?)))
                                (with-reconnect reconnect)
                                (with-auth auth)
                                (.build))]

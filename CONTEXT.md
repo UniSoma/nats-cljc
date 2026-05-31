@@ -32,7 +32,12 @@ _Avoid_: client, session
 
 **Status event**:
 A normalized connection-lifecycle notification delivered to an `:on-status` handler, identical in shape on every platform. Canonical `:type`s: `:connected`, `:disconnected`, `:reconnecting`, `:reconnected`, `:closed`, `:error`, `:slow-consumer`, `:lame-duck`, `:servers-changed`.
+The contract normalizes *shape*, not *cadence*: each delivered event is a bare `{:type ...}` map drawn from the canonical set, but the count, ordering, and trigger conditions follow each underlying client's native strategy and may differ per platform (see ADR 0006). Known divergences: a single connection loss yields one `:reconnecting` on the JVM (synthesized) but one per dial attempt on Node/browser (nats.js' native signal); `:servers-changed` fires only when genuinely new servers are gossiped on the JVM, but on essentially every server INFO on Node/browser. Portable consumers should treat each `:type` as an edge to react to, not a counter.
 _Avoid_: connection listener, notification
+
+**Reconnect**:
+The client's automatic re-establishment of a dropped connection, configured with the `:reconnect {:max :wait-ms :jitter-ms}` connect-option. `:max` is a non-negative attempt count with two sentinels shared by both underlying clients: `0` disables reconnection, `-1` is unlimited; `:wait-ms`/`:jitter-ms` set the per-attempt delay and its random spread. Any absent key leaves the native client's own default in place — and those defaults differ (JVM 60 attempts, Node/browser 10), so omitting `:max` does not give identical retry behavior across platforms.
+_Avoid_: retry, redial
 
 **Error**:
 A failure surfaced as an `ex-info` carrying a canonical `:type` and structured data, identical in shape on every platform (so portable code reads `(:type (ex-data e))` rather than branching on host exception types). Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`. One-shot operations reject their promise with it; async failures (a throwing handler, a decode failure, a slow consumer, a protocol error) reach the connection's `:on-status` `:error` sink, or a per-subscription `:on-error`.

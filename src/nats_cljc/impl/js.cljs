@@ -82,14 +82,17 @@
                           {:type :auth-invalid :nkey nkey :derived pub})))))
     (nats-core/nkeyAuthenticator seed-bytes)))
 
-(defn- with-reconnect
+(defn with-reconnect
   "Merge the `:reconnect {:max :wait-ms :jitter-ms}` connect-option into the
-   nats-core options map. Absent keys leave nats.js' own defaults in place."
+   nats-core options map. `:max 0` disables reconnection — nats.js' off-switch is
+   the `reconnect` boolean, not `maxReconnectAttempts 0` (which keeps reconnecting)
+   — and `:max -1` is unlimited; absent keys leave nats.js' own defaults in place."
   [opts {:keys [max wait-ms jitter-ms]}]
   (cond-> opts
-    max       (assoc :maxReconnectAttempts max)
-    wait-ms   (assoc :reconnectTimeWait wait-ms)
-    jitter-ms (assoc :reconnectJitter jitter-ms)))
+    (= max 0)              (assoc :reconnect false)
+    (and max (not= max 0)) (assoc :maxReconnectAttempts max)
+    wait-ms                (assoc :reconnectTimeWait wait-ms)
+    jitter-ms              (assoc :reconnectJitter jitter-ms)))
 
 (defn- with-auth
   "Merge the `:auth` connect-option into the nats-core options map. The auth seam
