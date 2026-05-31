@@ -1,21 +1,22 @@
 ---
 id: nts-01kstxa377qb
 title: Connection lifecycle & normalized status
-status: open
+status: closed
 type: feature
 priority: 1
 mode: hitl
 created: '2026-05-29T22:22:37.286340516Z'
-updated: '2026-05-29T23:13:53.725826987Z'
+updated: '2026-05-31T15:38:14.668332658Z'
+closed: '2026-05-31T15:38:14.668332658Z'
 acceptance:
 - title: Each `:auth` shape connects against an appropriately configured server (`:token` and `:user`/`:pass` at minimum; nkey/jwt/creds where the server supports them)
-  done: false
+  done: true
 - title: '`:reconnect` options drive reconnection and the `:reconnecting` / `:reconnected` status events fire'
-  done: false
+  done: true
 - title: '`flush`, `drain` (connection and subscription), and `close` each return a promise that settles correctly; `drain` and `close` end the connection subscriptions'
-  done: false
+  done: true
 - title: Normalized `:on-status` events use the canonical `:type` set, identical in shape on all three platforms
-  done: false
+  done: true
 deps:
 - nts-01kstx8ysgv5
 ---
@@ -42,3 +43,7 @@ Split into four child slices (now a tracking epic, not an implementable unit —
 - nts-01kstzmdepdq  Reconnect + server-driven status  (dep 7a)
 
 Downstream rewired off this epic onto the specific slices: #9 (error-model) now deps [#3, #4, 7a, 7b]; #10 (blocking layer) now deps [#9, 7a].
+
+**2026-05-31T15:38:14.668332658Z**
+
+Tracking epic delivered through its four closed children: lifecycle ops + normalized status spine (nts-01kstzmd6d2v), basic auth (nts-01kstzmd96ms), advanced auth (nts-01kstzmdbxh7), and reconnect + server-driven status (nts-01kstzmdepdq) — all CI-verified on JVM, browser-headless, and Node. Covers every epic AC: all :auth shapes, :reconnect-driven :reconnecting/:reconnected, flush/drain/close settling promises with drain/close ending subs, and the canonical :on-status :type set normalized identically across platforms. The two remaining canonical types :error and :slow-consumer are intentionally owned by the error-model (nts-01kstxatbw6k) and delivery-semantics slices, which produce them — the status vocabulary and normalization spine are fully in place here. No implementation work remained in the epic; closing it to clear the stale tracking node.
