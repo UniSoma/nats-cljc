@@ -4,14 +4,22 @@
   (:require [nats-cljc.protocol :as proto])
   (:import [io.nats.client Nats Options Options$Builder Connection Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events]
            [java.time Duration]
-           [java.util.concurrent CompletableFuture CompletionStage]
-           [java.util.function Supplier Function]))
+           [java.util.concurrent CompletableFuture CompletionStage CancellationException TimeoutException]
+           [java.util.function Supplier Function BiFunction]))
 
 ;; Upper bound for the blocking flush/drain one-shots; a healthy connection
 ;; settles in milliseconds. Finite (not Duration.ZERO = wait-forever) so a dead
 ;; connection rejects rather than hangs; richer timeout handling is the
 ;; error-model slice's job.
 (def ^:private ^Duration op-timeout (Duration/ofSeconds 10))
+
+(defn- msg->raw
+  "Lift a jnats Message into the raw map the facade decodes (ADR 0005): subject,
+   wire bytes, and the reply-to subject (nil when absent)."
+  [^Message msg]
+  {:subject (.getSubject msg)
+   :bytes   (.getData msg)
+   :reply   (.getReplyTo msg)})
 
 (defrecord JvmConnection [^Connection client codec]
   proto/Conn
@@ -37,8 +45,7 @@
       (.subscribe dispatcher ^String subject
                   (reify MessageHandler
                     (onMessage [_ msg]
-                      (let [m {:subject (.getSubject ^Message msg)
-                               :bytes   (.getData ^Message msg)}]
+                      (let [m (msg->raw msg)]
                         (swap! tail
                                (fn [^CompletableFuture prev]
                                  (-> prev
@@ -69,7 +76,29 @@
     ;; ConnectionListener as the connection tears down.
     (CompletableFuture/runAsync
      (reify Runnable
-       (run [_] (.close client))))))
+       (run [_] (.close client)))))
+  (-request [_ subject bytes timeout-ms]
+    ;; jnats' requestWithTimeout returns a CompletableFuture<Message> over its
+    ;; muxed reply-inbox. `.handle` lifts a successful Message into the raw map the
+    ;; facade decodes, and normalizes the two failure modes (ADR 0006): with the
+    ;; connection's useTimeoutException set (see `connect`), a timeout completes the
+    ;; future with a TimeoutException, while a no-responders 503 cancels it
+    ;; (CancellationException). We re-throw each as a typed ex-info so the facade's
+    ;; promise rejects with it.
+    (.handle ^CompletableFuture (.requestWithTimeout client ^String subject ^bytes bytes (Duration/ofMillis timeout-ms))
+             (reify BiFunction
+               (apply [_ msg ex]
+                 (cond
+                   (nil? ex)
+                   (msg->raw msg)
+                   (instance? TimeoutException ex)
+                   (throw (ex-info "Request timed out"
+                                   {:type :timeout :subject subject :timeout-ms timeout-ms}))
+                   (instance? CancellationException ex)
+                   (throw (ex-info "No responders for request"
+                                   {:type :no-responders :subject subject}))
+                   :else
+                   (throw ex)))))))
 
 ;; Status spine (ADR 0006/0009): map jnats' native lifecycle events onto the
 ;; canonical status :type set. Unmapped events (e.g. RESUBSCRIBED) are dropped;
@@ -161,6 +190,11 @@
        (let [reconnect?    (not= 0 (:max reconnect))
              ^Options opts (-> (Options/builder)
                                (.servers (into-array String servers))
+                               ;; Surface a request timeout as a TimeoutException
+                               ;; (vs the default CancellationException, which a
+                               ;; no-responders 503 also raises) so -request can
+                               ;; tell the two failure modes apart (ADR 0006).
+                               (.useTimeoutException)
                                (cond-> on-status (.connectionListener (status-listener on-status reconnect?)))
                                (with-reconnect reconnect)
                                (with-auth auth)
@@ -179,3 +213,10 @@
    connection."
   [^Subscription sub]
   (.drain sub op-timeout))
+
+(defn then
+  "Map `f` over the value the native promise `p` resolves to, returning a new
+   native promise. The facade uses it to decode a raw message map without touching
+   jnats' Message type (ADR 0005); a rejection propagates untouched."
+  [^CompletableFuture p f]
+  (.thenApply p (reify Function (apply [_ x] (f x)))))

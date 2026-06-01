@@ -4,8 +4,8 @@
    codec encode/decode; everything here deals in raw wire bytes.
 
    The lifecycle slice adds -flush/-close (and -drain, which the facade also
-   applies to a native Subscription); later slices grow it further (request,
-   unsubscribe, status)."
+   applies to a native Subscription); the request/reply slice adds -request;
+   later slices grow it further (unsubscribe, status)."
   ;; -flush would otherwise shadow cljs.core/-flush (IWriter); no clojure.core
   ;; var by that name exists, so the exclude is a no-op on the JVM.
   (:refer-clojure :exclude [-flush]))
@@ -17,7 +17,15 @@
   (-subscribe [conn subject handler]
     "Subscribe to `subject`, returning a native Subscription synchronously.
      `handler` is the low-level handler, invoked per message with a raw map
-     `{:subject <string> :bytes <platform-bytes>}`.")
+     `{:subject <string> :bytes <platform-bytes> :reply <string-or-nil>}`,
+     where `:reply` is the message's reply-to subject (nil when absent).")
+  (-request [conn subject bytes timeout-ms]
+    "Send a request: publish raw `bytes` to `subject` with a managed reply inbox,
+     returning a native promise of the raw reply map
+     `{:subject <string> :bytes <platform-bytes> :reply <string-or-nil>}`. The
+     promise rejects with an ex-info carrying `:type :no-responders` (nobody
+     subscribes `subject`) or `:type :timeout` (responders exist but none answer
+     within `timeout-ms`) (ADR 0002/0006).")
   (-flush [conn]
     "Flush pending writes, returning a native promise that settles once the
      server has processed everything buffered on the connection.")

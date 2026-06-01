@@ -76,6 +76,17 @@
 (def ^:private indep-a-subject "delivery.indep.a")
 (def ^:private indep-b-subject "delivery.indep.b")
 
+;; Request/reply subject (ADR 0002/0006). The responder subscribes here; the
+;; requester's reply arrives on a per-request inbox the client manages.
+(def ^:private request-subject "rr.request")
+
+;; A subject no test ever subscribes — exercises the :no-responders failure mode.
+(def ^:private no-responders-subject "rr.no-responders")
+
+;; A subject a responder subscribes but never answers — exercises the :timeout
+;; failure mode (responders exist, yet none reply within :timeout-ms).
+(def ^:private silent-subject "rr.silent")
+
 ;; Test-only teardown: close the native client so jnats' non-daemon threads (and
 ;; the CLJS ws connection) don't outlive the test. A public close/drain is its
 ;; own slice; here we reach the record's client field directly.
@@ -690,4 +701,98 @@
                                           (is hit? "the backpressured subscription resumes once its promise settles")))
                                 (p/finally (fn [_ _] (close! conn)))))))
                 (p/catch (fn [e] (is false (str "independence test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Request/reply over the core round-trip (ADR 0002/0006). A responder subscribes
+;; to `request-subject` and answers via `reply` (sugar that publishes to the
+;; request's `:reply` inbox); the requester's `request` resolves to the decoded
+;; reply message. `reply` returns nil; every delivered/resolved message carries a
+;; `:reply` key (nil when there is no reply subject).
+(deftest request-reply-round-trip
+  #?(:clj
+     (let [conn    @(nats/connect {:servers [server-url]})
+           replied (promise)]
+       (try
+         (nats/subscribe conn request-subject
+                         (fn [msg]
+                           (deliver replied (nats/reply conn msg {:pong (:n (:data msg))}))))
+         (let [resp (deref (nats/request conn request-subject {:n 7} {:timeout-ms 5000}) 5000 ::timeout)]
+           (is (not= ::timeout resp) "request resolves within 5s")
+           (is (= {:pong 7} (:data resp)) "request resolves to the decoded reply payload")
+           (is (contains? resp :reply) "resolved message always carries a :reply key")
+           (is (nil? (deref replied 5000 ::unset)) "reply returns nil"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [replied (atom ::unset)]
+                            (nats/subscribe conn request-subject
+                                            (fn [msg]
+                                              (reset! replied (nats/reply conn msg {:pong (:n (:data msg))}))))
+                            (-> (p/timeout (nats/request conn request-subject {:n 7} {:timeout-ms 5000}) 5000)
+                                (p/then (fn [resp]
+                                          (is (= {:pong 7} (:data resp)) "request resolves to the decoded reply payload")
+                                          (is (contains? resp :reply) "resolved message always carries a :reply key")
+                                          (is (nil? @replied) "reply returns nil")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "request/reply round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; No-responders failure mode (ADR 0006): a request to a subject nobody
+;; subscribes rejects fast with a normalized `:type :no-responders`, distinct
+;; from a timeout — the server reports it as soon as it sees no subscribers.
+(deftest request-no-responders-rejects
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})
+           t    (try (deref (nats/request conn no-responders-subject {:n 1} {:timeout-ms 2000}) 5000 ::timeout)
+                     nil
+                     (catch java.util.concurrent.ExecutionException e
+                       (:type (ex-data (.getCause e)))))]
+       (try
+         (is (= :no-responders t)
+             "a request to a subject with no subscribers rejects with :no-responders")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (-> (nats/request conn no-responders-subject {:n 1} {:timeout-ms 2000})
+                              (p/then (fn [_] (is false "expected the request to reject with :no-responders")))
+                              (p/catch (fn [e]
+                                         (is (= :no-responders (:type (ex-data e)))
+                                             "a request to a subject with no subscribers rejects with :no-responders")))
+                              (p/finally (fn [_ _] (close! conn))))))
+                (p/catch (fn [e] (is false (str "connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Timeout failure mode (ADR 0006): responders exist (a subscriber is registered,
+;; confirmed via flush) but none answer within :timeout-ms, so the request
+;; rejects with a normalized `:type :timeout` — distinct from :no-responders.
+(deftest request-timeout-rejects
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})]
+       (try
+         (nats/subscribe conn silent-subject (fn [_msg] nil))
+         @(nats/flush conn)
+         (let [t (try (deref (nats/request conn silent-subject {:n 1} {:timeout-ms 300}) 5000 ::timeout)
+                      nil
+                      (catch java.util.concurrent.ExecutionException e
+                        (:type (ex-data (.getCause e)))))]
+           (is (= :timeout t)
+               "a request whose responders never answer within :timeout-ms rejects with :timeout"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (nats/subscribe conn silent-subject (fn [_msg] nil))
+                          (-> (nats/flush conn)
+                              (p/then (fn [_] (nats/request conn silent-subject {:n 1} {:timeout-ms 300})))
+                              (p/then (fn [_] (is false "expected the request to reject with :timeout")))
+                              (p/catch (fn [e]
+                                         (is (= :timeout (:type (ex-data e)))
+                                             "a request whose responders never answer within :timeout-ms rejects with :timeout")))
+                              (p/finally (fn [_ _] (close! conn))))))
+                (p/catch (fn [e] (is false (str "connect failed: " e))))
                 (p/finally (fn [_ _] (done)))))))

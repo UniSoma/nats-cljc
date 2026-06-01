@@ -5,6 +5,28 @@
   (:require [nats-cljc.protocol :as proto]
             ["@nats-io/nats-core" :as nats-core]))
 
+(defn- no-responders?
+  "True when `e` is nats.js' no-responders rejection: a RequestError whose
+   .isNoResponders() is true, or a bare NoRespondersError (its usual cause)."
+  [e]
+  (or (instance? nats-core/NoRespondersError e)
+      (and (instance? nats-core/RequestError e) (.isNoResponders ^js e))))
+
+(defn- timeout?
+  "True when `e` is nats.js' request-timeout rejection: a TimeoutError, directly
+   or as the cause of a wrapping RequestError."
+  [e]
+  (or (instance? nats-core/TimeoutError e)
+      (instance? nats-core/TimeoutError (.-cause ^js e))))
+
+(defn- msg->raw
+  "Lift a nats.js Msg into the raw map the facade decodes (ADR 0005): subject,
+   wire bytes, and the reply-to subject (nil when absent)."
+  [^js msg]
+  {:subject (.-subject msg)
+   :bytes   (.-data msg)
+   :reply   (.-reply msg)})
+
 (defrecord JsConnection [client codec]
   proto/Conn
   (-publish [_ subject bytes]
@@ -28,8 +50,7 @@
     (let [tail (atom (js/Promise.resolve))]
       (.subscribe ^js client subject
                   #js {:callback (fn [_err ^js msg]
-                                   (let [m {:subject (.-subject msg)
-                                            :bytes   (.-data msg)}]
+                                   (let [m (msg->raw msg)]
                                      (swap! tail
                                             (fn [^js prev]
                                               (-> prev
@@ -46,7 +67,23 @@
   (-close [_]
     ;; nats.js close already returns a Promise; the "close" status event reaches
     ;; :on-status via the status() pump as the connection tears down.
-    (.close ^js client)))
+    (.close ^js client))
+  (-request [_ subject bytes timeout-ms]
+    ;; nats.js request() resolves to a Msg over its muxed inbox; map it into the
+    ;; raw map the facade decodes. nats.js already distinguishes the two failure
+    ;; modes natively, which we normalize to typed ex-infos so the facade's promise
+    ;; rejects with them (ADR 0006).
+    (-> (.request ^js client subject bytes #js {:timeout timeout-ms})
+        (.then (fn [^js msg] (msg->raw msg)))
+        (.catch (fn [e]
+                  (throw (cond
+                           (no-responders? e)
+                           (ex-info "No responders for request"
+                                    {:type :no-responders :subject subject})
+                           (timeout? e)
+                           (ex-info "Request timed out"
+                                    {:type :timeout :subject subject :timeout-ms timeout-ms})
+                           :else e)))))))
 
 (defn- ->bytes [s]
   (.encode (js/TextEncoder.) s))
@@ -159,3 +196,10 @@
    a connection."
   [^js sub]
   (.drain sub))
+
+(defn then
+  "Map `f` over the value the native promise `p` resolves to, returning a new
+   native promise. The facade uses it to decode a raw message map without touching
+   nats.js' Msg type (ADR 0005); a rejection propagates untouched."
+  [p f]
+  (.then ^js p f))
