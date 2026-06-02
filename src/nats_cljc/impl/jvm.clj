@@ -21,11 +21,20 @@
    :bytes   (.getData msg)
    :reply   (.getReplyTo msg)})
 
+(defrecord JvmSubscription [^Subscription sub]
+  proto/Drainable
+  ;; jnats sub.drain returns a CompletableFuture<Boolean> that settles once the
+  ;; subscription's pending messages are delivered and it is removed — ending just
+  ;; this subscription, leaving the connection open.
+  (-drain [_] (.drain sub op-timeout))
+  proto/Sub
+  (-active? [_] (.isActive sub)))
+
 (defrecord JvmConnection [^Connection client codec]
   proto/Conn
   (-publish [_ subject bytes]
     (.publish client ^String subject ^bytes bytes))
-  (-subscribe [_ subject handler]
+  (-subscribe [_ subject queue handler]
     ;; Per-subscription tail: each message's handler invocation is composed onto
     ;; the previous one's settle, so a handler that returns a CompletionStage
     ;; suspends delivery of the next message until it settles — promise-return
@@ -41,24 +50,31 @@
     ;; never trips. Honoring :max-pending + surfacing :slow-consumer is
     ;; nts-01kstxatbw6k AC#4 (likely a rework to a blocking-dispatcher model).
     (let [^Dispatcher dispatcher (.createDispatcher client)
-          tail                   (atom (CompletableFuture/completedFuture nil))]
-      (.subscribe dispatcher ^String subject
-                  (reify MessageHandler
-                    (onMessage [_ msg]
-                      (let [m (msg->raw msg)]
-                        (swap! tail
-                               (fn [^CompletableFuture prev]
-                                 (-> prev
-                                     (.thenCompose
-                                      (reify Function
-                                        (apply [_ _]
-                                          (let [r (handler m)]
-                                            (if (instance? CompletionStage r)
-                                              r
-                                              (CompletableFuture/completedFuture nil))))))
-                                     (.exceptionally
-                                      (reify Function
-                                        (apply [_ _] nil))))))))))))
+          tail                   (atom (CompletableFuture/completedFuture nil))
+          ^MessageHandler mh     (reify MessageHandler
+                                   (onMessage [_ msg]
+                                     (let [m (msg->raw msg)]
+                                       (swap! tail
+                                              (fn [^CompletableFuture prev]
+                                                (-> prev
+                                                    (.thenCompose
+                                                     (reify Function
+                                                       (apply [_ _]
+                                                         (let [r (handler m)]
+                                                           (if (instance? CompletionStage r)
+                                                             r
+                                                             (CompletableFuture/completedFuture nil))))))
+                                                    (.exceptionally
+                                                     (reify Function
+                                                       (apply [_ _] nil)))))))))]
+      ;; The queue-group name selects jnats' three-arg subscribe overload
+      ;; (subject, queue, handler); a nil queue is a plain subscription. Wrap the
+      ;; native handle in a JvmSubscription so the facade returns a uniform
+      ;; Subscription (drain/active?) instead of leaking jnats' type.
+      (->JvmSubscription
+       (if queue
+         (.subscribe dispatcher ^String subject ^String queue mh)
+         (.subscribe dispatcher ^String subject mh)))))
   (-flush [_]
     ;; jnats flush blocks until the server has processed the buffer (or the
     ;; timeout elapses, completing the future exceptionally); run it off-thread
@@ -66,10 +82,6 @@
     (CompletableFuture/runAsync
      (reify Runnable
        (run [_] (.flush client op-timeout)))))
-  (-drain [_]
-    ;; jnats drain already returns a CompletableFuture<Boolean>; draining ends the
-    ;; connection's subscriptions and closes it (CLOSED reaches :on-status).
-    (.drain client op-timeout))
   (-close [_]
     ;; jnats close is blocking and void; run it off-thread so the facade returns
     ;; a settling promise (ADR 0002). The CLOSED event reaches :on-status via the
@@ -98,7 +110,12 @@
                    (throw (ex-info "No responders for request"
                                    {:type :no-responders :subject subject}))
                    :else
-                   (throw ex)))))))
+                   (throw ex))))))
+  proto/Drainable
+  (-drain [_]
+    ;; jnats drain already returns a CompletableFuture<Boolean>; draining ends the
+    ;; connection's subscriptions and closes it (CLOSED reaches :on-status).
+    (.drain client op-timeout)))
 
 ;; Status spine (ADR 0006/0009): map jnats' native lifecycle events onto the
 ;; canonical status :type set. Unmapped events (e.g. RESUBSCRIBED) are dropped;
@@ -205,14 +222,6 @@
              (throw (ex-info "Failed to connect to NATS"
                              {:type :connect-failed :servers servers}
                              e)))))))))
-
-(defn drain-subscription
-  "Drain a single native Subscription, returning a CompletableFuture<Boolean>
-   that settles once its pending messages are delivered and it is removed. The
-   facade's `drain` routes here when handed a subscription rather than a
-   connection."
-  [^Subscription sub]
-  (.drain sub op-timeout))
 
 (defn then
   "Map `f` over the value the native promise `p` resolves to, returning a new

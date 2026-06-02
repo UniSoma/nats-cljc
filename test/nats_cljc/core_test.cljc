@@ -2,6 +2,7 @@
   (:require #?(:clj  [clojure.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is async]])
             [nats-cljc.core :as nats]
+            [nats-cljc.protocol :as proto]
             ;; The server-driven status types (:lame-duck / :servers-changed) have
             ;; no portable client-side trigger, so they are asserted at the real
             ;; per-platform normalization seam (impl/deliver-status!) rather than
@@ -76,6 +77,11 @@
 (def ^:private indep-a-subject "delivery.indep.a")
 (def ^:private indep-b-subject "delivery.indep.b")
 
+;; Queue-group subjects (ADR 0007). Distinct per behavior so the shared servers
+;; don't cross-feed between tests.
+(def ^:private queue-subject "delivery.queue")
+(def ^:private queue-mixed-subject "delivery.queue.mixed")
+
 ;; Request/reply subject (ADR 0002/0006). The responder subscribes here; the
 ;; requester's reply arrives on a per-request inbox the client manages.
 (def ^:private request-subject "rr.request")
@@ -146,11 +152,10 @@
         ib    (idx b)]
     (boolean (and ia ib (< ia ib)))))
 
-;; Test-only check that a subscription has been ended (by drain/close). Reaches
-;; the native handle subscribe returns — a jnats Subscription / a nats.js Sub.
+;; Test-only check that a subscription has been ended (by drain/close), through
+;; the portable Subscription record's -active? — no native-handle reach-in.
 (defn- sub-ended? [sub]
-  #?(:clj  (not (.isActive sub))
-     :cljs (.isClosed ^js sub)))
+  (not (proto/-active? sub)))
 
 (deftest connect-resolves-to-a-connection
   #?(:clj
@@ -702,6 +707,93 @@
                                 (p/finally (fn [_ _] (close! conn)))))))
                 (p/catch (fn [e] (is false (str "independence test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
+
+;; Queue groups / competing consumers (ADR 0007). Subscriptions sharing a :queue
+;; group on one subject compete: the server load-balances each matching message to
+;; exactly one member, so the group's combined delivery is the full stream with no
+;; duplication (a disjoint share). All subs and the pubs share one connection, so
+;; the server registers the subscriptions before any message arrives — no flush.
+(deftest queue-group-load-balances
+  (let [n 50]
+    #?(:clj
+       (let [conn @(nats/connect {:servers [server-url]})
+             a    (atom [])
+             b    (atom [])]
+         (try
+           (nats/subscribe conn queue-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
+           (nats/subscribe conn queue-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
+           (dotimes [i n] (nats/publish conn queue-subject i))
+           (is (wait-for #(= n (+ (count @a) (count @b))) 5000)
+               "every published message reaches the queue group")
+           (is (= (vec (range n)) (vec (sort (concat @a @b))))
+               "each message reaches exactly one member — combined delivery is the full set, no duplication")
+           (is (and (seq @a) (seq @b))
+               "both members receive a share (the server load-balances)")
+           (finally (close! conn))))
+       :cljs
+       (async done
+              (-> (nats/connect {:servers [server-url]})
+                  (p/then (fn [conn]
+                            (let [a (atom [])
+                                  b (atom [])]
+                              (nats/subscribe conn queue-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
+                              (nats/subscribe conn queue-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
+                              (dotimes [i n] (nats/publish conn queue-subject i))
+                              (-> (wait-for #(= n (+ (count @a) (count @b))) 5000)
+                                  (p/then (fn [hit?]
+                                            (is hit? "every published message reaches the queue group")
+                                            (is (= (vec (range n)) (vec (sort (concat @a @b))))
+                                                "each message reaches exactly one member — combined delivery is the full set, no duplication")
+                                            (is (and (seq @a) (seq @b))
+                                                "both members receive a share (the server load-balances)")))
+                                  (p/finally (fn [_ _] (close! conn)))))))
+                  (p/catch (fn [e] (is false (str "queue group test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+;; A queue group only competes within itself: a plain (non-queue) subscription on
+;; the same subject is a separate interest, so it still receives every message
+;; while the group splits the same stream (ADR 0007). One connection registers all
+;; three subscriptions before any publish — no flush needed.
+(deftest non-queue-subscription-receives-all-alongside-a-queue-group
+  (let [n 50]
+    #?(:clj
+       (let [conn @(nats/connect {:servers [server-url]})
+             a    (atom [])
+             b    (atom [])
+             all  (atom [])]
+         (try
+           (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
+           (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
+           (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! all conj (:data msg))))
+           (dotimes [i n] (nats/publish conn queue-mixed-subject i))
+           (is (wait-for #(and (= n (count @all)) (= n (+ (count @a) (count @b)))) 5000)
+               "the plain subscription and the queue group both finish")
+           (is (= (vec (range n)) (vec (sort @all)))
+               "a non-queue subscription on the same subject receives every message")
+           (is (= (vec (range n)) (vec (sort (concat @a @b))))
+               "the queue group still splits the same stream into a disjoint share")
+           (finally (close! conn))))
+       :cljs
+       (async done
+              (-> (nats/connect {:servers [server-url]})
+                  (p/then (fn [conn]
+                            (let [a   (atom [])
+                                  b   (atom [])
+                                  all (atom [])]
+                              (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
+                              (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
+                              (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! all conj (:data msg))))
+                              (dotimes [i n] (nats/publish conn queue-mixed-subject i))
+                              (-> (wait-for #(and (= n (count @all)) (= n (+ (count @a) (count @b)))) 5000)
+                                  (p/then (fn [hit?]
+                                            (is hit? "the plain subscription and the queue group both finish")
+                                            (is (= (vec (range n)) (vec (sort @all)))
+                                                "a non-queue subscription on the same subject receives every message")
+                                            (is (= (vec (range n)) (vec (sort (concat @a @b))))
+                                                "the queue group still splits the same stream into a disjoint share")))
+                                  (p/finally (fn [_ _] (close! conn)))))))
+                  (p/catch (fn [e] (is false (str "mixed queue/plain test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
 
 ;; Request/reply over the core round-trip (ADR 0002/0006). A responder subscribes
 ;; to `request-subject` and answers via `reply` (sugar that publishes to the

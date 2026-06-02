@@ -8,7 +8,8 @@
   ;; `flush` is part of the public verb surface, shadowing clojure.core/flush
   ;; (and cljs.core/flush) here on purpose.
   (:refer-clojure :exclude [flush])
-  (:require [nats-cljc.codec :as codec]
+  (:require [clojure.string :as str]
+            [nats-cljc.codec :as codec]
             [nats-cljc.protocol :as proto]
             #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])))
@@ -45,11 +46,16 @@
   "Subscribe to `subject`, returning a Subscription synchronously. `handler` is
    invoked once per message with `{:subject :data :reply}`, where `:data` is
    decoded with the connection's codec and `:reply` is the message's reply-to
-   subject (nil when absent), which `reply` answers (ADR 0007)."
-  [conn subject handler]
-  (let [codec-kw (:codec conn)]
-    (proto/-subscribe conn subject
-                      (fn [raw] (handler (decode-msg codec-kw raw))))))
+   subject (nil when absent), which `reply` answers (ADR 0007). `opts` may set
+   `:queue`: subscriptions sharing a queue-group name compete, so the server
+   load-balances each matching message to exactly one member of the group. A nil
+   or blank `:queue` is a plain subscription (normalized here so both platforms
+   agree, rather than relying on each native layer's truthiness)."
+  ([conn subject handler] (subscribe conn subject handler {}))
+  ([conn subject handler {:keys [queue]}]
+   (let [codec-kw (:codec conn)]
+     (proto/-subscribe conn subject (when-not (str/blank? queue) queue)
+                       (fn [raw] (handler (decode-msg codec-kw raw)))))))
 
 (defn request
   "Send a request to `subject` on `conn`, encoding `data` with the connection's
@@ -89,9 +95,7 @@
    then closes the connection; for a subscription, it ends just that one and
    leaves the connection open (ADR 0002)."
   [conn-or-sub]
-  (if (satisfies? proto/Conn conn-or-sub)
-    (proto/-drain conn-or-sub)
-    (impl/drain-subscription conn-or-sub)))
+  (proto/-drain conn-or-sub))
 
 (defn close
   "Close `conn`, returning a platform-native promise that settles once the

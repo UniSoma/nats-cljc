@@ -27,11 +27,20 @@
    :bytes   (.-data msg)
    :reply   (.-reply msg)})
 
+(defrecord JsSubscription [sub]
+  proto/Drainable
+  ;; nats.js sub.drain returns a Promise that settles once the subscription's
+  ;; pending messages are delivered and it closes — ending just this subscription,
+  ;; leaving the connection open.
+  (-drain [_] (.drain ^js sub))
+  proto/Sub
+  (-active? [_] (not (.isClosed ^js sub))))
+
 (defrecord JsConnection [client codec]
   proto/Conn
   (-publish [_ subject bytes]
     (.publish ^js client subject bytes))
-  (-subscribe [_ subject handler]
+  (-subscribe [_ subject queue handler]
     ;; A subscribe with a :callback delivers per-message and returns the
     ;; Subscription synchronously (instead of becoming an async iterable). The
     ;; per-subscription tail chains each handler invocation onto the previous
@@ -47,23 +56,24 @@
     ;; for a :callback sub, so nothing signals or bounds it. Honoring :max-pending
     ;; + surfacing :slow-consumer is nts-01kstxatbw6k AC#4 (likely a rework to the
     ;; async-iterator + await-handler model, where nats.js buffers and signals).
-    (let [tail (atom (js/Promise.resolve))]
-      (.subscribe ^js client subject
-                  #js {:callback (fn [_err ^js msg]
-                                   (let [m (msg->raw msg)]
-                                     (swap! tail
-                                            (fn [^js prev]
-                                              (-> prev
-                                                  (.then (fn [_] (handler m)))
-                                                  (.catch (fn [_] js/undefined)))))))})))
+    (let [tail (atom (js/Promise.resolve))
+          opts #js {:callback (fn [_err ^js msg]
+                                (let [m (msg->raw msg)]
+                                  (swap! tail
+                                         (fn [^js prev]
+                                           (-> prev
+                                               (.then (fn [_] (handler m)))
+                                               (.catch (fn [_] js/undefined)))))))}]
+      ;; The queue-group name rides in nats.js' SubscriptionOptions alongside
+      ;; :callback; omit it for a plain subscription. Wrap the native Sub in a
+      ;; JsSubscription so the facade returns a uniform Subscription (drain/active?)
+      ;; instead of leaking nats.js' type.
+      (when queue (set! (.-queue opts) queue))
+      (->JsSubscription (.subscribe ^js client subject opts))))
   (-flush [_]
     ;; nats.js flush already returns a Promise that settles once the server has
     ;; processed the buffer.
     (.flush ^js client))
-  (-drain [_]
-    ;; nats.js drain already returns a Promise; draining ends the connection's
-    ;; subscriptions and closes it (the "close" status event still flows).
-    (.drain ^js client))
   (-close [_]
     ;; nats.js close already returns a Promise; the "close" status event reaches
     ;; :on-status via the status() pump as the connection tears down.
@@ -83,7 +93,12 @@
                            (timeout? e)
                            (ex-info "Request timed out"
                                     {:type :timeout :subject subject :timeout-ms timeout-ms})
-                           :else e)))))))
+                           :else e))))))
+  proto/Drainable
+  (-drain [_]
+    ;; nats.js drain already returns a Promise; draining ends the connection's
+    ;; subscriptions and closes it (the "close" status event still flows).
+    (.drain ^js client)))
 
 (defn- ->bytes [s]
   (.encode (js/TextEncoder.) s))
@@ -189,13 +204,6 @@
                                   e)))))
     (catch :default e
       (js/Promise.reject e))))
-
-(defn drain-subscription
-  "Drain a single native Subscription, returning the Promise nats.js' sub.drain()
-   yields. The facade's `drain` routes here when handed a subscription rather than
-   a connection."
-  [^js sub]
-  (.drain sub))
 
 (defn then
   "Map `f` over the value the native promise `p` resolves to, returning a new
