@@ -2,6 +2,7 @@
   (:require #?(:clj  [clojure.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is async]])
             [nats-cljc.core :as nats]
+            [nats-cljc.codec :as codec]
             [nats-cljc.protocol :as proto]
             ;; The server-driven status types (:lame-duck / :servers-changed) have
             ;; no portable client-side trigger, so they are asserted at the real
@@ -113,10 +114,9 @@
 (defn- close! [conn] (.close (:client conn)))
 
 ;; A `:bytes` subscriber observes the exact wire bytes a publisher produced;
-;; UTF-8-decode them so the per-call-override assertion reads as a string.
-(defn- raw->str [b]
-  #?(:clj  (String. ^bytes b java.nio.charset.StandardCharsets/UTF_8)
-     :cljs (.decode (js/TextDecoder.) b)))
+;; UTF-8-decode them (via codec's public bridge) so the per-call-override
+;; assertion reads as a string.
+(def ^:private raw->str codec/bytes->str)
 
 ;; Test-only trigger for a real link drop: both native clients expose a public
 ;; force-reconnect that genuinely drops the socket (firing the native
@@ -885,20 +885,33 @@
 
 ;; AC1: a per-call :codec overrides the connection default on request, and reply
 ;; gains an opts arity so the response leg matches. The connection defaults to
-;; :edn; the requester sends with :codec :string (so request both encodes the
-;; request and decodes the reply as :string) and the responder replies with
-;; :codec :string. The requester only reads back the plain "pong" when both
-;; honor the override — the :edn default would have decoded the quoted reply
-;; bytes to the symbol `pong`, or encoded the reply as "\"pong\"".
+;; :edn; the requester sends "hi" with :codec :string and the responder both
+;; subscribes and replies with :codec :string. Two legs are asserted so neither
+;; encode override can silently regress:
+;;   - request-encode: the responder captures and asserts it received "hi".
+;;     :string encodes it unquoted; the :edn default would have sent "\"hi\"",
+;;     which the subscriber's :string decodes to the literal "\"hi\"" — failing
+;;     the assertion. (A value like 42 is useless here: (pr-str 42) = (str 42),
+;;     so :edn and :string are byte-identical and the override leg goes untested.)
+;;   - reply-encode + request-decode: the requester reads back the plain "pong".
+;;     The :edn default would have decoded the reply bytes to the symbol `pong`,
+;;     or encoded the reply as "\"pong\"".
+;; The responder asserts on the main thread (via a promise/deferred), not inside
+;; the handler, so the report lands on the test thread.
 (deftest per-call-codec-overrides-request-and-reply
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})]
+     (let [conn     @(nats/connect {:servers [server-url]})
+           received (promise)]
        (try
          (nats/subscribe conn codec-request-subject
-                         (fn [msg] (nats/reply conn msg "pong" {:codec :string}))
+                         (fn [msg]
+                           (deliver received (:data msg))
+                           (nats/reply conn msg "pong" {:codec :string}))
                          {:codec :string})
-         (let [resp (deref (nats/request conn codec-request-subject 42 {:codec :string :timeout-ms 5000}) 5000 ::timeout)]
+         (let [resp (deref (nats/request conn codec-request-subject "hi" {:codec :string :timeout-ms 5000}) 5000 ::timeout)]
            (is (not= ::timeout resp) "request resolves within 5s")
+           (is (= "hi" (deref received 5000 ::timeout))
+               "the per-call :string on request encodes the body unquoted (the :edn default would have sent \"\\\"hi\\\"\")")
            (is (= "pong" (:data resp))
                "request and reply honor the per-call :string over the :edn default"))
          (finally (close! conn))))
@@ -906,14 +919,21 @@
      (async done
             (-> (nats/connect {:servers [server-url]})
                 (p/then (fn [conn]
-                          (nats/subscribe conn codec-request-subject
-                                          (fn [msg] (nats/reply conn msg "pong" {:codec :string}))
-                                          {:codec :string})
-                          (-> (p/timeout (nats/request conn codec-request-subject 42 {:codec :string :timeout-ms 5000}) 5000)
-                              (p/then (fn [resp]
-                                        (is (= "pong" (:data resp))
-                                            "request and reply honor the per-call :string over the :edn default")))
-                              (p/finally (fn [_ _] (close! conn))))))
+                          (let [received (p/deferred)]
+                            (nats/subscribe conn codec-request-subject
+                                            (fn [msg]
+                                              (p/resolve! received (:data msg))
+                                              (nats/reply conn msg "pong" {:codec :string}))
+                                            {:codec :string})
+                            (-> (p/timeout (nats/request conn codec-request-subject "hi" {:codec :string :timeout-ms 5000}) 5000)
+                                (p/then (fn [resp]
+                                          (is (= "pong" (:data resp))
+                                              "request and reply honor the per-call :string over the :edn default")))
+                                (p/then (fn [_] (p/timeout received 5000)))
+                                (p/then (fn [recvd]
+                                          (is (= "hi" recvd)
+                                              "the per-call :string on request encodes the body unquoted (the :edn default would have sent \"\\\"hi\\\"\")")))
+                                (p/finally (fn [_ _] (close! conn)))))))
                 (p/catch (fn [e] (is false (str "request/reply override failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 

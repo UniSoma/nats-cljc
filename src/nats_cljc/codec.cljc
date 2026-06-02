@@ -14,15 +14,36 @@
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])))
 
-(defn- str->bytes [s]
+;; cljs `TextEncoder`/`TextDecoder` are stateless, so one module-level instance
+;; each serves every call (`defonce`, but a stale instance after a reload is
+;; harmless — unlike the codec records, the encoder carries no protocol impl).
+;; The JVM bridges through `String`/`getBytes` directly, with no instance to hold.
+#?(:cljs (defonce ^:private text-encoder (js/TextEncoder.)))
+#?(:cljs (defonce ^:private text-decoder (js/TextDecoder.)))
+
+(defn str->bytes
+  "UTF-8-encode string `s` to wire bytes. The single UTF-8 bridge the built-in
+   codecs and the opt-in `:json`/`:transit` namespaces share; public so a custom
+   `ICodec` can produce honest wire bytes too."
+  [s]
   #?(:clj  (.getBytes ^String s java.nio.charset.StandardCharsets/UTF_8)
-     :cljs (.encode (js/TextEncoder.) s)))
+     :cljs (.encode text-encoder s)))
 
-(defn- bytes->str [b]
+(defn bytes->str
+  "UTF-8-decode wire bytes `b` to a string — the inverse of `str->bytes`."
+  [b]
   #?(:clj  (String. ^bytes b java.nio.charset.StandardCharsets/UTF_8)
-     :cljs (.decode (js/TextDecoder.) b)))
+     :cljs (.decode text-decoder b)))
 
-(defn- bytes-value? [x]
+(defn- bytes-value?
+  "Is `x` the platform's wire-byte type? Deliberately platform-specific — `:bytes`
+   is ADR 0004's one non-portable codec. JVM: a primitive `byte[]` only (jnats'
+   native payload), so a `ByteBuffer` or boxed `Byte[]` is rejected. cljs: any
+   `js/Uint8Array`, which by design includes its subclasses (notably a Node
+   `Buffer`). The accepted *type* therefore differs per leg, but values never cross
+   legs, so no single value is accepted on one and rejected on the other; the
+   asymmetry (JVM exact, cljs lenient about subclasses) is documented, not silent."
+  [x]
   #?(:clj  (bytes? x)
      :cljs (instance? js/Uint8Array x)))
 
@@ -49,8 +70,9 @@
   ICodec
   ;; Strict passthrough: the delivered `:data` is platform-native bytes — the
   ;; ADR-0004-sanctioned exception to Data being a portable Clojure value.
-  ;; Encode demands platform bytes; anything else is a `:codec-error` (rethrown
-  ;; as-is by the wrapper, never wrapped with an `:op`).
+  ;; Encode demands platform bytes; anything else is a `:codec-error`. The guard
+  ;; raises it with no `:op`; the encode wrapper re-stamps `:op :encode` (it is an
+  ;; encode failure) while keeping this "got <type>" message.
   (-encode [_ value]
     (if (bytes-value? value)
       value
@@ -58,67 +80,105 @@
                       {:type :codec-error :codec :bytes}))))
   (-decode [_ bytes] bytes))
 
-(defonce ^{:doc "Keyword -> ICodec, seeded with the built-ins. Opt-in codecs add
-   themselves via `register!`; `defonce` keeps registrations across REPL reloads."}
+(defonce ^{:doc "Keyword -> ICodec. Both the built-ins (registered just below)
+   and opt-in/custom codecs enter through `register!`; `defonce` keeps the atom
+   across a reload, so opt-in/custom registrations survive it."}
   registry
-  (atom {:edn    (->EdnCodec)
-         :string (->StringCodec)
-         :bytes  (->BytesCodec)}))
+  (atom {}))
 
 (defn register!
-  "Register `codec` (an `ICodec`) under keyword `k`. Opt-in codec namespaces call
-   this at load time, so requiring the namespace is what makes `k` resolvable."
+  "Register `codec` (an `ICodec`) under keyword `k`. The built-ins register
+   themselves below; opt-in codec namespaces call this at load time, so requiring
+   the namespace is what makes `k` resolvable."
   [k codec]
   (swap! registry assoc k codec)
   nil)
 
-(def ^:private opt-in-ns
-  "Built-in keywords whose codec lives in an opt-in namespace, so a registry miss
-   can point at the namespace to `require` instead of just reporting `:unknown`."
-  {:transit 'nats-cljc.codec.transit
-   :json    'nats-cljc.codec.json})
+;; Register the built-ins on every load — NOT inside the `defonce`. A registry
+;; seeded once would, after a `:reload` of this ns, keep the *old* records: built
+;; against the previous `ICodec`, so `(encode :edn …)` throws "No implementation
+;; of method -encode" until a JVM restart, breaking the reload-aware nREPL
+;; workflow. Re-registering on each load overwrites those stale instances; opt-in
+;; and custom codecs (registered under other keys) survive because `defonce`
+;; keeps the atom.
+(register! :edn    (->EdnCodec))
+(register! :string (->StringCodec))
+(register! :bytes  (->BytesCodec))
+
+(defn- opt-in-ns
+  "The namespace a keyword codec registers from, by convention
+   `nats-cljc.codec.<name>` (ADR 0011), so a registry miss can point at a namespace
+   to `require` rather than just report the keyword unknown. By convention, not a
+   static map, so a new opt-in codec needs no edit here. Trade-off: a *typo'd*
+   keyword yields a hint for a namespace that won't resolve, rather than a plain
+   \"unknown codec\" — acceptable since the dominant miss is a real opt-in codec
+   left un-required."
+  [codec]
+  (symbol (str "nats-cljc.codec." (name codec))))
 
 (defn- resolve-codec
-  "An `ICodec` instance passes through; a keyword is looked up in the registry. A
-   miss throws `:codec-error` naming the keyword — a resolution failure, so no
-   `:op` (distinct from an encode/decode failure). A known opt-in keyword carries
-   `:require '<ns>` and an actionable message; a genuinely unknown one does not."
+  "Resolve a codec reference to an `ICodec`. The common argument is a keyword, so
+   that path runs first — `keyword?` plus a registry lookup — reserving the slower,
+   uncached `satisfies?` for the rare instance case. A keyword miss throws
+   `:codec-error` with a `:require '<ns>` hint (ADR 0011); a non-keyword that is
+   not an `ICodec` is genuinely unknown. Either is a *resolution* failure, so no
+   `:op` (distinct from an encode/decode failure)."
   [codec]
-  (if (satisfies? ICodec codec)
-    codec
+  (if (keyword? codec)
     (or (get @registry codec)
         (let [ns (opt-in-ns codec)]
-          (throw (ex-info (if ns
-                            (str "Codec " codec " is not loaded — (require '" ns ")")
-                            (str "Unknown codec: " codec))
-                          (cond-> {:type :codec-error :codec codec}
-                            ns (assoc :require ns))))))))
+          (throw (ex-info (str "Codec " codec " is not loaded — (require '" ns ")")
+                          {:type :codec-error :codec codec :require ns}))))
+    (if (satisfies? ICodec codec)
+      codec
+      (throw (ex-info (str "Unknown codec: " codec)
+                      {:type :codec-error :codec codec})))))
+
+(defn- codec-id
+  "A stable, keyword-shaped identifier for `codec` in error ex-data: a registry
+   keyword passes through; an `ICodec` instance becomes the sentinel `:custom`.
+   Never the live instance or its class-hash `toString` — both leak the object
+   into logs/serialized payloads and shift across reloads, where a keyword matches
+   the built-in case so consumers can always expect a keyword under `:codec`."
+  [codec]
+  (if (keyword? codec) codec :custom))
 
 (defn- ->codec-error
-  "Normalize a failure to an `ex-info` `:type :codec-error` (ADR 0006/0011). An
-   already-`:codec-error` ex-info (the `:bytes` guard, a registry miss) is
-   rethrown as-is — never nested; ex-data stays minimal (no raw value/bytes)."
+  "Normalize an encode/decode failure to an `ex-info` `:type :codec-error` carrying
+   the operation under `:op` and a stable `:codec` id (ADR 0006/0011). `:op` is
+   *always* present here: resolution failures — the no-`:op` case — are raised by
+   `resolve-codec` outside the try, so anything reaching this is an encode/decode
+   failure. An already-`:codec-error` (the `:bytes` guard, or a codec that nests
+   `codec/encode`/`decode` internally) is re-stamped with this op and codec rather
+   than rethrown verbatim — so callers matching on `:op`/`:codec` see *this*
+   operation, not an inner one — chaining its cause, never the codec-error itself,
+   so `:codec-error` is never nested in `:codec-error`."
   [e codec op]
-  (if (= :codec-error (:type (ex-data e)))
-    e
-    (ex-info (str "Codec " (name op) " failed for " codec)
-             {:type :codec-error :codec codec :op op}
-             e)))
+  (let [id (codec-id codec)]
+    (if (= :codec-error (:type (ex-data e)))
+      (ex-info (ex-message e)
+               {:type :codec-error :codec id :op op}
+               (ex-cause e))
+      (ex-info (str "Codec " (name op) " failed for " id)
+               {:type :codec-error :codec id :op op}
+               e))))
 
 (defn encode
   "Encode a Clojure value to wire bytes using `codec` (a keyword or `ICodec`).
    Any failure surfaces as `ex-info` `:type :codec-error`."
   [codec value]
-  (try
-    (-encode (resolve-codec codec) value)
-    (catch #?(:clj Throwable :cljs :default) e
-      (throw (->codec-error e codec :encode)))))
+  (let [c (resolve-codec codec)]
+    (try
+      (-encode c value)
+      (catch #?(:clj Throwable :cljs :default) e
+        (throw (->codec-error e codec :encode))))))
 
 (defn decode
   "Decode wire bytes to a Clojure value using `codec` (a keyword or `ICodec`).
    Any failure surfaces as `ex-info` `:type :codec-error`."
   [codec bytes]
-  (try
-    (-decode (resolve-codec codec) bytes)
-    (catch #?(:clj Throwable :cljs :default) e
-      (throw (->codec-error e codec :decode)))))
+  (let [c (resolve-codec codec)]
+    (try
+      (-decode c bytes)
+      (catch #?(:clj Throwable :cljs :default) e
+        (throw (->codec-error e codec :decode))))))

@@ -52,17 +52,25 @@
                    (assoc m k vs)))
                {} headers)))
 
+(defn- effective-codec
+  "The codec for a single call: a per-call `:codec` in `opts` overrides the
+   connection default, else the connection's `:codec` (ADR 0011). The one place
+   the precedence rule lives, so publish/subscribe/request/reply can't drift."
+  [conn opts]
+  (or (:codec opts) (:codec conn)))
+
 (defn publish
   "Publish `data` to `subject` on `conn`, encoding it with the connection's codec.
-   Fire-and-forget: returns nil (ADR 0002). `opts` may set `:headers`, a map of
+   Fire-and-forget: returns nil (ADR 0002). `opts` may set `:codec` to override the
+   connection's default codec for this call (ADR 0011), and `:headers`, a map of
    case-sensitive string names to one or more string values; a scalar value is
    normalized to a one-element vector (CONTEXT: Headers). Header names and values
    must be strings, and names must be valid header tokens (printable ASCII, no
    colon); invalid input throws."
   ([conn subject data] (publish conn subject data {}))
-  ([conn subject data {:keys [headers codec]}]
+  ([conn subject data {:keys [headers] :as opts}]
    (proto/-publish conn subject (normalize-headers headers)
-                   (codec/encode (or codec (:codec conn)) data))
+                   (codec/encode (effective-codec conn opts) data))
    nil))
 
 (defn- decode-msg
@@ -88,25 +96,28 @@
    invoked once per message with `{:subject :data :reply}`, where `:data` is
    decoded with the connection's codec and `:reply` is the message's reply-to
    subject (nil when absent), which `reply` answers (ADR 0007). `opts` may set
-   `:queue`: subscriptions sharing a queue-group name compete, so the server
+   `:codec` to override the connection's default codec for decoding (ADR 0011),
+   and `:queue`: subscriptions sharing a queue-group name compete, so the server
    load-balances each matching message to exactly one member of the group. A nil
    or blank `:queue` is a plain subscription (normalized here so both platforms
    agree, rather than relying on each native layer's truthiness)."
   ([conn subject handler] (subscribe conn subject handler {}))
-  ([conn subject handler {:keys [queue codec]}]
-   (let [codec (or codec (:codec conn))]
+  ([conn subject handler {:keys [queue] :as opts}]
+   (let [codec (effective-codec conn opts)]
      (proto/-subscribe conn subject (when-not (str/blank? queue) queue)
                        (fn [raw] (handler (decode-msg codec raw)))))))
 
 (defn request
   "Send a request to `subject` on `conn`, encoding `data` with the connection's
    codec, and return a platform-native promise that resolves to the decoded reply
-   message `{:subject :data :reply}` (ADR 0002). `opts` may set `:timeout-ms`
-   (default 5000). The promise rejects with an `ex-info` whose `:type` is
-   `:no-responders` (nobody subscribes `subject`) or `:timeout` (responders exist
-   but none answer within `:timeout-ms`) (ADR 0006)."
+   message `{:subject :data :reply}` (ADR 0002). `opts` may set `:codec` to
+   override the connection's default codec for both the request encode and the
+   reply decode (ADR 0011), and `:timeout-ms` (default 5000). The promise rejects
+   with an `ex-info` whose `:type` is `:no-responders` (nobody subscribes
+   `subject`) or `:timeout` (responders exist but none answer within
+   `:timeout-ms`) (ADR 0006)."
   [conn subject data opts]
-  (let [codec (or (:codec opts) (:codec conn))]
+  (let [codec (effective-codec conn opts)]
     (impl/then (proto/-request conn subject (codec/encode codec data) (:timeout-ms opts 5000))
                (fn [raw] (decode-msg codec raw)))))
 
@@ -118,9 +129,9 @@
    Throws an `ex-info` `:type :no-reply-subject` when `msg` has no `:reply` (e.g. a
    plain pub/sub message), rather than publishing to a nil subject."
   ([conn msg data] (reply conn msg data {}))
-  ([conn msg data {:keys [codec]}]
+  ([conn msg data opts]
    (if-let [reply-subject (:reply msg)]
-     (do (proto/-publish conn reply-subject nil (codec/encode (or codec (:codec conn)) data))
+     (do (proto/-publish conn reply-subject nil (codec/encode (effective-codec conn opts) data))
          nil)
      (throw (ex-info "Message has no reply subject"
                      {:type :no-reply-subject :subject (:subject msg)})))))
