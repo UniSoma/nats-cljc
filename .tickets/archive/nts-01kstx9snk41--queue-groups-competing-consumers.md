@@ -1,17 +1,18 @@
 ---
 id: nts-01kstx9snk41
 title: Queue groups (competing consumers)
-status: in_progress
+status: closed
 type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:27.507161086Z'
-updated: '2026-06-01T23:09:56.882637511Z'
+updated: '2026-06-02T00:58:24.244599102Z'
+closed: '2026-06-02T00:58:24.244599102Z'
 acceptance:
 - title: Multiple subscriptions sharing a `:queue` group each receive a disjoint share — each message delivered to exactly one member
   done: true
 - title: Verified on JVM, browser, and Node against a real server
-  done: false
+  done: true
 - title: A non-queue subscription on the same subject still receives every message
   done: true
 deps:
@@ -58,3 +59,13 @@ Refactor (the bundled prerequisite): subscribe now returns a Subscription record
 Tests: queue-group-load-balances (AC#1, disjoint+complete share, both members get a share) and non-queue-subscription-receives-all-alongside-a-queue-group (AC#3).
 
 Status: green on JVM (27 tests / 48 assertions) and Node (27 / 50); clj-kondo clean. AC#2 browser leg is CI-only (ADR 0010) — left unticked until CI is green. Not committed (awaiting user).
+
+**2026-06-02T00:58:24.153879118Z**
+
+CI green on all three platforms (JVM, browser-headless, Node) — AC#2 verified, ticket closed.
+
+Post-implementation review hardening: the :queue option is normalized once in the core facade via (when-not (str/blank? queue) queue), so nil/empty/whitespace all collapse to nil (plain subscription) before reaching either native layer. Without it the platforms diverged on a blank queue — JVM took jnats' 3-arg overload (blank-named queue group) while nats.js' own truthiness dropped it (plain sub). Single normalization point keeps the portable contract honest.
+
+**2026-06-02T00:58:24.244599102Z**
+
+Queue groups (competing consumers) shipped and CI-green on JVM, browser, and Node. nats/subscribe gained a :queue opt that joins a named group so the server load-balances each message to exactly one member (jnats 3-arg Dispatcher.subscribe / nats.js SubOpts.queue); a nil-or-blank :queue normalizes to a plain subscription in the core facade. Bundled the Subscription-record prerequisite: subscribe returns JvmSubscription/JsSubscription wrapping the native handle, -drain split out of Conn into a Drainable protocol (collapsing core/drain's satisfies? fork into a uniform proto/-drain), and a new Sub/-active? predicate removed the tests' native reach-ins.
