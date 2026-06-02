@@ -1,11 +1,12 @@
 (ns nats-cljc.impl.jvm
   "JVM platform implementation: a Connection record wrapping io.nats:jnats over
    TCP (ADR 0001/0003). All jnats interop is quarantined here (ADR 0005)."
-  (:require [nats-cljc.protocol :as proto])
-  (:import [io.nats.client Nats Options Options$Builder Connection Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events]
+  (:require [clojure.string :as str]
+            [nats-cljc.protocol :as proto])
+  (:import [io.nats.client Nats Options Options$Builder Connection Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener]
            [io.nats.client.impl Headers]
            [java.time Duration]
-           [java.util.concurrent CompletableFuture CompletionStage CancellationException TimeoutException]
+           [java.util.concurrent CompletableFuture CompletionStage CompletionException CancellationException TimeoutException]
            [java.util.function Supplier Function BiFunction]))
 
 ;; Upper bound for the blocking flush/drain one-shots; a healthy connection
@@ -43,56 +44,99 @@
    :reply   (.getReplyTo msg)
    :headers (raw-headers msg)})
 
-(defrecord JvmSubscription [^Subscription sub]
+(defn- unwrap-completion
+  "jnats reports an async handler rejection wrapped in a CompletionException (from
+   blocking on its CompletionStage); unwrap to the value the handler actually
+   threw, so a thrown handler value passes through unchanged (ADR 0006)."
+  [e]
+  (if (instance? CompletionException e) (or (.getCause ^CompletionException e) e) e))
+
+(defn- route-error!
+  "Route a caught async dispatch failure to its sink (ADR 0006): the per-sub
+   `on-error` if set (the bare value), else the connection `on-status` as a
+   non-bare `{:type :error :error e}` event; both nil drops it. Strict override —
+   never both."
+  [on-error on-status e]
+  (if on-error
+    (on-error e)
+    (when on-status (on-status {:type :error :error e}))))
+
+(defn- op-state-error
+  "Normalize an IllegalStateException from a publish/request on a non-open
+   connection by its jnats message (ADR 0006): the drain WINDOW (`Draining`) →
+   `:drained` — a don't-retry signal — and a fully closed connection (`Closed`) →
+   `:connection-closed`, which is retry-able. jnats keeps `getStatus` CONNECTED
+   during drain, so the message — not the status — distinguishes the two.
+   Unrecognized states return the original exception for the caller to rethrow."
+  [subject ^Throwable e]
+  (let [msg (str (.getMessage e))]
+    (cond
+      (str/includes? msg "Draining")
+      (ex-info "Connection is draining" {:type :drained :subject subject} e)
+      (str/includes? msg "Closed")
+      (ex-info "Connection is closed" {:type :connection-closed :subject subject} e)
+      :else e)))
+
+(defrecord JvmSubscription [^Subscription sub registry ^Dispatcher dispatcher]
   proto/Drainable
   ;; jnats sub.drain returns a CompletableFuture<Boolean> that settles once the
   ;; subscription's pending messages are delivered and it is removed — ending just
-  ;; this subscription, leaving the connection open.
-  (-drain [_] (.drain sub op-timeout))
+  ;; this subscription, leaving the connection open. Dissoc this dispatcher from
+  ;; the slow-consumer registry so a drained sub leaks no sink (ADR 0006).
+  (-drain [_] (swap! registry dissoc dispatcher) (.drain sub op-timeout))
   proto/Sub
   (-active? [_] (.isActive sub)))
 
-(defrecord JvmConnection [^Connection client codec]
+(defrecord JvmConnection [^Connection client codec on-status registry]
   proto/Conn
   (-publish [_ subject headers bytes]
     ;; The headers map selects jnats' publish(subject, Headers, body) overload; a
-    ;; nil headers map is a plain publish (no header frame on the wire).
-    (if-let [^Headers h (->headers headers)]
-      (.publish client ^String subject h ^bytes bytes)
-      (.publish client ^String subject ^bytes bytes)))
-  (-subscribe [_ subject queue handler]
-    ;; Per-subscription tail: each message's handler invocation is composed onto
-    ;; the previous one's settle, so a handler that returns a CompletionStage
-    ;; suspends delivery of the next message until it settles — promise-return
-    ;; backpressure (ADR 0007). jnats dispatches onMessage serially on this
-    ;; dispatcher's single thread, so the tail mutates without contention and the
-    ;; thread is never blocked (the compose returns immediately). A
-    ;; non-CompletionStage return composes a completed future, delivering the next
-    ;; message at once. `.exceptionally` keeps a throwing/rejecting handler from
-    ;; stalling the chain (error routing is the error-model slice's job).
-    ;; NB: under a sustained-slow handler the undelivered backlog grows UNBOUNDED
-    ;; in this chain — onMessage returns at once, so jnats' dispatcher queue stays
-    ;; empty and its native slow-consumer (setPendingLimits/slowConsumerDetected)
-    ;; never trips. Honoring :max-pending + surfacing :slow-consumer is
-    ;; nts-01kstxatbw6k AC#4 (likely a rework to a blocking-dispatcher model).
+    ;; nil headers map is a plain publish (no header frame on the wire). jnats
+    ;; rejects an over-max payload with an IllegalArgumentException; normalize it
+    ;; to a synchronous `:max-payload-exceeded` (fire-and-forget has no promise to
+    ;; reject — ADR 0006).
+    (try
+      (if-let [^Headers h (->headers headers)]
+        (.publish client ^String subject h ^bytes bytes)
+        (.publish client ^String subject ^bytes bytes))
+      (catch IllegalArgumentException e
+        (throw (ex-info "Message payload exceeds the server's max payload"
+                        {:type :max-payload-exceeded :subject subject
+                         :size (alength ^bytes bytes) :max (.getMaxPayload client)}
+                        e)))
+      ;; A closed connection refuses the publish; surface it as the retry-able
+      ;; `:connection-closed` (publish is allowed during drain, so it never sees
+      ;; `:drained`). `op-state-error` returns the original for unrecognized states.
+      (catch IllegalStateException e
+        (throw (op-state-error subject e)))))
+  (-subscribe [_ subject queue {:keys [on-error max-pending]} handler]
+    ;; Road 2 (ADR 0007): onMessage BLOCKS this dispatcher's thread on the
+    ;; handler's CompletionStage (no timeout). Serial, one-at-a-time delivery and
+    ;; promise-return backpressure fall out for free — and, crucially, the backlog
+    ;; builds in jnats' OWN dispatcher queue, so its native pending-limits and
+    ;; slowConsumerDetected actually engage (the superseded tail-chain kept the
+    ;; queue empty). A non-CompletionStage return delivers the next message at
+    ;; once. A synchronous decode/handler throw, or an async rejection (surfaced as
+    ;; a CompletionException by .join), is caught and routed to the sub's
+    ;; :on-error / the connection's :on-status — the subscription survives.
     (let [^Dispatcher dispatcher (.createDispatcher client)
-          tail                   (atom (CompletableFuture/completedFuture nil))
-          ^MessageHandler mh     (reify MessageHandler
-                                   (onMessage [_ msg]
-                                     (let [m (msg->raw msg)]
-                                       (swap! tail
-                                              (fn [^CompletableFuture prev]
-                                                (-> prev
-                                                    (.thenCompose
-                                                     (reify Function
-                                                       (apply [_ _]
-                                                         (let [r (handler m)]
-                                                           (if (instance? CompletionStage r)
-                                                             r
-                                                             (CompletableFuture/completedFuture nil))))))
-                                                    (.exceptionally
-                                                     (reify Function
-                                                       (apply [_ _] nil)))))))))]
+          ^MessageHandler mh
+          (reify MessageHandler
+            (onMessage [_ msg]
+              (try
+                (let [r (handler (msg->raw msg))]
+                  (when (instance? CompletionStage r)
+                    (.join (.toCompletableFuture ^CompletionStage r))))
+                (catch Throwable e
+                  (route-error! on-error on-status (unwrap-completion e))))))]
+      ;; :max-pending caps jnats' dispatcher queue (bytes unlimited); absent leaves
+      ;; jnats' 512K-msg / 64 MB defaults. The dispatcher is the native Consumer
+      ;; slowConsumerDetected fires with, so register it (when there's a sink) so
+      ;; the connection ErrorListener can route the overflow back to this :on-error.
+      (when max-pending (.setPendingLimits dispatcher (long max-pending) -1))
+      (when on-error
+        (swap! registry assoc dispatcher
+               {:on-error on-error :subject subject :max-pending max-pending}))
       ;; The queue-group name selects jnats' three-arg subscribe overload
       ;; (subject, queue, handler); a nil queue is a plain subscription. Wrap the
       ;; native handle in a JvmSubscription so the facade returns a uniform
@@ -100,7 +144,8 @@
       (->JvmSubscription
        (if queue
          (.subscribe dispatcher ^String subject ^String queue mh)
-         (.subscribe dispatcher ^String subject mh)))))
+         (.subscribe dispatcher ^String subject mh))
+       registry dispatcher)))
   (-flush [_]
     ;; jnats flush blocks until the server has processed the buffer (or the
     ;; timeout elapses, completing the future exceptionally); run it off-thread
@@ -123,20 +168,29 @@
     ;; future with a TimeoutException, while a no-responders 503 cancels it
     ;; (CancellationException). We re-throw each as a typed ex-info so the facade's
     ;; promise rejects with it.
-    (.handle ^CompletableFuture (.requestWithTimeout client ^String subject ^bytes bytes (Duration/ofMillis timeout-ms))
-             (reify BiFunction
-               (apply [_ msg ex]
-                 (cond
-                   (nil? ex)
-                   (msg->raw msg)
-                   (instance? TimeoutException ex)
-                   (throw (ex-info "Request timed out"
-                                   {:type :timeout :subject subject :timeout-ms timeout-ms}))
-                   (instance? CancellationException ex)
-                   (throw (ex-info "No responders for request"
-                                   {:type :no-responders :subject subject}))
-                   :else
-                   (throw ex))))))
+    ;; A closed or draining connection makes requestWithTimeout throw
+    ;; synchronously; convert that to a rejected future so request rejects (never
+    ;; throws) with `:connection-closed` (retry-able) or `:drained` (ADR 0006).
+    (try
+      (.handle ^CompletableFuture (.requestWithTimeout client ^String subject ^bytes bytes (Duration/ofMillis timeout-ms))
+               (reify BiFunction
+                 (apply [_ msg ex]
+                   (cond
+                     (nil? ex)
+                     (msg->raw msg)
+                     (instance? TimeoutException ex)
+                     (throw (ex-info "Request timed out"
+                                     {:type :timeout :subject subject :timeout-ms timeout-ms}))
+                     (instance? CancellationException ex)
+                     (throw (ex-info "No responders for request"
+                                     {:type :no-responders :subject subject}))
+                     :else
+                     (throw ex)))))
+      (catch IllegalStateException e
+        (let [x (op-state-error subject e)]
+          (if (identical? x e)
+            (throw e)
+            (CompletableFuture/failedFuture x))))))
   proto/Drainable
   (-drain [_]
     ;; jnats drain already returns a CompletableFuture<Boolean>; draining ends the
@@ -176,6 +230,36 @@
       (let [t (deliver-status! on-status ev)]
         (when (and reconnect? (= :disconnected t))
           (on-status {:type :reconnecting}))))))
+
+(defn server-error-type
+  "Classify a jnats ErrorListener error string onto a connection-level error
+   `:type` (ADR 0006): jnats' exact \"Permissions Violation\" → `:permissions-violation`,
+   anything else → `:protocol-error`. No clean e2e trigger exists for the latter,
+   so it is exercised as a classifier unit (the same logic on both legs)."
+  [error]
+  (if (and error (str/includes? error "Permissions Violation"))
+    :permissions-violation
+    :protocol-error))
+
+(defn error-listener
+  "A connection-level ErrorListener (ADR 0006). `slowConsumerDetected` fires with
+   only the native Consumer — the Dispatcher — so the dispatcher→sink `registry`
+   is the only bridge back to the originating subscription's `:on-error`; an
+   unregistered dispatcher (the sub set no `:on-error`) drops it. `errorOccurred`
+   is connection-level with no subscription identity, so a permissions/protocol
+   error reaches `:on-status` as an `:error` event ONLY — never a per-sub override
+   — and is dropped when no `:on-status` is set. `:pending` is native-approximate."
+  ^ErrorListener [on-status registry]
+  (reify ErrorListener
+    (slowConsumerDetected [_ _conn consumer]
+      (when-let [{:keys [on-error subject max-pending]} (get @registry consumer)]
+        (on-error (ex-info "Slow consumer"
+                           {:type :slow-consumer :subject subject :max-pending max-pending
+                            :pending (.getPendingMessageCount ^Consumer consumer)}))))
+    (errorOccurred [_ _conn error]
+      (when on-status
+        (on-status {:type  :error
+                    :error (ex-info error {:type (server-error-type error)})})))))
 
 (defn- nkey-auth-handler
   "An nkey AuthHandler signing nonces with `seed`. When the public `nkey` is
@@ -231,6 +315,9 @@
        ;; caller explicitly disabled reconnection with :reconnect {:max 0} (0 is
        ;; jnats' "off" sentinel; absent :max keeps the client default, which is on).
        (let [reconnect?    (not= 0 (:max reconnect))
+             ;; dispatcher→sink registry the ErrorListener routes slowConsumerDetected
+             ;; through, and -subscribe assocs into (ADR 0006/0007).
+             registry      (atom {})
              ^Options opts (-> (Options/builder)
                                (.servers (into-array String servers))
                                ;; Surface a request timeout as a TimeoutException
@@ -239,11 +326,12 @@
                                ;; tell the two failure modes apart (ADR 0006).
                                (.useTimeoutException)
                                (cond-> on-status (.connectionListener (status-listener on-status reconnect?)))
+                               (.errorListener (error-listener on-status registry))
                                (with-reconnect reconnect)
                                (with-auth auth)
                                (.build))]
          (try
-           (->JvmConnection (Nats/connect opts) codec)
+           (->JvmConnection (Nats/connect opts) codec on-status registry)
            (catch Exception e
              (throw (ex-info "Failed to connect to NATS"
                              {:type :connect-failed :servers servers}

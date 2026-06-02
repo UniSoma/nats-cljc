@@ -7,12 +7,22 @@ A `.cljc` handler runs on two very different execution models — `jnats` delive
 - **Handlers must never block synchronously.** That is fatal on ClojureScript (it freezes the event loop) and on the JVM stalls the subscription's dispatcher and trips `:slow-consumer`.
 - **A handler may return a promise.** If it does, the subscription waits for that promise to settle before delivering the next message — per-subscription backpressure with no core.async. Returning a non-promise delivers the next message immediately.
 
-Overflow surfaces as a `:slow-consumer` status event when undelivered messages for a subscription cross an optional `:max-pending` threshold. What `:max-pending` guarantees portably is the **signal**, not a hard heap cap: on the JVM jnats additionally **drops** over-limit messages from its dispatcher queue (and is bounded by default at 512K msgs / 64 MB even with `:max-pending` absent); on ClojureScript nats-core's buffer is unbounded and `:max-pending` only sets the notification threshold (`slow?`) — it does not auto-drop, so the consumer reacts to `:slow-consumer` (drain, unsubscribe, or slow the source). This is an accepted "shape, not cadence" divergence (ADR 0006): the *event* is portable, the *drop* is native.
+Overflow surfaces as a `:slow-consumer` Error delivered to that subscription's `:on-error` (never the connection-level `:on-status` — it is inherently per-subscription; ADR 0006) when undelivered messages for the subscription cross an optional `:max-pending` threshold, and is silently dropped if the subscription set no `:on-error`. What `:max-pending` guarantees portably is the **signal**, not a hard heap cap: on the JVM jnats additionally **drops** over-limit messages from its dispatcher queue (and is bounded by default at 512K msgs / 64 MB even with `:max-pending` absent); on ClojureScript nats-core's buffer is unbounded and `:max-pending` only sets the notification threshold (`slow?`) — it does not auto-drop, so the consumer reacts to `:slow-consumer` (drain, unsubscribe, or slow the source). This is an accepted "shape, not cadence" divergence (ADR 0006): the *signal* is portable, the *drop* is native.
+
+## Realizing the contract: native consumption (road 2)
+
+The contract above (serial, ordered-per-publisher, promise-return backpressure, `:slow-consumer` at `:max-pending`) is realized by driving each client's **own consumption model** rather than by an our-layer queue — even though the native way looks like an anti-pattern on the JVM.
+
+- **JVM:** the dispatcher's `onMessage` **blocks the dispatcher thread** on the handler's `CompletionStage` (no timeout). Serial delivery and one-at-a-time ordering fall out for free, and — crucially — backpressure builds in jnats' *own* dispatcher queue, so its native pending-limits (`setPendingLimits`, 512K/64 MB default) and `ErrorListener.slowConsumerDetected` actually engage. `slowConsumerDetected` fires connection-level with only the native `Consumer`, so a `{dispatcher → :on-error}` registry on the connection routes it to the originating subscription.
+- **CLJS:** the subscription is consumed as an **async iterable** (no `{:callback}`), with a detached loop that `await`s the handler before pulling the next message. The buffering then lives in nats-core's `QueuedIterator`, where the iterator-only `slow?` threshold + `setSlowNotificationFn` apply (both *throw* under the callback model).
+
+The earlier promise-return chain (manual tail-chaining onto each prior settle) is **superseded**, not reverted: it was correct for ordering/backpressure but kept both native queues empty, so neither client's slow-consumer detection could ever trip. Accepted costs: the JVM pins one dispatcher thread per in-flight slow handler; CLJS must wire the detached loop's teardown into drain/close/unsubscribe (handled by letting the iterable complete).
 
 ## Considered options
 
 - **Promise cross-subscription parallelism** — rejected: ClojureScript's single thread cannot honor it, so it would be a portability lie.
 - **Strictly fire-and-forget handlers, all backpressure deferred to the future core.async/missionary adapters** — rejected: promise-return backpressure is a cheap, portable win available immediately, and it is the natural answer to "don't block — return a promise instead."
+- **Road 1: an our-layer pending counter on the eager-chain** — rejected: bolting a counter onto the superseded tail-chain leaves both native queues empty, so `:max-pending`/`:slow-consumer` would be a parallel re-implementation of what each client already does (and jnats' native drop could never be honored). Road 2 reuses the native machinery and deletes the tail-chaining.
 
 ## Consequences
 

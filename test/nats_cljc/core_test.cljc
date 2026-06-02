@@ -108,6 +108,29 @@
 (def ^:private headers-absent-subject "headers.absent")
 (def ^:private headers-trim-subject "headers.trim")
 
+;; Error-model subjects (ADR 0006). Each canonical Error :type is reproduced and
+;; asserted with identical shape on both legs. Distinct per behavior so the
+;; shared server doesn't cross-feed between tests.
+(def ^:private throw-subject "err.handler-throw")
+(def ^:private throw-fallback-subject "err.handler-throw.fallback")
+(def ^:private codec-error-subject "err.codec")
+(def ^:private slow-subject "err.slow")
+(def ^:private payload-subject "err.payload")
+(def ^:private closed-pub-subject "err.closed.pub")
+(def ^:private drain-window-subject "err.drain")
+
+;; A server nothing listens on — exercises the :connect-failed dial failure.
+(def ^:private dead-server-url
+  #?(:clj  "nats://127.0.0.1:1"
+     :cljs "ws://127.0.0.1:1"))
+
+;; Restricted user (ci/nats-users.conf): denied subscribe to "forbidden.>", so a
+;; subscribe there draws a server-side Permissions Violation — the only portable
+;; trigger for the connection-level :permissions-violation error.
+(def ^:private restricted-user "restricted")
+(def ^:private restricted-pass "restricted-pass")
+(def ^:private forbidden-subject "forbidden.secret")
+
 ;; Test-only teardown: close the native client so jnats' non-daemon threads (and
 ;; the CLJS ws connection) don't outlive the test. A public close/drain is its
 ;; own slice; here we reach the record's client field directly.
@@ -160,6 +183,13 @@
   []
   (let [seen (atom [])]
     [seen (fn [s] (swap! seen conj s))]))
+
+(defn- error-collector
+  "An :on-error handler closing over an atom of the (bare) errors it receives —
+   the async-failure twin of `status-collector` (ADR 0006)."
+  []
+  (let [seen (atom [])]
+    [seen (fn [e] (swap! seen conj e))]))
 
 ;; Portable ordering check over a status-collector's `seen` (CLJS vectors have no
 ;; .indexOf): true only when a `:type a` event appears before a `:type b` one —
@@ -1169,4 +1199,368 @@
                               "a nil header value is rejected as :invalid-header, not silently dropped")
                           (close! conn)))
                 (p/catch (fn [e] (is false (str "connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; ===========================================================================
+;; Error model (ADR 0006): every canonical Error :type reproduced and asserted
+;; with identical shape on both legs. One-shot ops reject their promise; async
+;; failures reach a sink (sub :on-error, else connection :on-status :error).
+;; ===========================================================================
+
+;; :connect-failed (ADR 0006): the server-side dial attempt fails — here against
+;; a port nothing listens on — so connect rejects its promise with a normalized
+;; `:type :connect-failed`, distinct from the client-side :auth-invalid.
+(deftest connect-failed-rejects
+  #?(:clj
+     (let [t (try @(nats/connect {:servers [dead-server-url] :reconnect {:max 0}})
+                  nil
+                  (catch java.util.concurrent.ExecutionException e
+                    (:type (ex-data (.getCause e)))))]
+       (is (= :connect-failed t)
+           "connecting to a dead server rejects with :connect-failed"))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [dead-server-url] :reconnect {:max 0}})
+                (p/then (fn [conn] (is false "expected the dial to reject with :connect-failed") (close! conn)))
+                (p/catch (fn [e]
+                           (is (= :connect-failed (:type (ex-data e)))
+                               "connecting to a dead server rejects with :connect-failed")))
+                (p/finally (fn [_ _] (done)))))))
+
+;; :max-payload-exceeded (ADR 0006): a publish whose bytes exceed the server's
+;; max_payload throws synchronously — fire-and-forget has no promise to reject —
+;; with a normalized `:type :max-payload-exceeded`. ~1.1 MB vs the default 1 MB.
+(deftest max-payload-exceeded-throws
+  (let [big (apply str (repeat 1100000 \x))]
+    #?(:clj
+       (let [conn @(nats/connect {:servers [server-url]})]
+         (try
+           (is (= :max-payload-exceeded
+                  (try (nats/publish conn payload-subject big)
+                       :no-throw
+                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+               "an oversized publish throws :max-payload-exceeded")
+           (finally (close! conn))))
+       :cljs
+       (async done
+              (-> (nats/connect {:servers [server-url]})
+                  (p/then (fn [conn]
+                            (is (= :max-payload-exceeded
+                                   (try (nats/publish conn payload-subject big)
+                                        :no-throw
+                                        (catch :default e (:type (ex-data e)))))
+                                "an oversized publish throws :max-payload-exceeded")
+                            (close! conn)))
+                  (p/catch (fn [e] (is false (str "connect failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+;; :connection-closed (ADR 0006): operating on a closed connection. publish has
+;; no promise so it throws synchronously; request rejects its promise. Both carry
+;; a normalized `:type :connection-closed` — a retry-able signal, distinct from
+;; :drained (the drain-window refusal).
+(deftest connection-closed-normalized
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})]
+       @(nats/close conn)
+       (is (= :connection-closed
+              (try (nats/publish conn closed-pub-subject {:n 1})
+                   :no-throw
+                   (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+           "publish on a closed connection throws :connection-closed")
+       (is (= :connection-closed
+              (try (deref (nats/request conn closed-pub-subject {:n 1} {:timeout-ms 500}) 2000 ::timeout)
+                   nil
+                   (catch java.util.concurrent.ExecutionException e (:type (ex-data (.getCause e))))))
+           "request on a closed connection rejects with :connection-closed"))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (-> (nats/close conn)
+                              (p/then (fn [_]
+                                        (is (= :connection-closed
+                                               (try (nats/publish conn closed-pub-subject {:n 1})
+                                                    :no-throw
+                                                    (catch :default e (:type (ex-data e)))))
+                                            "publish on a closed connection throws :connection-closed")
+                                        (nats/request conn closed-pub-subject {:n 1} {:timeout-ms 500})))
+                              (p/then (fn [_] (is false "expected request to reject with :connection-closed")))
+                              (p/catch (fn [e]
+                                         (is (= :connection-closed (:type (ex-data e)))
+                                             "request on a closed connection rejects with :connection-closed"))))))
+                (p/catch (fn [e] (is false (str "connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; handler-throw → :on-error (ADR 0006/0007, AC#2): a handler that throws is
+;; caught and routed to the subscription's :on-error — the raw thrown value,
+;; passed through unchanged with no canonical :type — without killing the
+;; subscription, so a later message still arrives. :boom throws; :ok is delivered.
+(deftest handler-throw-routes-to-on-error
+  #?(:clj
+     (let [conn       @(nats/connect {:servers [server-url]})
+           [errs on-error] (error-collector)
+           got        (atom [])]
+       (try
+         (nats/subscribe conn throw-subject
+                         (fn [msg]
+                           (if (= :boom (:data msg))
+                             (throw (ex-info "boom" {:kaboom true}))
+                             (swap! got conj (:data msg))))
+                         {:on-error on-error})
+         (nats/publish conn throw-subject :boom)
+         (nats/publish conn throw-subject :ok)
+         (is (wait-for #(and (seq @errs) (= [:ok] @got)) 5000)
+             "the throw reaches :on-error and the next message is still delivered")
+         (is (= {:kaboom true} (ex-data (first @errs)))
+             "the raw thrown value reaches :on-error unchanged")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [[errs on-error] (error-collector)
+                                got        (atom [])]
+                            (nats/subscribe conn throw-subject
+                                            (fn [msg]
+                                              (if (= :boom (:data msg))
+                                                (throw (ex-info "boom" {:kaboom true}))
+                                                (swap! got conj (:data msg))))
+                                            {:on-error on-error})
+                            (nats/publish conn throw-subject :boom)
+                            (nats/publish conn throw-subject :ok)
+                            (-> (wait-for #(and (seq @errs) (= [:ok] @got)) 5000)
+                                (p/then (fn [hit?]
+                                          (is hit? "the throw reaches :on-error and the next message is still delivered")
+                                          (is (= {:kaboom true} (ex-data (first @errs)))
+                                              "the raw thrown value reaches :on-error unchanged")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "handler-throw test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; handler-throw → :on-status :error fallback (ADR 0006, AC#2): with NO per-sub
+;; :on-error, the same thrown value reaches the connection's :on-status — as the
+;; lone non-bare lifecycle event `{:type :error :error <ex-info>}` — and the
+;; subscription still survives.
+(deftest handler-throw-falls-back-to-on-status
+  #?(:clj
+     (let [[seen on-status] (status-collector)
+           conn       @(nats/connect {:servers [server-url] :on-status on-status})
+           got        (atom [])]
+       (try
+         (nats/subscribe conn throw-fallback-subject
+                         (fn [msg]
+                           (if (= :boom (:data msg))
+                             (throw (ex-info "boom" {:kaboom true}))
+                             (swap! got conj (:data msg)))))
+         (nats/publish conn throw-fallback-subject :boom)
+         (nats/publish conn throw-fallback-subject :ok)
+         (is (wait-for #(and (some (comp #{:error} :type) @seen) (= [:ok] @got)) 5000)
+             "with no :on-error the throw reaches :on-status and the sub survives")
+         (is (= {:kaboom true} (ex-data (:error (first (filter (comp #{:error} :type) @seen)))))
+             "the :error event wraps the thrown value under :error")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (let [[seen on-status] (status-collector)]
+              (-> (nats/connect {:servers [server-url] :on-status on-status})
+                  (p/then (fn [conn]
+                            (let [got (atom [])]
+                              (nats/subscribe conn throw-fallback-subject
+                                              (fn [msg]
+                                                (if (= :boom (:data msg))
+                                                  (throw (ex-info "boom" {:kaboom true}))
+                                                  (swap! got conj (:data msg)))))
+                              (nats/publish conn throw-fallback-subject :boom)
+                              (nats/publish conn throw-fallback-subject :ok)
+                              (-> (wait-for #(and (some (comp #{:error} :type) @seen) (= [:ok] @got)) 5000)
+                                  (p/then (fn [hit?]
+                                            (is hit? "with no :on-error the throw reaches :on-status and the sub survives")
+                                            (is (= {:kaboom true} (ex-data (:error (first (filter (comp #{:error} :type) @seen)))))
+                                                "the :error event wraps the thrown value under :error")))
+                                  (p/finally (fn [_ _] (close! conn)))))))
+                  (p/catch (fn [e] (is false (str "fallback test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+;; decode-failure → :codec-error (ADR 0006, AC#3): a subscriber decoding with
+;; :edn receives raw non-EDN bytes (a lone "{", published via :string). decode-msg
+;; throws synchronously — the handler never sees garbage — and the failure is
+;; routed to the sub's :on-error as a normalized :codec-error, without killing the
+;; subscription: a following valid message is still delivered.
+(deftest decode-failure-routes-to-on-error
+  #?(:clj
+     (let [conn       @(nats/connect {:servers [server-url]})
+           [errs on-error] (error-collector)
+           got        (atom [])]
+       (try
+         (nats/subscribe conn codec-error-subject
+                         (fn [msg] (swap! got conj (:data msg)))
+                         {:on-error on-error})
+         (nats/publish conn codec-error-subject "{" {:codec :string})
+         (nats/publish conn codec-error-subject {:ok 1})
+         (is (wait-for #(and (seq @errs) (= [{:ok 1}] @got)) 5000)
+             "the decode failure reaches :on-error and the next message survives")
+         (is (= :codec-error (:type (ex-data (first @errs))))
+             "the failure is a normalized :codec-error ex-info")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [[errs on-error] (error-collector)
+                                got        (atom [])]
+                            (nats/subscribe conn codec-error-subject
+                                            (fn [msg] (swap! got conj (:data msg)))
+                                            {:on-error on-error})
+                            (nats/publish conn codec-error-subject "{" {:codec :string})
+                            (nats/publish conn codec-error-subject {:ok 1})
+                            (-> (wait-for #(and (seq @errs) (= [{:ok 1}] @got)) 5000)
+                                (p/then (fn [hit?]
+                                          (is hit? "the decode failure reaches :on-error and the next message survives")
+                                          (is (= :codec-error (:type (ex-data (first @errs))))
+                                              "the failure is a normalized :codec-error ex-info")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "decode-failure test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; :slow-consumer + :max-pending (ADR 0006/0007, AC#4): a handler held on a
+;; pending promise lets a flood pile up past :max-pending 1, so the overflow
+;; reaches the subscription's :on-error (per-sub — never :on-status) as a
+;; :slow-consumer carrying its subject and threshold. The signal is portable; the
+;; drop is native (JVM drops, CLJS buffers unbounded) — so only the signal is asserted.
+(deftest slow-consumer-routes-to-on-error
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})
+           [errs on-error] (error-collector)
+           gate (java.util.concurrent.CompletableFuture.)]
+       (try
+         (nats/subscribe conn slow-subject (fn [_] gate)
+                         {:on-error on-error :max-pending 1})
+         (dotimes [_ 20] (nats/publish conn slow-subject {:n 1}))
+         @(nats/flush conn)
+         (is (wait-for #(some (comp #{:slow-consumer} :type ex-data) @errs) 5000)
+             ":max-pending overflow reaches :on-error as :slow-consumer")
+         (let [d (some-> (filter (comp #{:slow-consumer} :type ex-data) @errs) first ex-data)]
+           (is (= slow-subject (:subject d)) "the :slow-consumer names its subject")
+           (is (= 1 (:max-pending d)) "the :slow-consumer carries its :max-pending threshold"))
+         (finally
+           (.complete gate nil)
+           (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [[errs on-error] (error-collector)
+                                gate (p/deferred)]
+                            (nats/subscribe conn slow-subject (fn [_] gate)
+                                            {:on-error on-error :max-pending 1})
+                            (dotimes [_ 20] (nats/publish conn slow-subject {:n 1}))
+                            (-> (nats/flush conn)
+                                (p/then (fn [_] (wait-for #(some (comp #{:slow-consumer} :type ex-data) @errs) 5000)))
+                                (p/then (fn [hit?]
+                                          (is hit? ":max-pending overflow reaches :on-error as :slow-consumer")
+                                          (let [d (some-> (filter (comp #{:slow-consumer} :type ex-data) @errs) first ex-data)]
+                                            (is (= slow-subject (:subject d)) "the :slow-consumer names its subject")
+                                            (is (= 1 (:max-pending d)) "the :slow-consumer carries its :max-pending threshold"))))
+                                (p/finally (fn [_ _] (p/resolve! gate nil) (close! conn)))))))
+                (p/catch (fn [e] (is false (str "slow-consumer test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; :permissions-violation (ADR 0006, AC#1): a connection-level failure with no
+;; per-sub identity — jnats' ErrorListener / nats.js' status stream hand back no
+;; subscription — so a forbidden subscribe (the restricted user is denied
+;; "forbidden.>") reaches :on-status as an :error event ONLY, never a per-sub
+;; :on-error, carrying a :permissions-violation ex-info.
+(deftest permissions-violation-reaches-on-status
+  #?(:clj
+     (let [[seen on-status] (status-collector)
+           conn @(nats/connect {:servers   [users-server-url]
+                                :auth      {:user restricted-user :pass restricted-pass}
+                                :on-status on-status})]
+       (try
+         (nats/subscribe conn forbidden-subject (fn [_] nil))
+         (is (wait-for #(some (comp #{:error} :type) @seen) 5000)
+             "a forbidden subscribe reaches :on-status as an :error event")
+         (is (= :permissions-violation
+                (:type (ex-data (:error (first (filter (comp #{:error} :type) @seen))))))
+             "the :error event carries a :permissions-violation ex-info")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (let [[seen on-status] (status-collector)]
+              (-> (nats/connect {:servers   [users-server-url]
+                                 :auth      {:user restricted-user :pass restricted-pass}
+                                 :on-status on-status})
+                  (p/then (fn [conn]
+                            (nats/subscribe conn forbidden-subject (fn [_] nil))
+                            (-> (wait-for #(some (comp #{:error} :type) @seen) 5000)
+                                (p/then (fn [hit?]
+                                          (is hit? "a forbidden subscribe reaches :on-status as an :error event")
+                                          (is (= :permissions-violation
+                                                 (:type (ex-data (:error (first (filter (comp #{:error} :type) @seen))))))
+                                              "the :error event carries a :permissions-violation ex-info")))
+                                (p/finally (fn [_ _] (close! conn))))))
+                  (p/catch (fn [e] (is false (str "permissions test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+;; :protocol-error (ADR 0006, AC#1): the server emits it for malformed protocol
+;; exchanges the client never produces, so there is no clean e2e trigger. Both
+;; legs route every server error through one classifier (jnats' ErrorListener
+;; string / nats.js' status error message), so it is asserted at that impl seam:
+;; jnats' exact "Permissions Violation" → :permissions-violation, anything else
+;; (and an absent string) → :protocol-error — identical logic on both platforms.
+(deftest server-error-classifier-maps-protocol-error
+  (is (= :permissions-violation
+         (impl/server-error-type "Permissions Violation for Subscription to \"forbidden.x\""))
+      "a Permissions Violation classifies as :permissions-violation")
+  (is (= :protocol-error (impl/server-error-type "Unknown Protocol Operation"))
+      "any other server error classifies as :protocol-error")
+  (is (= :protocol-error (impl/server-error-type nil))
+      "an absent error string classifies as :protocol-error"))
+
+;; :drained (ADR 0006, AC#1): an op refused during the drain WINDOW — distinct
+;; from :connection-closed, which is retry-able. A handler held on a pending
+;; promise keeps the connection draining; a request issued in that window rejects
+;; with :drained (after drain completes the same op would be :connection-closed).
+(deftest request-during-drain-window-rejects-drained
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})
+           gate (java.util.concurrent.CompletableFuture.)]
+       (try
+         (nats/subscribe conn drain-window-subject (fn [_] gate))
+         (nats/publish conn drain-window-subject {:n 1})
+         @(nats/flush conn)
+         (Thread/sleep 200)
+         (let [drain-ret (nats/drain conn)]
+           (Thread/sleep 100)
+           (let [t (try (deref (nats/request conn drain-window-subject {:n 2} {:timeout-ms 500}) 2000 ::timeout)
+                        nil
+                        (catch java.util.concurrent.ExecutionException e (:type (ex-data (.getCause e)))))]
+             (is (= :drained t)
+                 "a request in the drain window rejects with :drained, not :connection-closed"))
+           (.complete gate nil)
+           (deref drain-ret 3000 ::timeout))
+         (finally
+           (.complete gate nil)
+           (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [gate (p/deferred)]
+                            (nats/subscribe conn drain-window-subject (fn [_] gate))
+                            (nats/publish conn drain-window-subject {:n 1})
+                            (-> (nats/flush conn)
+                                (p/then (fn [_] (p/delay 200)))
+                                (p/then (fn [_]
+                                          (let [drain-ret (nats/drain conn)]
+                                            (-> (p/delay 100)
+                                                (p/then (fn [_] (nats/request conn drain-window-subject {:n 2} {:timeout-ms 500})))
+                                                (p/then (fn [_] (is false "expected the request to reject with :drained")))
+                                                (p/catch (fn [e]
+                                                           (is (= :drained (:type (ex-data e)))
+                                                               "a request in the drain window rejects with :drained, not :connection-closed")))
+                                                (p/then (fn [_] (p/resolve! gate nil)))
+                                                (p/then (fn [_] drain-ret))))))
+                                (p/finally (fn [_ _] (p/resolve! gate nil) (close! conn)))))))
+                (p/catch (fn [e] (is false (str "drain-window test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))

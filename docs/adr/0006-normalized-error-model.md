@@ -3,7 +3,18 @@
 Failures surface as an **`ex-info`** carrying a canonical **`:type`** keyword plus structured `ex-data`, identical in shape on the JVM and ClojureScript. Portable code inspects `(:type (ex-data e))` instead of branching on `Throwable` vs `js/Error`; native exceptions are normalized into this representation. There are two channels:
 
 - **One-shot operations** (`connect`, `request`, `flush`, `drain`, `close`) **reject their promise** with such an `ex-info`.
-- **Async failures with no call to reject** — a throwing handler (caught, so it never kills the dispatch loop), a **decode failure** (the handler is not called with garbage), a protocol error — reach the connection's **`:on-status` `:error`** sink, with an optional per-subscription **`:on-error`** override. **`:slow-consumer`** is the exception: it is inherently a property of one subscription, so it is delivered **only** to that subscription's `:on-error` (never the connection-level `:on-status`), keeping every `:on-status` event a bare connection-level `{:type ...}`.
+- **Async failures with no call to reject** reach a sink, routed by origin:
+
+  | Failure | Channel | normalized `:type` |
+  |---|---|---|
+  | Throwing handler (caught, so it never kills the dispatch loop) | sub `:on-error` if set, else `:on-status` `:error` | *none* — the raw thrown value, passed through unchanged |
+  | Decode failure (the handler is never called with garbage) | sub `:on-error` if set, else `:on-status` `:error` | `:codec-error` |
+  | `:slow-consumer` | sub `:on-error` **only** (dropped if unset) | `:slow-consumer` |
+  | `:permissions-violation`, `:protocol-error` | `:on-status` `:error` **only** | as named |
+
+  The per-sub override is **strict**: when a subscription sets `:on-error`, only it fires for that sub's handler/decode failures — never both it and `:on-status`. `:slow-consumer` is inherently a property of one subscription, so it never reaches the connection-level `:on-status`. `:permissions-violation` and `:protocol-error` are connection-level: jnats' `ErrorListener` hands us no subscription identity and nats.js' `permissionContext` does not map cleanly back to our subscription record, so they stay at `:on-status` and carry no per-sub override. A thrown handler value carries no canonical `:type` because it is the consumer's own exception, not a normalized NATS failure.
+
+  **Shape of the two sinks.** `:on-error` receives the **bare ex-info** (portable code reads `(:type (ex-data e))` exactly as on the one-shot reject path). `:on-status` receives a map keyed by a status-vocabulary `:type`; lifecycle events are bare `{:type ...}`, and the `:error` event is the lone exception, wrapping the offending ex-info under `:error` (`{:type :error :error <ex-info>}`) so dispatch on `(:type ev)` stays uniform.
 
 `request` distinguishes **`:timeout`** (responders exist, none answered in time) from **`:no-responders`** (NATS 503 — nobody subscribed); both reject rather than resolving to `nil`.
 
@@ -13,7 +24,7 @@ Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connectio
 
 ## Status events: shape, not cadence
 
-The same normalization applies to connection-lifecycle **status events** delivered to `:on-status` (canonical `:type`s in CONTEXT.md). What "identical in shape" guarantees there is deliberately narrower than for errors: each delivered event is a bare `{:type ...}` map drawn from the canonical set, but the **count, ordering, and trigger conditions are not normalized** — they follow each underlying client's native reconnect/gossip strategy. We normalize the vocabulary, not the cadence, because the alternative (collapsing or synthesizing events to make the streams byte-identical) means permanently re-implementing two clients' internal loops, and the events carry no payload a consumer could reconcile anyway (they are bare `{:type ...}`).
+The same normalization applies to connection-lifecycle **status events** delivered to `:on-status` (canonical `:type`s in CONTEXT.md). What "identical in shape" guarantees there is deliberately narrower than for errors: each delivered lifecycle event is a bare `{:type ...}` map drawn from the canonical set (the `:error` event excepted — it carries the offending ex-info under `:error`, per the routing table above), but the **count, ordering, and trigger conditions are not normalized** — they follow each underlying client's native reconnect/gossip strategy. We normalize the vocabulary, not the cadence, because the alternative (collapsing or synthesizing events to make the streams byte-identical) means permanently re-implementing two clients' internal loops, and the events carry no payload a consumer could reconcile anyway (they are bare `{:type ...}`).
 
 Known divergences, accepted under this decision:
 

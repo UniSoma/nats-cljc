@@ -2,7 +2,8 @@
   "ClojureScript platform implementation: a Connection record wrapping
    @nats-io/nats-core over WebSocket (ADR 0001/0003), serving browser and Node
    from one package. All JS interop is quarantined here (ADR 0005)."
-  (:require [nats-cljc.protocol :as proto]
+  (:require [clojure.string :as str]
+            [nats-cljc.protocol :as proto]
             ["@nats-io/nats-core" :as nats-core]))
 
 (defn- no-responders?
@@ -59,44 +60,94 @@
   proto/Sub
   (-active? [_] (not (.isClosed ^js sub))))
 
-(defrecord JsConnection [client codec]
+(defn- op-state-error
+  "Build the ex-info for a nats.js ClosedConnectionError from a publish/request on
+   a non-open connection (ADR 0006): the drain WINDOW → `:drained` (a don't-retry
+   signal), else fully closed → `:connection-closed` (retry-able). nats.js raises
+   the same ClosedConnectionError for both, so the live `isDraining` — not the
+   error type — distinguishes them."
+  [^js client subject]
+  (if (.isDraining client)
+    (ex-info "Connection is draining" {:type :drained :subject subject})
+    (ex-info "Connection is closed" {:type :connection-closed :subject subject})))
+
+(defn- consume!
+  "Drive a no-callback nats.js Subscription as an async-iterable (road 2, ADR
+   0007): a detached `.next` loop (mirroring `pump-status!`) awaits the handler
+   before pulling the next message, so a returned promise applies per-subscription
+   backpressure and the backlog fills nats.js' OWN buffer — where the iterator-only
+   slow-consumer threshold lives (the superseded callback-tail kept it empty). One
+   funnel catches a sync decode throw, a sync handler throw, and a rejecting
+   handler promise alike, routing each to the sub's `on-error` (else the
+   connection `on-status` :error) and then CONTINUING — the subscription survives.
+   The iterable completing (drain/unsubscribe/close) ends the loop; the `.next`
+   `.catch` swallows that close-race."
+  [^js sub handler on-error on-status]
+  (let [iter (.call (unchecked-get sub js/Symbol.asyncIterator) sub)]
+    (letfn [(route [e]
+              (try
+                (if on-error (on-error e) (when on-status (on-status {:type :error :error e})))
+                (catch :default _ nil))
+              (step))
+            (step []
+              (-> (.next iter)
+                  (.then (fn [^js res]
+                           (when-not (.-done res)
+                             (-> (js/Promise.resolve)
+                                 (.then (fn [_] (handler (msg->raw (.-value res)))))
+                                 (.then (fn [_] (step)))
+                                 (.catch route)))))
+                  (.catch (fn [_] nil))))]
+      (step))))
+
+(defrecord JsConnection [client codec on-status]
   proto/Conn
   (-publish [_ subject headers bytes]
     ;; The headers map rides in nats.js' PublishOptions; omit it for a plain
-    ;; publish (no header frame on the wire).
-    (if-let [h (->headers headers)]
-      (.publish ^js client subject bytes #js {:headers h})
-      (.publish ^js client subject bytes)))
-  (-subscribe [_ subject queue handler]
-    ;; A subscribe with a :callback delivers per-message and returns the
-    ;; Subscription synchronously (instead of becoming an async iterable). The
-    ;; per-subscription tail chains each handler invocation onto the previous
-    ;; one's settle, so a handler that returns a promise (a thenable) suspends
-    ;; delivery of the next message until it settles — promise-return backpressure
-    ;; (ADR 0007). The event loop is single-threaded, so the tail mutates without
-    ;; contention and is never blocked. A non-thenable return resolves
-    ;; immediately, delivering the next message at once. `.catch` keeps a
-    ;; rejecting handler from stalling the chain (error routing is the error-model
-    ;; slice's job).
-    ;; NB: under a sustained-slow handler the undelivered backlog grows UNBOUNDED
-    ;; in this chain — nats.js' native slow-consumer is iterator-only and throws
-    ;; for a :callback sub, so nothing signals or bounds it. Honoring :max-pending
-    ;; + surfacing :slow-consumer is nts-01kstxatbw6k AC#4 (likely a rework to the
-    ;; async-iterator + await-handler model, where nats.js buffers and signals).
-    (let [tail (atom (js/Promise.resolve))
-          opts #js {:callback (fn [_err ^js msg]
-                                (let [m (msg->raw msg)]
-                                  (swap! tail
-                                         (fn [^js prev]
-                                           (-> prev
-                                               (.then (fn [_] (handler m)))
-                                               (.catch (fn [_] js/undefined)))))))}]
-      ;; The queue-group name rides in nats.js' SubscriptionOptions alongside
-      ;; :callback; omit it for a plain subscription. Wrap the native Sub in a
-      ;; JsSubscription so the facade returns a uniform Subscription (drain/active?)
-      ;; instead of leaking nats.js' type.
+    ;; publish (no header frame on the wire). nats.js rejects an over-max payload
+    ;; with an InvalidArgumentError; normalize it to a synchronous
+    ;; `:max-payload-exceeded` (fire-and-forget has no promise to reject — ADR 0006).
+    (try
+      (if-let [h (->headers headers)]
+        (.publish ^js client subject bytes #js {:headers h})
+        (.publish ^js client subject bytes))
+      (catch :default e
+        (cond
+          (instance? nats-core/InvalidArgumentError e)
+          (throw (ex-info "Message payload exceeds the server's max payload"
+                          {:type :max-payload-exceeded :subject subject
+                           :size (.-length bytes) :max (some-> (.-info ^js client) .-max_payload)}))
+          ;; A closed or draining connection refuses the publish (nats.js, unlike
+          ;; jnats, rejects a draining publish too); normalize by drain state (ADR 0006).
+          (instance? nats-core/ClosedConnectionError e)
+          (throw (op-state-error client subject))
+          :else (throw e)))))
+  (-subscribe [_ subject queue {:keys [on-error max-pending]} handler]
+    ;; Road 2 (ADR 0007): NO :callback — the subscription is an async-iterable that
+    ;; `consume!` drives with a detached loop awaiting the handler, so a returned
+    ;; promise applies backpressure and the backlog fills nats.js' own buffer
+    ;; (where the iterator-only slow-consumer threshold lives; it throws under a
+    ;; :callback sub). A decode/handler throw or rejection routes to :on-error /
+    ;; :on-status and the loop continues — the subscription survives.
+    (let [opts #js {}]
+      ;; The queue-group name rides in nats.js' SubscriptionOptions; omit it for a
+      ;; plain subscription. Wrap the native Sub in a JsSubscription so the facade
+      ;; returns a uniform Subscription (drain/active?) without leaking nats.js' type.
       (when queue (set! (.-queue opts) queue))
-      (->JsSubscription (.subscribe ^js client subject opts))))
+      (let [sub (.subscribe ^js client subject opts)]
+        ;; :max-pending arms nats.js' iterator-only slow-consumer threshold; its
+        ;; notifier routes the overflow to this sub's :on-error (ADR 0006/0007).
+        ;; nats.js does NOT auto-drop over-limit messages (unbounded buffer) — the
+        ;; signal is portable, the drop is native (an accepted divergence). Absent
+        ;; :on-error drops the signal, so only wire it when there's a sink.
+        (when (and max-pending on-error)
+          (.setSlowNotificationFn ^js sub max-pending
+                                  (fn [pending]
+                                    (on-error (ex-info "Slow consumer"
+                                                       {:type :slow-consumer :subject subject
+                                                        :max-pending max-pending :pending pending})))))
+        (consume! sub handler on-error on-status)
+        (->JsSubscription sub))))
   (-flush [_]
     ;; nats.js flush already returns a Promise that settles once the server has
     ;; processed the buffer.
@@ -120,6 +171,11 @@
                            (timeout? e)
                            (ex-info "Request timed out"
                                     {:type :timeout :subject subject :timeout-ms timeout-ms})
+                           ;; A closed or draining connection rejects the request
+                           ;; with `:connection-closed` (retry-able) or `:drained`,
+                           ;; by drain state (ADR 0006).
+                           (instance? nats-core/ClosedConnectionError e)
+                           (op-state-error client subject)
                            :else e))))))
   proto/Drainable
   (-drain [_]
@@ -142,14 +198,32 @@
    "update"       :servers-changed
    "close"        :closed})
 
+(defn server-error-type
+  "Classify a nats.js server-error message onto a connection-level error `:type`
+   (ADR 0006): the exact \"Permissions Violation\" → `:permissions-violation`,
+   anything else → `:protocol-error`. No clean e2e trigger exists for the latter,
+   so it is exercised as a classifier unit (the same logic on both legs)."
+  [error]
+  (if (and error (str/includes? error "Permissions Violation"))
+    :permissions-violation
+    :protocol-error))
+
 (defn deliver-status!
-  "Normalize one native nats.js status object; when its type is mapped, deliver
-   it to `on-status` as a plain `{:type ...}` map and return the canonical type,
-   else nil. Unmapped names are ignored."
+  "Normalize one native nats.js status object onto `on-status` (ADR 0006). nats.js
+   funnels server errors (permissions/protocol) through the same status stream as
+   an `error` type with no subscription identity, so it surfaces as the lone
+   non-bare lifecycle event `{:type :error :error <ex-info>}` — never a per-sub
+   override — with the error classified by `server-error-type`. A mapped lifecycle
+   name delivers as a bare `{:type ...}`; unmapped names are ignored. Returns the
+   canonical type, or nil."
   [on-status ^js native]
-  (when-let [t (status->type (.-type native))]
-    (on-status {:type t})
-    t))
+  (if (= "error" (.-type native))
+    (let [msg (some-> (.-error native) .-message)]
+      (on-status {:type :error :error (ex-info (str msg) {:type (server-error-type msg)})})
+      :error)
+    (when-let [t (status->type (.-type native))]
+      (on-status {:type t})
+      t)))
 
 (defn- pump-status!
   "Drain nats.js' status() async-iterable, normalizing each event onto
@@ -224,7 +298,7 @@
                  (when on-status
                    (on-status {:type :connected})
                    (pump-status! nc on-status))
-                 (->JsConnection nc codec)))
+                 (->JsConnection nc codec on-status)))
         (.catch (fn [e]
                   (throw (ex-info "Failed to connect to NATS"
                                   {:type :connect-failed :servers servers}

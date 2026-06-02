@@ -22,14 +22,20 @@
     "Publish raw `bytes` to `subject`. Fire-and-forget; return value unused.
      `headers` is the canonical portable header map `{name -> vector-of-strings}`
      (case-sensitive string names) the facade normalizes to, or nil for none.")
-  (-subscribe [conn subject queue handler]
+  (-subscribe [conn subject queue opts handler]
     "Subscribe to `subject`, returning a Subscription record synchronously. When
      `queue` is a non-nil group name the subscription joins that queue group and
      the server load-balances each matching message to exactly one member; nil is
      a plain subscription that receives every matching message. `handler` is the
      low-level handler, invoked per message with a raw map
      `{:subject <string> :bytes <platform-bytes> :reply <string-or-nil>}`,
-     where `:reply` is the message's reply-to subject (nil when absent).")
+     where `:reply` is the message's reply-to subject (nil when absent).
+     `opts` is `{:on-error <fn-or-nil> :max-pending <int-or-nil>}` (ADR 0006/0007):
+     `:on-error` is a 1-arg sink for this subscription's async failures (a thrown
+     handler value, a decode failure, or `:slow-consumer`); when absent, handler
+     and decode failures fall back to the connection's `:on-status` `:error` event
+     and `:slow-consumer` is dropped. `:max-pending` is a message-count threshold
+     above which `:slow-consumer` fires.")
   (-request [conn subject bytes timeout-ms]
     "Send a request: publish raw `bytes` to `subject` with a managed reply inbox,
      returning a native promise of the raw reply map

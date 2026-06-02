@@ -100,11 +100,21 @@
    and `:queue`: subscriptions sharing a queue-group name compete, so the server
    load-balances each matching message to exactly one member of the group. A nil
    or blank `:queue` is a plain subscription (normalized here so both platforms
-   agree, rather than relying on each native layer's truthiness)."
+   agree, rather than relying on each native layer's truthiness).
+
+   `opts` may also set the async-failure sink and overflow threshold (ADR 0006):
+   `:on-error`, a 1-arg fn receiving this subscription's failures as a bare
+   `ex-info` — a thrown handler value (unchanged, no canonical `:type`), a decode
+   failure (`:codec-error`), or `:slow-consumer` — and `:max-pending`, a
+   message-count threshold above which `:slow-consumer` fires. With no `:on-error`,
+   a thrown-handler/decode failure falls back to the connection's `:on-status`
+   `:error` event and `:slow-consumer` is dropped; the override is strict (never
+   both). A decode failure is caught here, so the handler never sees garbage."
   ([conn subject handler] (subscribe conn subject handler {}))
-  ([conn subject handler {:keys [queue] :as opts}]
+  ([conn subject handler {:keys [queue on-error max-pending] :as opts}]
    (let [codec (effective-codec conn opts)]
      (proto/-subscribe conn subject (when-not (str/blank? queue) queue)
+                       {:on-error on-error :max-pending max-pending}
                        (fn [raw] (handler (decode-msg codec raw)))))))
 
 (defn request
