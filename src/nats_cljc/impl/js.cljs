@@ -19,13 +19,36 @@
   (or (instance? nats-core/TimeoutError e)
       (instance? nats-core/TimeoutError (.-cause ^js e))))
 
+(defn- ->headers
+  "Build a nats.js MsgHdrs from the canonical portable map `{name -> [str ...]}`,
+   or nil for none. append's default Exact match stores names verbatim, so the
+   case-sensitive names survive to the wire."
+  [headers]
+  (when headers
+    (let [h (nats-core/headers)]
+      (doseq [[k vs] headers
+              v       vs]
+        (.append ^js h k v))
+      h)))
+
+(defn- raw-headers
+  "Extract a nats.js Msg's headers into the canonical portable map
+   `{name -> [str ...]}`, or nil when it carries none. toRecord preserves the
+   case-sensitive names (ADR 0005)."
+  [^js msg]
+  (when-let [h (.-headers msg)]
+    (let [r (js->clj (.toRecord ^js h))]
+      (when (seq r) r))))
+
 (defn- msg->raw
   "Lift a nats.js Msg into the raw map the facade decodes (ADR 0005): subject,
-   wire bytes, and the reply-to subject (nil when absent)."
+   wire bytes, the reply-to subject (nil when absent), and the headers map (nil
+   when absent)."
   [^js msg]
   {:subject (.-subject msg)
    :bytes   (.-data msg)
-   :reply   (.-reply msg)})
+   :reply   (.-reply msg)
+   :headers (raw-headers msg)})
 
 (defrecord JsSubscription [sub]
   proto/Drainable
@@ -38,8 +61,12 @@
 
 (defrecord JsConnection [client codec]
   proto/Conn
-  (-publish [_ subject bytes]
-    (.publish ^js client subject bytes))
+  (-publish [_ subject headers bytes]
+    ;; The headers map rides in nats.js' PublishOptions; omit it for a plain
+    ;; publish (no header frame on the wire).
+    (if-let [h (->headers headers)]
+      (.publish ^js client subject bytes #js {:headers h})
+      (.publish ^js client subject bytes)))
   (-subscribe [_ subject queue handler]
     ;; A subscribe with a :callback delivers per-message and returns the
     ;; Subscription synchronously (instead of becoming an async iterable). The

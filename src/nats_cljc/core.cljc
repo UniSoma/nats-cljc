@@ -27,20 +27,60 @@
   [opts]
   (impl/connect opts))
 
+(defn- normalize-headers
+  "Normalize a user `:headers` map to the canonical portable form the protocol
+   carries: `{name -> vector-of-strings}` with case-sensitive string names. A
+   scalar value is wrapped in a one-element vector; a vector is kept as-is
+   (CONTEXT: Headers). Returns nil for nil/empty input so `:headers` stays absent
+   when none were set.
+
+   Names and values must be strings: jnats and nats.js diverge on a non-string
+   value (notably nil — jnats drops it and publishes headerless, nats.js throws),
+   so we reject it here with a portable `:type :invalid-header` ex-info rather
+   than leak that divergence. A set is treated as a scalar (its order is
+   undefined); pass a vector for multiple values."
+  [headers]
+  (when (seq headers)
+    (reduce-kv (fn [m k v]
+                 (when-not (string? k)
+                   (throw (ex-info "Header names must be strings"
+                                   {:type :invalid-header :name k})))
+                 (let [vs (if (sequential? v) (vec v) [v])]
+                   (when-not (every? string? vs)
+                     (throw (ex-info "Header values must be strings"
+                                     {:type :invalid-header :name k :values vs})))
+                   (assoc m k vs)))
+               {} headers)))
+
 (defn publish
   "Publish `data` to `subject` on `conn`, encoding it with the connection's codec.
-   Fire-and-forget: returns nil (ADR 0002)."
-  [conn subject data]
-  (proto/-publish conn subject (codec/encode (:codec conn) data))
-  nil)
+   Fire-and-forget: returns nil (ADR 0002). `opts` may set `:headers`, a map of
+   case-sensitive string names to one or more string values; a scalar value is
+   normalized to a one-element vector (CONTEXT: Headers). Header names and values
+   must be strings, and names must be valid header tokens (printable ASCII, no
+   colon); invalid input throws."
+  ([conn subject data] (publish conn subject data {}))
+  ([conn subject data {:keys [headers]}]
+   (proto/-publish conn subject (normalize-headers headers) (codec/encode (:codec conn) data))
+   nil))
 
 (defn- decode-msg
-  "Decode a raw delivery/reply map `{:subject :bytes :reply}` into the public
-   message shape `{:subject :data :reply}`, decoding `:bytes` with `codec-kw`."
-  [codec-kw {:keys [subject bytes reply]}]
-  {:subject subject
-   :reply   reply
-   :data    (codec/decode codec-kw bytes)})
+  "Decode a raw delivery/reply map `{:subject :bytes :reply :headers}` into the
+   public message shape `{:subject :data :reply}`, decoding `:bytes` with
+   `codec-kw`. `:headers` (canonical `{name -> vector-of-strings}`) is added only
+   when the message carried some, so it is absent otherwise.
+
+   This is where the portable header-value contract is enforced: surrounding
+   whitespace is insignificant and stripped on delivery (nats.js already trims,
+   so the JS leg double-trims harmlessly; jnats does not, so this is what makes
+   the JVM leg agree), and an empty map is dropped so `:headers` stays absent
+   regardless of any platform quirk in producing it (CONTEXT: Headers)."
+  [codec-kw {:keys [subject bytes reply headers]}]
+  (cond-> {:subject subject
+           :reply   reply
+           :data    (codec/decode codec-kw bytes)}
+    (seq headers) (assoc :headers (reduce-kv (fn [m k vs] (assoc m k (mapv str/trim vs)))
+                                             {} headers))))
 
 (defn subscribe
   "Subscribe to `subject`, returning a Subscription synchronously. `handler` is
@@ -77,7 +117,7 @@
    subject."
   [conn msg data]
   (if-let [reply-subject (:reply msg)]
-    (do (proto/-publish conn reply-subject (codec/encode (:codec conn) data))
+    (do (proto/-publish conn reply-subject nil (codec/encode (:codec conn) data))
         nil)
     (throw (ex-info "Message has no reply subject"
                     {:type :no-reply-subject :subject (:subject msg)}))))

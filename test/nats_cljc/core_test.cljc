@@ -93,6 +93,15 @@
 ;; failure mode (responders exist, yet none reply within :timeout-ms).
 (def ^:private silent-subject "rr.silent")
 
+;; Headers subjects: case-sensitive string names -> one-or-more string values,
+;; present only when set. Distinct per behavior so the shared server doesn't
+;; cross-feed between tests.
+(def ^:private headers-scalar-subject "headers.scalar")
+(def ^:private headers-vector-subject "headers.vector")
+(def ^:private headers-case-subject "headers.case")
+(def ^:private headers-absent-subject "headers.absent")
+(def ^:private headers-trim-subject "headers.trim")
+
 ;; Test-only teardown: close the native client so jnats' non-daemon threads (and
 ;; the CLJS ws connection) don't outlive the test. A public close/drain is its
 ;; own slice; here we reach the record's client field directly.
@@ -886,5 +895,181 @@
                                          (is (= :timeout (:type (ex-data e)))
                                              "a request whose responders never answer within :timeout-ms rejects with :timeout")))
                               (p/finally (fn [_ _] (close! conn))))))
+                (p/catch (fn [e] (is false (str "connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Headers round-trip (CONTEXT: Headers). A scalar header value is accepted on
+;; publish and arrives normalized to a one-element vector of strings under
+;; :headers — the same shape on every platform.
+(deftest headers-scalar-delivers-as-one-element-vector
+  #?(:clj
+     (let [conn     @(nats/connect {:servers [server-url]})
+           received (promise)]
+       (try
+         (nats/subscribe conn headers-scalar-subject #(deliver received %))
+         (nats/publish conn headers-scalar-subject payload {:headers {"X-Trace" "abc"}})
+         (let [msg (deref received 5000 ::timeout)]
+           (is (not= ::timeout msg) "handler is invoked within 5s")
+           (is (= {"X-Trace" ["abc"]} (:headers msg))
+               "a scalar header value is delivered as a one-element vector of strings"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [received (p/deferred)]
+                            (nats/subscribe conn headers-scalar-subject #(p/resolve! received %))
+                            (nats/publish conn headers-scalar-subject payload {:headers {"X-Trace" "abc"}})
+                            (-> (p/timeout received 5000)
+                                (p/then (fn [msg]
+                                          (is (= {"X-Trace" ["abc"]} (:headers msg))
+                                              "a scalar header value is delivered as a one-element vector of strings")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; When nothing was published under :headers, the delivered message carries no
+;; :headers key at all — absence, not an empty map (CONTEXT: Headers).
+(deftest headers-absent-when-none-set
+  #?(:clj
+     (let [conn     @(nats/connect {:servers [server-url]})
+           received (promise)]
+       (try
+         (nats/subscribe conn headers-absent-subject #(deliver received %))
+         (nats/publish conn headers-absent-subject payload)
+         (let [msg (deref received 5000 ::timeout)]
+           (is (not= ::timeout msg) "handler is invoked within 5s")
+           (is (not (contains? msg :headers))
+               ":headers is absent from the delivered map when none were set"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [received (p/deferred)]
+                            (nats/subscribe conn headers-absent-subject #(p/resolve! received %))
+                            (nats/publish conn headers-absent-subject payload)
+                            (-> (p/timeout received 5000)
+                                (p/then (fn [msg]
+                                          (is (not (contains? msg :headers))
+                                              ":headers is absent from the delivered map when none were set")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Header names are case-sensitive: two names differing only in case are distinct
+;; entries that survive the round-trip without collapsing (CONTEXT: Headers).
+(deftest headers-names-are-case-sensitive
+  #?(:clj
+     (let [conn     @(nats/connect {:servers [server-url]})
+           received (promise)]
+       (try
+         (nats/subscribe conn headers-case-subject #(deliver received %))
+         (nats/publish conn headers-case-subject payload {:headers {"X-Trace" "upper" "x-trace" "lower"}})
+         (let [msg (deref received 5000 ::timeout)]
+           (is (not= ::timeout msg) "handler is invoked within 5s")
+           (is (= {"X-Trace" ["upper"] "x-trace" ["lower"]} (:headers msg))
+               "names differing only in case are preserved as distinct entries"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [received (p/deferred)]
+                            (nats/subscribe conn headers-case-subject #(p/resolve! received %))
+                            (nats/publish conn headers-case-subject payload {:headers {"X-Trace" "upper" "x-trace" "lower"}})
+                            (-> (p/timeout received 5000)
+                                (p/then (fn [msg]
+                                          (is (= {"X-Trace" ["upper"] "x-trace" ["lower"]} (:headers msg))
+                                              "names differing only in case are preserved as distinct entries")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; A vector-valued header carries multiple values for one name; they arrive
+;; unchanged as a vector of strings, in order (CONTEXT: Headers).
+(deftest headers-vector-delivers-unchanged
+  #?(:clj
+     (let [conn     @(nats/connect {:servers [server-url]})
+           received (promise)]
+       (try
+         (nats/subscribe conn headers-vector-subject #(deliver received %))
+         (nats/publish conn headers-vector-subject payload {:headers {"X-Tag" ["a" "b"]}})
+         (let [msg (deref received 5000 ::timeout)]
+           (is (not= ::timeout msg) "handler is invoked within 5s")
+           (is (= {"X-Tag" ["a" "b"]} (:headers msg))
+               "a vector-valued header is delivered unchanged as a vector of strings"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [received (p/deferred)]
+                            (nats/subscribe conn headers-vector-subject #(p/resolve! received %))
+                            (nats/publish conn headers-vector-subject payload {:headers {"X-Tag" ["a" "b"]}})
+                            (-> (p/timeout received 5000)
+                                (p/then (fn [msg]
+                                          (is (= {"X-Tag" ["a" "b"]} (:headers msg))
+                                              "a vector-valued header is delivered unchanged as a vector of strings")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Surrounding whitespace on a header value is insignificant and stripped on
+;; delivery, identically on every platform (CONTEXT: Headers). nats.js trims
+;; natively; decode-msg owns the rule so the JVM leg agrees rather than relying
+;; on the underlying client's behavior.
+(deftest headers-whitespace-stripped-on-delivery
+  #?(:clj
+     (let [conn     @(nats/connect {:servers [server-url]})
+           received (promise)]
+       (try
+         (nats/subscribe conn headers-trim-subject #(deliver received %))
+         (nats/publish conn headers-trim-subject payload {:headers {"X-Trace" "  abc  "}})
+         (let [msg (deref received 5000 ::timeout)]
+           (is (not= ::timeout msg) "handler is invoked within 5s")
+           (is (= {"X-Trace" ["abc"]} (:headers msg))
+               "surrounding whitespace is stripped from the delivered value"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [received (p/deferred)]
+                            (nats/subscribe conn headers-trim-subject #(p/resolve! received %))
+                            (nats/publish conn headers-trim-subject payload {:headers {"X-Trace" "  abc  "}})
+                            (-> (p/timeout received 5000)
+                                (p/then (fn [msg]
+                                          (is (= {"X-Trace" ["abc"]} (:headers msg))
+                                              "surrounding whitespace is stripped from the delivered value")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; A non-string header value is rejected with a portable `:type :invalid-header`
+;; ex-info on every platform, rather than leaking the underlying clients'
+;; divergence: jnats silently drops a nil value and publishes headerless, while
+;; nats.js throws (CONTEXT: Headers). The throw is synchronous in `publish`,
+;; before anything reaches the wire.
+(deftest headers-non-string-value-rejected
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})]
+       (try
+         (is (= :invalid-header
+                (try (nats/publish conn "headers.invalid" payload {:headers {"X-Trace" nil}})
+                     :no-throw
+                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+             "a nil header value is rejected as :invalid-header, not silently dropped")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (is (= :invalid-header
+                                 (try (nats/publish conn "headers.invalid" payload {:headers {"X-Trace" nil}})
+                                      :no-throw
+                                      (catch :default e (:type (ex-data e)))))
+                              "a nil header value is rejected as :invalid-header, not silently dropped")
+                          (close! conn)))
                 (p/catch (fn [e] (is false (str "connect failed: " e))))
                 (p/finally (fn [_ _] (done)))))))

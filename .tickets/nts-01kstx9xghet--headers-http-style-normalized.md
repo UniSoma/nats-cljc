@@ -1,19 +1,19 @@
 ---
 id: nts-01kstx9xghet
 title: Headers (HTTP-style, normalized)
-status: open
+status: in_progress
 type: feature
 priority: 1
 mode: afk
 created: '2026-05-29T22:22:31.441033681Z'
-updated: '2026-05-29T22:34:55.151010465Z'
+updated: '2026-06-02T01:14:07.747892569Z'
 acceptance:
 - title: Publishing `:headers` with a scalar value delivers it as a one-element vector of strings
-  done: false
+  done: true
 - title: Publishing vector-valued headers delivers them unchanged as vectors of strings
-  done: false
+  done: true
 - title: Header names are preserved case-sensitively
-  done: false
+  done: true
 - title: '`:headers` is absent from the delivered map when none were set; verified on all three platforms'
   done: false
 deps:

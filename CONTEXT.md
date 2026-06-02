@@ -54,7 +54,7 @@ A dot-delimited token string naming where a message is published and what a subs
 _Avoid_: topic, address, queue (a *queue group* is a different thing)
 
 **Headers**:
-Optional named string values carried by a message, HTTP-style: case-sensitive string names, each mapping to one or more string values. Delivered as `name → vector-of-strings`; a scalar value is accepted on publish and normalized to a one-element vector.
+Optional named string values carried by a message, HTTP-style: case-sensitive string names, each mapping to one or more string values. Delivered as `name → vector-of-strings`; a scalar value is accepted on publish and normalized to a one-element vector. Surrounding whitespace is insignificant and stripped on delivery.
 _Avoid_: properties, attributes, metadata
 
 **Data**:

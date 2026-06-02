@@ -18,8 +18,10 @@
 
 (defprotocol Conn
   "The primitive operations every platform Connection record implements."
-  (-publish [conn subject bytes]
-    "Publish raw `bytes` to `subject`. Fire-and-forget; return value unused.")
+  (-publish [conn subject headers bytes]
+    "Publish raw `bytes` to `subject`. Fire-and-forget; return value unused.
+     `headers` is the canonical portable header map `{name -> vector-of-strings}`
+     (case-sensitive string names) the facade normalizes to, or nil for none.")
   (-subscribe [conn subject queue handler]
     "Subscribe to `subject`, returning a Subscription record synchronously. When
      `queue` is a non-nil group name the subscription joins that queue group and

@@ -3,6 +3,7 @@
    TCP (ADR 0001/0003). All jnats interop is quarantined here (ADR 0005)."
   (:require [nats-cljc.protocol :as proto])
   (:import [io.nats.client Nats Options Options$Builder Connection Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events]
+           [io.nats.client.impl Headers]
            [java.time Duration]
            [java.util.concurrent CompletableFuture CompletionStage CancellationException TimeoutException]
            [java.util.function Supplier Function BiFunction]))
@@ -13,13 +14,34 @@
 ;; error-model slice's job.
 (def ^:private ^Duration op-timeout (Duration/ofSeconds 10))
 
+(defn- ->headers
+  "Build a jnats Headers from the canonical portable map `{name -> [str ...]}`, or
+   nil for none. Names are added verbatim (the Collection overload), so the
+   case-sensitive names survive to the wire."
+  [headers]
+  (when headers
+    (reduce-kv (fn [^Headers h ^String k vs] (.add h k ^java.util.Collection vs))
+               (Headers.) headers)))
+
+(defn- raw-headers
+  "Extract a jnats Message's headers into the canonical portable map
+   `{name -> [str ...]}`, or nil when it carries none. keySet preserves the
+   case-sensitive names (ADR 0005)."
+  [^Message msg]
+  (when (.hasHeaders msg)
+    (let [^Headers h (.getHeaders msg)]
+      (reduce (fn [m ^String k] (assoc m k (vec (.get h k))))
+              {} (.keySet h)))))
+
 (defn- msg->raw
   "Lift a jnats Message into the raw map the facade decodes (ADR 0005): subject,
-   wire bytes, and the reply-to subject (nil when absent)."
+   wire bytes, the reply-to subject (nil when absent), and the headers map (nil
+   when absent)."
   [^Message msg]
   {:subject (.getSubject msg)
    :bytes   (.getData msg)
-   :reply   (.getReplyTo msg)})
+   :reply   (.getReplyTo msg)
+   :headers (raw-headers msg)})
 
 (defrecord JvmSubscription [^Subscription sub]
   proto/Drainable
@@ -32,8 +54,12 @@
 
 (defrecord JvmConnection [^Connection client codec]
   proto/Conn
-  (-publish [_ subject bytes]
-    (.publish client ^String subject ^bytes bytes))
+  (-publish [_ subject headers bytes]
+    ;; The headers map selects jnats' publish(subject, Headers, body) overload; a
+    ;; nil headers map is a plain publish (no header frame on the wire).
+    (if-let [^Headers h (->headers headers)]
+      (.publish client ^String subject h ^bytes bytes)
+      (.publish client ^String subject ^bytes bytes)))
   (-subscribe [_ subject queue handler]
     ;; Per-subscription tail: each message's handler invocation is composed onto
     ;; the previous one's settle, so a handler that returns a CompletionStage
