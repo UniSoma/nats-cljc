@@ -62,7 +62,7 @@ The decoded value a message carries — ordinary Clojure data, once a codec has 
 _Avoid_: payload, body, content
 
 **Codec**:
-The pluggable component that converts between Clojure values and the bytes on the wire. A connection has a default codec; any publish/subscribe/request may override it.
+The pluggable component that converts between Clojure values and the bytes on the wire. A connection has a default codec; any publish/subscribe/request/reply may override it.
 _Avoid_: serializer, serde, marshaller (encoder/decoder are the two directions *within* a codec, not synonyms for it)
 
 **Subscription**:

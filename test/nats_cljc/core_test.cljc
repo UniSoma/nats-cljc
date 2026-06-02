@@ -70,6 +70,11 @@
 (def ^:private subject "tracer.roundtrip")
 (def ^:private payload {:hello "world" :n 42 :nested [1 2 {:k :v}]})
 
+;; Per-call :codec override (ADR 0011). Distinct subjects per direction so the
+;; shared server doesn't cross-feed.
+(def ^:private codec-pub-sub-subject "codec.override.pubsub")
+(def ^:private codec-request-subject "codec.override.request")
+
 ;; Delivery-semantics subjects (ADR 0007). Distinct per behavior so the shared
 ;; servers don't cross-feed between tests.
 (def ^:private order-subject "delivery.order")
@@ -106,6 +111,12 @@
 ;; the CLJS ws connection) don't outlive the test. A public close/drain is its
 ;; own slice; here we reach the record's client field directly.
 (defn- close! [conn] (.close (:client conn)))
+
+;; A `:bytes` subscriber observes the exact wire bytes a publisher produced;
+;; UTF-8-decode them so the per-call-override assertion reads as a string.
+(defn- raw->str [b]
+  #?(:clj  (String. ^bytes b java.nio.charset.StandardCharsets/UTF_8)
+     :cljs (.decode (js/TextDecoder.) b)))
 
 ;; Test-only trigger for a real link drop: both native clients expose a public
 ;; force-reconnect that genuinely drops the socket (firing the native
@@ -313,6 +324,38 @@
                                           (is (= payload (:data msg)) "handler receives EDN-decoded :data")))
                                 (p/finally (fn [_ _] (close! conn)))))))
                 (p/catch (fn [e] (is false (str "round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; AC1: a per-call :codec overrides the connection default on BOTH publish and
+;; subscribe. The connection defaults to :edn; the subscriber overrides to :bytes
+;; (so it captures the raw wire bytes) and the publisher overrides to :string.
+;; Only when both overrides take effect do the delivered bytes read as "hi" — the
+;; :edn default would have produced the quoted "\"hi\"".
+(deftest per-call-codec-overrides-publish-and-subscribe
+  #?(:clj
+     (let [conn     @(nats/connect {:servers [server-url]})
+           received (promise)
+           _        (nats/subscribe conn codec-pub-sub-subject #(deliver received %) {:codec :bytes})
+           _        (nats/publish conn codec-pub-sub-subject "hi" {:codec :string})]
+       (try
+         (let [msg (deref received 5000 ::timeout)]
+           (is (not= ::timeout msg) "handler is invoked within 5s")
+           (is (= "hi" (raw->str (:data msg)))
+               "per-call :string on publish + :bytes on subscribe override the :edn default"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [received (p/deferred)]
+                            (nats/subscribe conn codec-pub-sub-subject #(p/resolve! received %) {:codec :bytes})
+                            (nats/publish conn codec-pub-sub-subject "hi" {:codec :string})
+                            (-> (p/timeout received 5000)
+                                (p/then (fn [msg]
+                                          (is (= "hi" (raw->str (:data msg)))
+                                              "per-call :string on publish + :bytes on subscribe override the :edn default")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "override round-trip failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 
 (deftest status-connected-delivered
@@ -838,6 +881,40 @@
                                           (is (nil? @replied) "reply returns nil")))
                                 (p/finally (fn [_ _] (close! conn)))))))
                 (p/catch (fn [e] (is false (str "request/reply round-trip failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; AC1: a per-call :codec overrides the connection default on request, and reply
+;; gains an opts arity so the response leg matches. The connection defaults to
+;; :edn; the requester sends with :codec :string (so request both encodes the
+;; request and decodes the reply as :string) and the responder replies with
+;; :codec :string. The requester only reads back the plain "pong" when both
+;; honor the override — the :edn default would have decoded the quoted reply
+;; bytes to the symbol `pong`, or encoded the reply as "\"pong\"".
+(deftest per-call-codec-overrides-request-and-reply
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})]
+       (try
+         (nats/subscribe conn codec-request-subject
+                         (fn [msg] (nats/reply conn msg "pong" {:codec :string}))
+                         {:codec :string})
+         (let [resp (deref (nats/request conn codec-request-subject 42 {:codec :string :timeout-ms 5000}) 5000 ::timeout)]
+           (is (not= ::timeout resp) "request resolves within 5s")
+           (is (= "pong" (:data resp))
+               "request and reply honor the per-call :string over the :edn default"))
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (nats/subscribe conn codec-request-subject
+                                          (fn [msg] (nats/reply conn msg "pong" {:codec :string}))
+                                          {:codec :string})
+                          (-> (p/timeout (nats/request conn codec-request-subject 42 {:codec :string :timeout-ms 5000}) 5000)
+                              (p/then (fn [resp]
+                                        (is (= "pong" (:data resp))
+                                            "request and reply honor the per-call :string over the :edn default")))
+                              (p/finally (fn [_ _] (close! conn))))))
+                (p/catch (fn [e] (is false (str "request/reply override failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 
 ;; No-responders failure mode (ADR 0006): a request to a subject nobody

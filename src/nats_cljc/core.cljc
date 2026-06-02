@@ -60,14 +60,15 @@
    must be strings, and names must be valid header tokens (printable ASCII, no
    colon); invalid input throws."
   ([conn subject data] (publish conn subject data {}))
-  ([conn subject data {:keys [headers]}]
-   (proto/-publish conn subject (normalize-headers headers) (codec/encode (:codec conn) data))
+  ([conn subject data {:keys [headers codec]}]
+   (proto/-publish conn subject (normalize-headers headers)
+                   (codec/encode (or codec (:codec conn)) data))
    nil))
 
 (defn- decode-msg
   "Decode a raw delivery/reply map `{:subject :bytes :reply :headers}` into the
    public message shape `{:subject :data :reply}`, decoding `:bytes` with
-   `codec-kw`. `:headers` (canonical `{name -> vector-of-strings}`) is added only
+   `codec`. `:headers` (canonical `{name -> vector-of-strings}`) is added only
    when the message carried some, so it is absent otherwise.
 
    This is where the portable header-value contract is enforced: surrounding
@@ -75,10 +76,10 @@
    so the JS leg double-trims harmlessly; jnats does not, so this is what makes
    the JVM leg agree), and an empty map is dropped so `:headers` stays absent
    regardless of any platform quirk in producing it (CONTEXT: Headers)."
-  [codec-kw {:keys [subject bytes reply headers]}]
+  [codec {:keys [subject bytes reply headers]}]
   (cond-> {:subject subject
            :reply   reply
-           :data    (codec/decode codec-kw bytes)}
+           :data    (codec/decode codec bytes)}
     (seq headers) (assoc :headers (reduce-kv (fn [m k vs] (assoc m k (mapv str/trim vs)))
                                              {} headers))))
 
@@ -92,10 +93,10 @@
    or blank `:queue` is a plain subscription (normalized here so both platforms
    agree, rather than relying on each native layer's truthiness)."
   ([conn subject handler] (subscribe conn subject handler {}))
-  ([conn subject handler {:keys [queue]}]
-   (let [codec-kw (:codec conn)]
+  ([conn subject handler {:keys [queue codec]}]
+   (let [codec (or codec (:codec conn))]
      (proto/-subscribe conn subject (when-not (str/blank? queue) queue)
-                       (fn [raw] (handler (decode-msg codec-kw raw)))))))
+                       (fn [raw] (handler (decode-msg codec raw)))))))
 
 (defn request
   "Send a request to `subject` on `conn`, encoding `data` with the connection's
@@ -105,22 +106,24 @@
    `:no-responders` (nobody subscribes `subject`) or `:timeout` (responders exist
    but none answer within `:timeout-ms`) (ADR 0006)."
   [conn subject data opts]
-  (let [codec-kw (:codec conn)]
-    (impl/then (proto/-request conn subject (codec/encode codec-kw data) (:timeout-ms opts 5000))
-               (fn [raw] (decode-msg codec-kw raw)))))
+  (let [codec (or (:codec opts) (:codec conn))]
+    (impl/then (proto/-request conn subject (codec/encode codec data) (:timeout-ms opts 5000))
+               (fn [raw] (decode-msg codec raw)))))
 
 (defn reply
   "Reply to a request message `msg` with `data`, encoding it with the connection's
    codec and publishing to the request's `:reply` subject. Sugar over `publish`;
-   returns nil (ADR 0002). Throws an `ex-info` `:type :no-reply-subject` when `msg`
-   has no `:reply` (e.g. a plain pub/sub message), rather than publishing to a nil
-   subject."
-  [conn msg data]
-  (if-let [reply-subject (:reply msg)]
-    (do (proto/-publish conn reply-subject nil (codec/encode (:codec conn) data))
-        nil)
-    (throw (ex-info "Message has no reply subject"
-                    {:type :no-reply-subject :subject (:subject msg)}))))
+   returns nil (ADR 0002). `opts` may set `:codec` to override the connection
+   default, so a polyglot response can match the request's codec (ADR 0011).
+   Throws an `ex-info` `:type :no-reply-subject` when `msg` has no `:reply` (e.g. a
+   plain pub/sub message), rather than publishing to a nil subject."
+  ([conn msg data] (reply conn msg data {}))
+  ([conn msg data {:keys [codec]}]
+   (if-let [reply-subject (:reply msg)]
+     (do (proto/-publish conn reply-subject nil (codec/encode (or codec (:codec conn)) data))
+         nil)
+     (throw (ex-info "Message has no reply subject"
+                     {:type :no-reply-subject :subject (:subject msg)})))))
 
 (defn flush
   "Flush `conn`, returning a platform-native promise that settles once the server

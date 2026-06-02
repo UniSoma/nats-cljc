@@ -6,7 +6,7 @@ type: chore
 priority: 3
 mode: afk
 created: '2026-05-31T02:19:16.380631698Z'
-updated: '2026-05-31T02:19:16.380631698Z'
+updated: '2026-06-02T03:10:28.150476112Z'
 tags:
 - tech-debt
 - code-quality
@@ -39,3 +39,9 @@ with-auth dispatches on incidental key-presence and overloads :seed for two meth
 The codec registry (codec.cljc, today a case over :edn, growing to transit/json + custom protocol) is the same shape of problem. If you reshape one, reshape both toward an explicit tagged-variant dispatch rather than presence-flag cond->.
 
 Low urgency — five cases each. Worth a consistent model as both grow, not a speculative change now.
+
+## Notes
+
+**2026-06-02T03:10:28.150476112Z**
+
+Finding 2's codec-dispatch half is satisfied by nts-01kstx9pbqe5 (codecs slice): nats-cljc.codec now dispatches through an ICodec protocol + defonce registry (resolve-codec: instance pass-through, keyword lookup), which superseded the original `case` over codec keywords. Still open under this ticket: the auth-variant dispatch reshape, and Finding 1 (test-idiom consolidation).
