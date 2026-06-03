@@ -106,8 +106,13 @@
               (-> (.next iter)
                   (.then (fn [^js res]
                            (when-not (.-done res)
-                             (-> (js/Promise.resolve)
-                                 (.then (fn [_] (handler (msg->raw (.-value res)))))
+                             ;; Run the handler inside the Promise executor so a sync
+                             ;; decode/handler throw is captured as a rejection by the
+                             ;; constructor — the same `route` funnel as a rejecting
+                             ;; handler promise — without a throwaway resolved-promise
+                             ;; hop. `.then` still awaits it before the next `.next`
+                             ;; (per-publisher backpressure, ADR 0007).
+                             (-> (js/Promise. (fn [resolve _] (resolve (handler (msg->raw (.-value res))))))
                                  (.then (fn [_] (step)))
                                  (.catch route)))))
                   (.catch (fn [_] nil))))]
