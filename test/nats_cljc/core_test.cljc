@@ -3,6 +3,7 @@
                :cljs [cljs.test :refer-macros [deftest is async]])
             [nats-cljc.core :as nats]
             [nats-cljc.codec :as codec]
+            [nats-cljc.error :as error]
             [nats-cljc.protocol :as proto]
             ;; The server-driven status types (:lame-duck / :servers-changed) have
             ;; no portable client-side trigger, so they are asserted at the real
@@ -1698,17 +1699,17 @@
 
 ;; :protocol-error (ADR 0006, AC#1): the server emits it for malformed protocol
 ;; exchanges the client never produces, so there is no clean e2e trigger. Both
-;; legs route every server error through one classifier (jnats' ErrorListener
-;; string / nats.js' status error message), so it is asserted at that impl seam:
-;; jnats' exact "Permissions Violation" → :permissions-violation, anything else
-;; (and an absent string) → :protocol-error — identical logic on both platforms.
+;; legs feed their native server-error string (jnats' ErrorListener string /
+;; nats.js' status error message) to one shared classifier (`error/server-error-type`),
+;; so it is asserted there: exact "Permissions Violation" → :permissions-violation,
+;; anything else (and an absent string) → :protocol-error.
 (deftest server-error-classifier-maps-protocol-error
   (is (= :permissions-violation
-         (impl/server-error-type "Permissions Violation for Subscription to \"forbidden.x\""))
+         (error/server-error-type "Permissions Violation for Subscription to \"forbidden.x\""))
       "a Permissions Violation classifies as :permissions-violation")
-  (is (= :protocol-error (impl/server-error-type "Unknown Protocol Operation"))
+  (is (= :protocol-error (error/server-error-type "Unknown Protocol Operation"))
       "any other server error classifies as :protocol-error")
-  (is (= :protocol-error (impl/server-error-type nil))
+  (is (= :protocol-error (error/server-error-type nil))
       "an absent error string classifies as :protocol-error"))
 
 ;; :drained (ADR 0006, AC#1): an op refused during the drain WINDOW — distinct

@@ -2,6 +2,7 @@
   "JVM platform implementation: a Connection record wrapping io.nats:jnats over
    TCP (ADR 0001/0003). All jnats interop is quarantined here (ADR 0005)."
   (:require [clojure.string :as str]
+            [nats-cljc.error :as error]
             [nats-cljc.protocol :as proto])
   (:import [io.nats.client Nats Options Options$Builder Connection Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener]
            [io.nats.client.impl Headers]
@@ -253,16 +254,6 @@
         (when (and reconnect? (= :disconnected t))
           (on-status {:type :reconnecting}))))))
 
-(defn server-error-type
-  "Classify a jnats ErrorListener error string onto a connection-level error
-   `:type` (ADR 0006): jnats' exact \"Permissions Violation\" → `:permissions-violation`,
-   anything else → `:protocol-error`. No clean e2e trigger exists for the latter,
-   so it is exercised as a classifier unit (the same logic on both legs)."
-  [error]
-  (if (and error (str/includes? error "Permissions Violation"))
-    :permissions-violation
-    :protocol-error))
-
 (defn error-listener
   "A connection-level ErrorListener (ADR 0006). `slowConsumerDetected` fires with
    only the native Consumer — the Dispatcher — so the dispatcher→sink `registry`
@@ -285,7 +276,7 @@
     (errorOccurred [_ _conn error]
       (when on-status
         (on-status {:type  :error
-                    :error (ex-info error {:type (server-error-type error)})})))))
+                    :error (ex-info error {:type (error/server-error-type error)})})))))
 
 (defn- nkey-auth-handler
   "An nkey AuthHandler signing nonces with `seed`. When the public `nkey` is

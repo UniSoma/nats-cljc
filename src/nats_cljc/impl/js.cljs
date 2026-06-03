@@ -2,7 +2,7 @@
   "ClojureScript platform implementation: a Connection record wrapping
    @nats-io/nats-core over WebSocket (ADR 0001/0003), serving browser and Node
    from one package. All JS interop is quarantined here (ADR 0005)."
-  (:require [clojure.string :as str]
+  (:require [nats-cljc.error :as error]
             [nats-cljc.protocol :as proto]
             ["@nats-io/nats-core" :as nats-core]))
 
@@ -214,16 +214,6 @@
    "update"       :servers-changed
    "close"        :closed})
 
-(defn server-error-type
-  "Classify a nats.js server-error message onto a connection-level error `:type`
-   (ADR 0006): the exact \"Permissions Violation\" → `:permissions-violation`,
-   anything else → `:protocol-error`. No clean e2e trigger exists for the latter,
-   so it is exercised as a classifier unit (the same logic on both legs)."
-  [error]
-  (if (and error (str/includes? error "Permissions Violation"))
-    :permissions-violation
-    :protocol-error))
-
 (defn deliver-status!
   "Normalize one native nats.js status object onto `on-status` (ADR 0006). nats.js
    funnels server errors (permissions/protocol) through the same status stream as
@@ -235,7 +225,7 @@
   [on-status ^js native]
   (if (= "error" (.-type native))
     (let [msg (some-> (.-error native) .-message)]
-      (on-status {:type :error :error (ex-info (str msg) {:type (server-error-type msg)})})
+      (on-status {:type :error :error (ex-info (str msg) {:type (error/server-error-type msg)})})
       :error)
     (when-let [t (status->type (.-type native))]
       (on-status {:type t})
