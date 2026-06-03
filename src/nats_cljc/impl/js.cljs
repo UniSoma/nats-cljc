@@ -58,7 +58,14 @@
   ;; leaving the connection open.
   (-drain [_] (.drain ^js sub))
   proto/Sub
-  (-active? [_] (not (.isClosed ^js sub))))
+  (-active? [_] (not (.isClosed ^js sub)))
+  ;; nats.js Subscription.unsubscribe(max?) ends the sub abruptly and is already a
+  ;; no-op once closed (the idempotent contract, ADR 0012). It branches on `if (max)`
+  ;; internally, so a nil `max` (passed straight through) stops now and a positive
+  ;; int auto-stops after that many lifetime messages. Return nil rather than its void.
+  (-unsubscribe [_ max]
+    (.unsubscribe ^js sub max)
+    nil))
 
 (defn- op-state-error
   "Build the ex-info for a nats.js ClosedConnectionError from a publish/request on

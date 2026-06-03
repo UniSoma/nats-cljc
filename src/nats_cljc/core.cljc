@@ -152,6 +152,31 @@
      (throw (ex-info "Message has no reply subject"
                      {:type :no-reply-subject :subject (:subject msg)})))))
 
+(defn unsubscribe
+  "End a single subscription `sub` abruptly, returning nil synchronously: the
+   server is told to stop and any not-yet-delivered messages are dropped — the
+   lower-level sibling of `drain`, which flushes the backlog first and is
+   awaitable (ADR 0002/0012). Idempotent: unsubscribing an already-ended
+   subscription (a prior `unsubscribe`, a `drain`, or the connection closing) is a
+   silent no-op rather than an error (ADR 0012).
+
+   With `max`, the subscription auto-unsubscribes once it has received that many
+   messages over its lifetime — counted from subscription start, so messages
+   already delivered past the limit are never recalled, and if it has already
+   received `max` it stops now. `max` must be a positive integer no greater than
+   2147483647 (the JVM `Dispatcher.unsubscribe(sub, int)` cap, enforced on both
+   platforms so the contract is portable); anything else throws a `:type
+   :invalid-max` ex-info."
+  ([sub] (proto/-unsubscribe sub nil))
+  ([sub max]
+   ;; Bound by Integer/MAX_VALUE: the JVM native overload takes an `int`, and a
+   ;; larger value would pass `pos-int?` only to throw an uncaught ArithmeticException
+   ;; at `(int max)` there while succeeding on JS. Reject portably, before native.
+   (when-not (and (pos-int? max) (<= max 2147483647))
+     (throw (ex-info "unsubscribe max must be a positive integer no greater than 2147483647"
+                     {:type :invalid-max :max max})))
+   (proto/-unsubscribe sub max)))
+
 (defn flush
   "Flush `conn`, returning a platform-native promise that settles once the server
    has processed everything buffered on the connection (ADR 0002)."

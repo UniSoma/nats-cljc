@@ -11,7 +11,8 @@
    The lifecycle slice added -flush/-close/-drain; request/reply added -request;
    the queue-groups slice gave `-subscribe` a queue arg, returned a Subscription
    record (not the native handle) carrying `Drainable`/`Sub`, and split -drain out
-   of `Conn` into `Drainable`; later slices grow it further (unsubscribe, status)."
+   of `Conn` into `Drainable`; the unsubscribe slice added `-unsubscribe` to `Sub`;
+   later slices grow it further (status)."
   ;; -flush would otherwise shadow cljs.core/-flush (IWriter); no clojure.core
   ;; var by that name exists, so the exclude is a no-op on the JVM.
   (:refer-clojure :exclude [-flush]))
@@ -63,4 +64,12 @@
   "A single subscription's lifecycle, beyond draining."
   (-active? [sub]
     "True while the subscription is still delivering — not yet drained,
-     unsubscribed, or ended by the connection closing."))
+     unsubscribed, or ended by the connection closing.")
+  (-unsubscribe [sub max]
+    "End this subscription abruptly, the lower-level sibling of `-drain`: tell the
+     server to stop and drop any not-yet-delivered messages, returning nil
+     synchronously. `max` nil unsubscribes now; a positive int auto-unsubscribes
+     once the subscription has received that many messages over its lifetime
+     (counted from subscription start). Idempotent: unsubscribing an
+     already-ended subscription is a silent no-op (ADR 0012). The facade owns the
+     arities and validates `max`."))

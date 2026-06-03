@@ -88,6 +88,11 @@
 (def ^:private queue-subject "delivery.queue")
 (def ^:private queue-mixed-subject "delivery.queue.mixed")
 
+;; Unsubscribe subjects (ADR 0012). Distinct per behavior so the shared server
+;; doesn't cross-feed between tests.
+(def ^:private unsub-subject "unsub.abrupt")
+(def ^:private unsub-max-subject "unsub.max")
+
 ;; Request/reply subject (ADR 0002/0006). The responder subscribes here; the
 ;; requester's reply arrives on a per-request inbox the client manages.
 (def ^:private request-subject "rr.request")
@@ -645,6 +650,168 @@
                                               "draining one subscription leaves the connection's others active")))
                                 (p/finally (fn [_ _] (close! conn)))))))
                 (p/catch (fn [e] (is false (str "subscription drain test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Unsubscribe (ADR 0012) is the abrupt sibling of drain: it stops the
+;; subscription synchronously, returning nil, and DROPS not-yet-delivered
+;; messages (where drain flushes the backlog). Deliver one message to prove the
+;; sub is live, unsubscribe, then publish more and flush — same-connection
+;; ordering guarantees the server processes the UNSUB before the later PUB, so a
+;; still-1 count after the flush settles is a deterministic "no further delivery".
+(deftest unsubscribe-stops-delivery-abruptly-and-returns-nil
+  #?(:clj
+     (let [conn     @(nats/connect {:servers [server-url]})
+           received (atom [])
+           sub      (nats/subscribe conn unsub-subject (fn [msg] (swap! received conj (:data msg))))]
+       (try
+         (nats/publish conn unsub-subject :one)
+         (is (wait-for #(= 1 (count @received)) 2000) "the first message is delivered")
+         (is (nil? (nats/unsubscribe sub)) "unsubscribe returns nil synchronously")
+         (is (wait-for #(sub-ended? sub) 2000) "unsubscribe ends the subscription")
+         (nats/publish conn unsub-subject :two)
+         @(nats/flush conn)
+         (is (= [:one] @received) "no message is delivered after unsubscribe")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [received (atom [])
+                                sub      (nats/subscribe conn unsub-subject (fn [msg] (swap! received conj (:data msg))))]
+                            (nats/publish conn unsub-subject :one)
+                            (-> (wait-for #(= 1 (count @received)) 2000)
+                                (p/then (fn [hit?]
+                                          (is hit? "the first message is delivered")
+                                          (is (nil? (nats/unsubscribe sub)) "unsubscribe returns nil synchronously")
+                                          (wait-for #(sub-ended? sub) 2000)))
+                                (p/then (fn [ended?]
+                                          (is ended? "unsubscribe ends the subscription")
+                                          (nats/publish conn unsub-subject :two)
+                                          (nats/flush conn)))
+                                (p/then (fn [_]
+                                          (is (= [:one] @received) "no message is delivered after unsubscribe")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "unsubscribe test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; `(unsubscribe sub max)` auto-unsubscribes once the subscription has received
+;; `max` messages over its lifetime (ADR 0012). Arm max=3 before any publish,
+;; fire ten on the same connection (so SUB, the maxed UNSUB, and the PUBs are
+;; ordered server-side), and exactly three are delivered before the sub ends —
+;; the rest are dropped. native-confirmed identical on both clients.
+(deftest unsubscribe-max-auto-unsubscribes-after-n
+  (let [max 3 n 10]
+    #?(:clj
+       (let [conn     @(nats/connect {:servers [server-url]})
+             received (atom [])
+             sub      (nats/subscribe conn unsub-max-subject (fn [msg] (swap! received conj (:data msg))))]
+         (try
+           (is (nil? (nats/unsubscribe sub max)) "unsubscribe with max returns nil synchronously")
+           (dotimes [i n] (nats/publish conn unsub-max-subject i))
+           @(nats/flush conn)
+           (is (wait-for #(= max (count @received)) 2000)
+               "exactly max messages are delivered")
+           (is (wait-for #(sub-ended? sub) 2000)
+               "reaching max ends the subscription")
+           (is (= [0 1 2] @received) "the first max messages are delivered, the rest dropped")
+           (finally (close! conn))))
+       :cljs
+       (async done
+              (-> (nats/connect {:servers [server-url]})
+                  (p/then (fn [conn]
+                            (let [received (atom [])
+                                  sub      (nats/subscribe conn unsub-max-subject (fn [msg] (swap! received conj (:data msg))))]
+                              (is (nil? (nats/unsubscribe sub max)) "unsubscribe with max returns nil synchronously")
+                              (dotimes [i n] (nats/publish conn unsub-max-subject i))
+                              (-> (nats/flush conn)
+                                  (p/then (fn [_] (wait-for #(= max (count @received)) 2000)))
+                                  (p/then (fn [hit?]
+                                            (is hit? "exactly max messages are delivered")
+                                            (wait-for #(sub-ended? sub) 2000)))
+                                  (p/then (fn [ended?]
+                                            (is ended? "reaching max ends the subscription")
+                                            (is (= [0 1 2] @received) "the first max messages are delivered, the rest dropped")))
+                                  (p/finally (fn [_ _] (close! conn)))))))
+                  (p/catch (fn [e] (is false (str "unsubscribe-max test failed: " e))))
+                  (p/finally (fn [_ _] (done))))))))
+
+;; An invalid `max` is caller misuse the facade rejects synchronously with a
+;; portable `:type :invalid-max` on every platform (parallel to
+;; :invalid-max-pending), before touching the native sub. Two ways to be invalid:
+;; non-positive (0/negative would arm a zero/sentinel native auto-unsubscribe and
+;; stop the sub at the wrong time) and above Integer/MAX_VALUE (the JVM native
+;; overload takes an `int`, so a larger value would throw an uncaught
+;; ArithmeticException there while succeeding on JS — reject it the same on both).
+(deftest unsubscribe-invalid-max-rejected
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})
+           sub  (nats/subscribe conn unsub-max-subject (fn [_]))]
+       (try
+         (is (= :invalid-max
+                (try (nats/unsubscribe sub 0)
+                     :no-throw
+                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+             "max 0 is rejected as :invalid-max, not armed as a zero auto-unsubscribe")
+         (is (= :invalid-max
+                (try (nats/unsubscribe sub (inc 2147483647))
+                     :no-throw
+                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+             "max above Integer/MAX_VALUE is rejected as :invalid-max, not thrown as ArithmeticException")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [sub (nats/subscribe conn unsub-max-subject (fn [_]))]
+                            (is (= :invalid-max
+                                   (try (nats/unsubscribe sub 0)
+                                        :no-throw
+                                        (catch :default e (:type (ex-data e)))))
+                                "max 0 is rejected as :invalid-max, not armed as a zero auto-unsubscribe")
+                            (is (= :invalid-max
+                                   (try (nats/unsubscribe sub (inc 2147483647))
+                                        :no-throw
+                                        (catch :default e (:type (ex-data e)))))
+                                "max above Integer/MAX_VALUE is rejected the same as on JVM")
+                            (close! conn))))
+                (p/catch (fn [e] (is false (str "connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; Unsubscribe is idempotent (ADR 0012): unsubscribing an already-ended
+;; subscription — ended by a prior unsubscribe, a drain, or the connection
+;; closing — returns nil and does nothing, rather than erroring. nats.js is
+;; already a no-op on a closed sub; jnats' Dispatcher.unsubscribe throws
+;; IllegalStateException, which the JVM impl swallows. Three teardown paths, all
+;; the same silent no-op.
+(deftest unsubscribe-is-idempotent
+  #?(:clj
+     (let [conn  @(nats/connect {:servers [server-url]})
+           sub-a (nats/subscribe conn (str unsub-subject ".idem.a") (fn [_]))
+           sub-b (nats/subscribe conn (str unsub-subject ".idem.b") (fn [_]))]
+       (try
+         (nats/unsubscribe sub-a)
+         (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after a prior unsubscribe is a no-op")
+         @(nats/drain sub-b)
+         (is (nil? (nats/unsubscribe sub-b)) "unsubscribe after drain is a no-op")
+         @(nats/close conn)
+         (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after connection close is a no-op")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [sub-a (nats/subscribe conn (str unsub-subject ".idem.a") (fn [_]))
+                                sub-b (nats/subscribe conn (str unsub-subject ".idem.b") (fn [_]))]
+                            (nats/unsubscribe sub-a)
+                            (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after a prior unsubscribe is a no-op")
+                            (-> (nats/drain sub-b)
+                                (p/then (fn [_]
+                                          (is (nil? (nats/unsubscribe sub-b)) "unsubscribe after drain is a no-op")
+                                          (nats/close conn)))
+                                (p/then (fn [_]
+                                          (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after connection close is a no-op")))
+                                (p/finally (fn [_ _] (close! conn)))))))
+                (p/catch (fn [e] (is false (str "unsubscribe idempotency test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 
 ;; Delivery semantics (ADR 0007). With a SINGLE publisher, a subscription sees that

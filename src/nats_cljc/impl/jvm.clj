@@ -85,7 +85,22 @@
   ;; the slow-consumer registry so a drained sub leaks no sink (ADR 0006).
   (-drain [_] (swap! registry dissoc dispatcher) (.drain sub op-timeout))
   proto/Sub
-  (-active? [_] (.isActive sub)))
+  (-active? [_] (.isActive sub))
+  ;; jnats subs are dispatcher-owned, so route teardown through the dispatcher,
+  ;; never sub.unsubscribe(); dissoc the slow-consumer registry entry too (like
+  ;; -drain) so an unsubscribed sub leaks no sink (ADR 0006). `max` nil stops now;
+  ;; a positive int selects the unsubscribe(sub, after) overload that auto-stops
+  ;; after that many lifetime messages. A closed dispatcher or already-removed sub
+  ;; makes Dispatcher.unsubscribe throw IllegalStateException; swallow it to nil
+  ;; for the idempotent no-op (ADR 0012). Returns nil either way.
+  (-unsubscribe [_ max]
+    (swap! registry dissoc dispatcher)
+    (try
+      (if max
+        (.unsubscribe dispatcher sub (int max))
+        (.unsubscribe dispatcher sub))
+      (catch IllegalStateException _ nil))
+    nil))
 
 (defrecord JvmConnection [^Connection client codec on-status registry]
   proto/Conn

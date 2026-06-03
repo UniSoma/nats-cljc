@@ -1,26 +1,27 @@
 ---
 id: nts-01kt5jvdy5s1
 title: Unsubscribe (abrupt stop + auto-after-N)
-status: open
+status: closed
 type: feature
 priority: 1
 mode: afk
 created: '2026-06-03T01:51:29.733323655Z'
-updated: '2026-06-03T01:51:29.733323655Z'
+updated: '2026-06-03T12:56:57.098439770Z'
+closed: '2026-06-03T12:56:57.098439770Z'
 tags:
 - subscription
 - api
 acceptance:
 - title: (unsubscribe sub) stops delivery abruptly (handler sees no further msgs; buffered/in-flight dropped, not delivered) and returns nil synchronously
-  done: false
+  done: true
 - title: (unsubscribe sub max) auto-unsubscribes after max lifetime messages; non-positive-int max throws ex-info {:type :invalid-max}
-  done: false
+  done: true
 - title: 'Idempotent no-op: unsubscribe after a prior unsubscribe, after drain(sub), and after connection close all return nil without throwing (JVM swallows IllegalStateException) — ADR 0012'
-  done: false
+  done: true
 - title: -unsubscribe added to Sub protocol; JVM routes via dispatcher AND dissocs the slow-consumer registry entry; JS via native sub; facade owns arities + validation
-  done: false
+  done: true
 - title: README/CONTEXT/ADR-0012 stay accurate; suite green on JVM + Node (browser CI-only per ADR 0010)
-  done: false
+  done: true
 ---
 
 ## Description
@@ -42,3 +43,9 @@ JS (nats-core): (.unsubscribe sub) / (.unsubscribe sub max); already a no-op whe
 max semantics (native-confirmed, identical both clients): lifetime total from subscription start; if already >= max, stops now; never recalls already-delivered messages. No subscribe-time :max option (asymmetric across clients; the unsubscribe arity covers it race-free since max is a lifetime total).
 
 Blocking layer: ADR 0008 already re-exports unsubscribe unchanged (sync) — wire it in when this lands.
+
+## Notes
+
+**2026-06-03T12:56:57.098439770Z**
+
+Unsubscribe shipped on both clients: (unsubscribe sub) stops abruptly returning nil sync (in-flight dropped); (unsubscribe sub max) auto-unsubscribes after N lifetime messages. Facade owns arities + validation — max must be a positive int <= Integer/MAX_VALUE, rejected portably as :invalid-max before native (a larger value would throw an uncaught ArithmeticException at (int max) on JVM while succeeding on JS). Idempotent no-op after prior unsubscribe/drain/close (JVM swallows IllegalStateException), per ADR 0012. -unsubscribe added to Sub protocol; JVM routes via dispatcher + dissocs slow-consumer registry; JS via native sub. README/CONTEXT/ADR-0012 accurate; green JVM 62/123 + Node 62/118, clj-kondo clean (browser CI-only per ADR 0010).
