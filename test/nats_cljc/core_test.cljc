@@ -1201,6 +1201,33 @@
                 (p/catch (fn [e] (is false (str "connect failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 
+;; A non-positive :max-pending is caller misuse — it would otherwise arm a zero
+;; (or sentinel-unbounded) native cap and silently deafen the subscription — so
+;; subscribe rejects it synchronously with a portable `:type :invalid-max-pending`
+;; on every platform (parallel to :invalid-header), before any native subscribe.
+(deftest subscribe-non-positive-max-pending-rejected
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})]
+       (try
+         (is (= :invalid-max-pending
+                (try (nats/subscribe conn "mp.invalid" (fn [_]) {:max-pending 0})
+                     :no-throw
+                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+             "max-pending 0 is rejected as :invalid-max-pending, not armed as a zero cap")
+         (finally (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (is (= :invalid-max-pending
+                                 (try (nats/subscribe conn "mp.invalid" (fn [_]) {:max-pending 0})
+                                      :no-throw
+                                      (catch :default e (:type (ex-data e)))))
+                              "max-pending 0 is rejected as :invalid-max-pending, not armed as a zero cap")
+                          (close! conn)))
+                (p/catch (fn [e] (is false (str "connect failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
 ;; ===========================================================================
 ;; Error model (ADR 0006): every canonical Error :type reproduced and asserted
 ;; with identical shape on both legs. One-shot ops reject their promise; async

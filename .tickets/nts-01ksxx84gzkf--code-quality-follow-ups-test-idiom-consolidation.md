@@ -6,7 +6,7 @@ type: chore
 priority: 3
 mode: afk
 created: '2026-05-31T02:19:16.380631698Z'
-updated: '2026-06-02T03:10:28.150476112Z'
+updated: '2026-06-03T01:11:26.722257585Z'
 tags:
 - tech-debt
 - code-quality
@@ -45,3 +45,13 @@ Low urgency — five cases each. Worth a consistent model as both grow, not a sp
 **2026-06-02T03:10:28.150476112Z**
 
 Finding 2's codec-dispatch half is satisfied by nts-01kstx9pbqe5 (codecs slice): nats-cljc.codec now dispatches through an ICodec protocol + defonce registry (resolve-codec: instance pass-through, keyword lookup), which superseded the original `case` over codec keywords. Still open under this ticket: the auth-variant dispatch reshape, and Finding 1 (test-idiom consolidation).
+
+**2026-06-03T01:11:26.722257585Z**
+
+Code-review follow-ups from nts-01kstxatbw6k (error-model). Deferred cleanups, no correctness impact:
+
+(1) Consolidate server-error-type: it is byte-identical in impl/jvm.clj and impl/js.cljs (the cross-leg unit test today checks each leg's own copy, so drift would slip through). Move the one classifier into a shared .cljc (protocol.cljc, or a new nats-cljc.error ns matching the codec/->codec-error precedent) and have both legs call it. Leave op-state-error and the route/route-error! decision per-leg — their detection is genuinely platform-coupled and only a one-line ex-info is shareable (extraction costs more than it saves).
+
+(2) Simplify consume! in impl/js.cljs: the per-message (js/Promise.resolve) seed + extra (.then (fn [_] (step))) add two needless microtask hops and a throwaway promise on the hot path. Flatten while PRESERVING the validated sync-throw routing and per-publisher ordering; needs its own Node test run.
+
+(3) Registry-leak breadcrumb (impl/jvm.clj): the dispatcher->sink registry is dissoc'd only in JvmSubscription -drain. When the deferred unsubscribe op lands, it MUST route through the same dissoc (ideally a single subscription-teardown hook all exits share), else an unsubscribed-not-drained sub leaks its dispatcher + on-error closure until the connection closes.

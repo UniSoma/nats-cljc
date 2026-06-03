@@ -127,14 +127,21 @@
                 (let [r (handler (msg->raw msg))]
                   (when (instance? CompletionStage r)
                     (.join (.toCompletableFuture ^CompletionStage r))))
-                (catch Throwable e
+                ;; Catch Exception, not Throwable, so a JVM Error (OOM, etc.)
+                ;; propagates to jnats instead of being delivered as a fake
+                ;; handler failure while the dispatch loop carries on.
+                (catch Exception e
                   (route-error! on-error on-status (unwrap-completion e))))))]
-      ;; :max-pending caps jnats' dispatcher queue (bytes unlimited); absent leaves
-      ;; jnats' 512K-msg / 64 MB defaults. The dispatcher is the native Consumer
-      ;; slowConsumerDetected fires with, so register it (when there's a sink) so
-      ;; the connection ErrorListener can route the overflow back to this :on-error.
-      (when max-pending (.setPendingLimits dispatcher (long max-pending) -1))
-      (when on-error
+      ;; The native slow-consumer wiring engages only when BOTH :max-pending and
+      ;; :on-error are set (ADR 0007): :max-pending caps jnats' dispatcher queue
+      ;; (bytes unlimited) and the dispatcher — the native Consumer that
+      ;; slowConsumerDetected fires with — is registered so the connection
+      ;; ErrorListener can route the overflow back to this :on-error. With no sink
+      ;; there is nothing to signal, so leave jnats' 512K-msg / 64 MB defaults
+      ;; rather than silently dropping harder than default. Handler-throw / decode
+      ;; failures still route via the onMessage catch above, independent of this.
+      (when (and max-pending on-error)
+        (.setPendingLimits dispatcher (long max-pending) -1)
         (swap! registry assoc dispatcher
                {:on-error on-error :subject subject :max-pending max-pending}))
       ;; The queue-group name selects jnats' three-arg subscribe overload
@@ -245,10 +252,14 @@
   "A connection-level ErrorListener (ADR 0006). `slowConsumerDetected` fires with
    only the native Consumer — the Dispatcher — so the dispatcher→sink `registry`
    is the only bridge back to the originating subscription's `:on-error`; an
-   unregistered dispatcher (the sub set no `:on-error`) drops it. `errorOccurred`
-   is connection-level with no subscription identity, so a permissions/protocol
-   error reaches `:on-status` as an `:error` event ONLY — never a per-sub override
-   — and is dropped when no `:on-status` is set. `:pending` is native-approximate."
+   unregistered dispatcher (the sub set no `:on-error`, or no `:max-pending`) drops
+   it. A registered dispatcher releases its entry on the subscription's `-drain`; a
+   sub whose reference is dropped without draining retains its entry until the
+   connection closes (bounded by connection GC) — the deferred `unsubscribe` op
+   must dissoc here too. `errorOccurred` is connection-level with no subscription
+   identity, so a permissions/protocol error reaches `:on-status` as an `:error`
+   event ONLY — never a per-sub override — and is dropped when no `:on-status` is
+   set. `:pending` is native-approximate."
   ^ErrorListener [on-status registry]
   (reify ErrorListener
     (slowConsumerDetected [_ _conn consumer]

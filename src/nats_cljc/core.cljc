@@ -105,13 +105,19 @@
    `opts` may also set the async-failure sink and overflow threshold (ADR 0006):
    `:on-error`, a 1-arg fn receiving this subscription's failures as a bare
    `ex-info` — a thrown handler value (unchanged, no canonical `:type`), a decode
-   failure (`:codec-error`), or `:slow-consumer` — and `:max-pending`, a
+   failure (`:codec-error`), or `:slow-consumer` — and `:max-pending`, a positive
    message-count threshold above which `:slow-consumer` fires. With no `:on-error`,
    a thrown-handler/decode failure falls back to the connection's `:on-status`
    `:error` event and `:slow-consumer` is dropped; the override is strict (never
-   both). A decode failure is caught here, so the handler never sees garbage."
+   both). A decode failure is caught here, so the handler never sees garbage.
+   A non-positive `:max-pending` throws a `:type :invalid-max-pending` ex-info."
   ([conn subject handler] (subscribe conn subject handler {}))
   ([conn subject handler {:keys [queue on-error max-pending] :as opts}]
+   ;; Fail fast on caller misuse: a 0/negative/non-int threshold would otherwise
+   ;; arm a zero (or sentinel-unbounded) native cap and silently deafen the sub.
+   (when (and (some? max-pending) (not (pos-int? max-pending)))
+     (throw (ex-info "subscribe :max-pending must be a positive integer"
+                     {:type :invalid-max-pending :max-pending max-pending})))
    (let [codec (effective-codec conn opts)]
      (proto/-subscribe conn subject (when-not (str/blank? queue) queue)
                        {:on-error on-error :max-pending max-pending}

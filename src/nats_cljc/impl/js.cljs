@@ -81,7 +81,13 @@
    handler promise alike, routing each to the sub's `on-error` (else the
    connection `on-status` :error) and then CONTINUING — the subscription survives.
    The iterable completing (drain/unsubscribe/close) ends the loop; the `.next`
-   `.catch` swallows that close-race."
+   `.catch` swallows that close-race. It also swallows the rejection a subscription
+   `:permissions-violation` raises (nats-core's `stop(err)` makes `.next` throw):
+   that is deliberate — nats-core ALSO dispatches the error to the status stream
+   (protocol.js `processError` → `dispatchStatus {:type \"error\"}`), so it reaches
+   `:on-status` as `:permissions-violation` and nothing is lost by ending the loop
+   here. The sub becoming inactive on this leg (vs staying live on jnats) is an
+   accepted divergence (ADR 0006)."
   [^js sub handler on-error on-status]
   (let [iter (.call (unchecked-get sub js/Symbol.asyncIterator) sub)]
     (letfn [(route [e]
@@ -140,6 +146,9 @@
         ;; nats.js does NOT auto-drop over-limit messages (unbounded buffer) — the
         ;; signal is portable, the drop is native (an accepted divergence). Absent
         ;; :on-error drops the signal, so only wire it when there's a sink.
+        ;; NB: setSlowNotificationFn lives on nats-core's internal SubscriptionImpl,
+        ;; not the public Subscription interface — re-verify on any nats-core bump
+        ;; (pinned 3.3.1).
         (when (and max-pending on-error)
           (.setSlowNotificationFn ^js sub max-pending
                                   (fn [pending]
