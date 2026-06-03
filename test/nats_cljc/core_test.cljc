@@ -213,105 +213,92 @@
 (defn- sub-ended? [sub]
   (not (proto/-active? sub)))
 
+;; The suite's connect / settle / teardown envelope — the connect+teardown
+;; scaffolding every happy-path test repeated per leg. The per-platform fork stays
+;; at the call site (each test still writes its own blocking vs async body); only
+;; this boilerplate is shared. JVM blocks on connect, runs `(f conn)`, and closes
+;; in a `finally`. CLJS connects, awaits the promise `(f conn)` returns, closes,
+;; then calls cljs.test's `done`; a connect rejection fails the test via `is`
+;; rather than hanging it. Tests that expect connect ITSELF to reject
+;; (connect-failed, mismatched-nkey), never connect (the unit classifiers), or need
+;; gated teardown (slow-consumer, drain-window) keep their own shape.
+#?(:clj
+   (defn- with-conn [opts f]
+     (let [conn @(nats/connect opts)]
+       (try (f conn) (finally (close! conn)))))
+   :cljs
+   (defn- with-conn [opts done f]
+     (-> (nats/connect opts)
+         (p/then (fn [conn]
+                   (-> (p/resolved nil)
+                       (p/then (fn [_] (f conn)))
+                       (p/finally (fn [_ _] (close! conn))))))
+         (p/catch (fn [e] (is false (str "connect failed: " e))))
+         (p/finally (fn [_ _] (done))))))
+
+;; The five happy-path :auth shapes: each connects against the server configured
+;; for it (token/user-pass/nkey share fixtures; jwt/creds share the operator
+;; server). This table is the only thing that varies across the five deftests
+;; below — they stay separately named (one named failure per shape) and share the
+;; connect/teardown envelope. `[server auth message]` per case.
+(def ^:private auth-cases
+  {:token     [token-server-url {:token token}                 ":auth {:token ...} connects against a token-configured server"]
+   :user-pass [users-server-url {:user user :pass pass}        ":auth {:user ... :pass ...} connects against a user/password-configured server"]
+   :nkey      [users-server-url {:nkey nkey :seed seed}        ":auth {:nkey ... :seed ...} connects against an nkey-configured server"]
+   :jwt       [jwt-server-url   {:jwt user-jwt :seed jwt-seed} ":auth {:jwt ... :seed ...} connects against a jwt-configured server"]
+   :creds     [jwt-server-url   {:creds creds}                 ":auth {:creds ...} connects using credentials passed as string content"]})
+
 (deftest connect-resolves-to-a-connection
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})]
-       (try
-         (is (some? conn) "connect resolves to a non-nil Connection")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn] (is (some? conn) "connect resolves to a non-nil Connection")))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (is (some? conn) "connect resolves to a non-nil Connection")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn] (is (some? conn) "connect resolves to a non-nil Connection"))))))
 
+;; The five happy-path auth shapes (one named deftest each, sharing `auth-cases` +
+;; the connect/teardown envelope): connecting against the matching server resolves
+;; to a Connection.
 (deftest auth-with-token-connects
-  #?(:clj
-     (let [conn @(nats/connect {:servers [token-server-url]
-                                :auth    {:token token}})]
-       (try
-         (is (some? conn) ":auth {:token ...} connects against a token-configured server")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (-> (nats/connect {:servers [token-server-url]
-                               :auth    {:token token}})
-                (p/then (fn [conn]
-                          (is (some? conn) ":auth {:token ...} connects against a token-configured server")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "token auth connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+  (let [[server auth msg] (:token auth-cases)]
+    #?(:clj
+       (with-conn {:servers [server] :auth auth} (fn [conn] (is (some? conn) msg)))
+       :cljs
+       (async done
+              (with-conn {:servers [server] :auth auth} done (fn [conn] (is (some? conn) msg)))))))
 
 (deftest auth-with-user-pass-connects
-  #?(:clj
-     (let [conn @(nats/connect {:servers [users-server-url]
-                                :auth    {:user user :pass pass}})]
-       (try
-         (is (some? conn) ":auth {:user ... :pass ...} connects against a user/password-configured server")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (-> (nats/connect {:servers [users-server-url]
-                               :auth    {:user user :pass pass}})
-                (p/then (fn [conn]
-                          (is (some? conn) ":auth {:user ... :pass ...} connects against a user/password-configured server")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "user/pass auth connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+  (let [[server auth msg] (:user-pass auth-cases)]
+    #?(:clj
+       (with-conn {:servers [server] :auth auth} (fn [conn] (is (some? conn) msg)))
+       :cljs
+       (async done
+              (with-conn {:servers [server] :auth auth} done (fn [conn] (is (some? conn) msg)))))))
 
 (deftest auth-with-nkey-connects
-  #?(:clj
-     (let [conn @(nats/connect {:servers [users-server-url]
-                                :auth    {:nkey nkey :seed seed}})]
-       (try
-         (is (some? conn) ":auth {:nkey ... :seed ...} connects against an nkey-configured server")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (-> (nats/connect {:servers [users-server-url]
-                               :auth    {:nkey nkey :seed seed}})
-                (p/then (fn [conn]
-                          (is (some? conn) ":auth {:nkey ... :seed ...} connects against an nkey-configured server")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "nkey auth connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+  (let [[server auth msg] (:nkey auth-cases)]
+    #?(:clj
+       (with-conn {:servers [server] :auth auth} (fn [conn] (is (some? conn) msg)))
+       :cljs
+       (async done
+              (with-conn {:servers [server] :auth auth} done (fn [conn] (is (some? conn) msg)))))))
 
 (deftest auth-with-jwt-connects
-  #?(:clj
-     (let [conn @(nats/connect {:servers [jwt-server-url]
-                                :auth    {:jwt user-jwt :seed jwt-seed}})]
-       (try
-         (is (some? conn) ":auth {:jwt ... :seed ...} connects against a jwt-configured server")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (-> (nats/connect {:servers [jwt-server-url]
-                               :auth    {:jwt user-jwt :seed jwt-seed}})
-                (p/then (fn [conn]
-                          (is (some? conn) ":auth {:jwt ... :seed ...} connects against a jwt-configured server")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "jwt auth connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+  (let [[server auth msg] (:jwt auth-cases)]
+    #?(:clj
+       (with-conn {:servers [server] :auth auth} (fn [conn] (is (some? conn) msg)))
+       :cljs
+       (async done
+              (with-conn {:servers [server] :auth auth} done (fn [conn] (is (some? conn) msg)))))))
 
 (deftest auth-with-creds-connects
-  #?(:clj
-     (let [conn @(nats/connect {:servers [jwt-server-url]
-                                :auth    {:creds creds}})]
-       (try
-         (is (some? conn) ":auth {:creds ...} connects using credentials passed as string content")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (-> (nats/connect {:servers [jwt-server-url]
-                               :auth    {:creds creds}})
-                (p/then (fn [conn]
-                          (is (some? conn) ":auth {:creds ...} connects using credentials passed as string content")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "creds auth connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+  (let [[server auth msg] (:creds auth-cases)]
+    #?(:clj
+       (with-conn {:servers [server] :auth auth} (fn [conn] (is (some? conn) msg)))
+       :cljs
+       (async done
+              (with-conn {:servers [server] :auth auth} done (fn [conn] (is (some? conn) msg)))))))
 
 (deftest auth-with-mismatched-nkey-rejects
   #?(:clj
@@ -333,34 +320,30 @@
 
 (deftest publish-subscribe-round-trip
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (promise)
-           sub      (nats/subscribe conn subject #(deliver received %))
-           pub-ret  (nats/publish conn subject payload)]
-       (try
-         (is (some? sub) "subscribe returns a Subscription synchronously")
-         (is (nil? pub-ret) "publish returns nil")
-         (let [msg (deref received 5000 ::timeout)]
-           (is (not= ::timeout msg) "handler is invoked within 5s")
-           (is (= subject (:subject msg)) "handler receives the subject")
-           (is (= payload (:data msg)) "handler receives EDN-decoded :data"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (promise)
+               sub      (nats/subscribe conn subject #(deliver received %))
+               pub-ret  (nats/publish conn subject payload)]
+           (is (some? sub) "subscribe returns a Subscription synchronously")
+           (is (nil? pub-ret) "publish returns nil")
+           (let [msg (deref received 5000 ::timeout)]
+             (is (not= ::timeout msg) "handler is invoked within 5s")
+             (is (= subject (:subject msg)) "handler receives the subject")
+             (is (= payload (:data msg)) "handler receives EDN-decoded :data")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (p/deferred)
-                                sub      (nats/subscribe conn subject #(p/resolve! received %))
-                                pub-ret  (nats/publish conn subject payload)]
-                            (is (some? sub) "subscribe returns a Subscription synchronously")
-                            (is (nil? pub-ret) "publish returns nil")
-                            (-> (p/timeout received 5000)
-                                (p/then (fn [msg]
-                                          (is (= subject (:subject msg)) "handler receives the subject")
-                                          (is (= payload (:data msg)) "handler receives EDN-decoded :data")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "round-trip failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (p/deferred)
+                      sub      (nats/subscribe conn subject #(p/resolve! received %))
+                      pub-ret  (nats/publish conn subject payload)]
+                  (is (some? sub) "subscribe returns a Subscription synchronously")
+                  (is (nil? pub-ret) "publish returns nil")
+                  (-> (p/timeout received 5000)
+                      (p/then (fn [msg]
+                                (is (= subject (:subject msg)) "handler receives the subject")
+                                (is (= payload (:data msg)) "handler receives EDN-decoded :data"))))))))))
 
 ;; AC1: a per-call :codec overrides the connection default on BOTH publish and
 ;; subscribe. The connection defaults to :edn; the subscriber overrides to :bytes
@@ -369,103 +352,88 @@
 ;; :edn default would have produced the quoted "\"hi\"".
 (deftest per-call-codec-overrides-publish-and-subscribe
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (promise)
-           _        (nats/subscribe conn codec-pub-sub-subject #(deliver received %) {:codec :bytes})
-           _        (nats/publish conn codec-pub-sub-subject "hi" {:codec :string})]
-       (try
-         (let [msg (deref received 5000 ::timeout)]
-           (is (not= ::timeout msg) "handler is invoked within 5s")
-           (is (= "hi" (raw->str (:data msg)))
-               "per-call :string on publish + :bytes on subscribe override the :edn default"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (promise)
+               _        (nats/subscribe conn codec-pub-sub-subject #(deliver received %) {:codec :bytes})
+               _        (nats/publish conn codec-pub-sub-subject "hi" {:codec :string})]
+           (let [msg (deref received 5000 ::timeout)]
+             (is (not= ::timeout msg) "handler is invoked within 5s")
+             (is (= "hi" (raw->str (:data msg)))
+                 "per-call :string on publish + :bytes on subscribe override the :edn default")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (p/deferred)]
-                            (nats/subscribe conn codec-pub-sub-subject #(p/resolve! received %) {:codec :bytes})
-                            (nats/publish conn codec-pub-sub-subject "hi" {:codec :string})
-                            (-> (p/timeout received 5000)
-                                (p/then (fn [msg]
-                                          (is (= "hi" (raw->str (:data msg)))
-                                              "per-call :string on publish + :bytes on subscribe override the :edn default")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "override round-trip failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (p/deferred)]
+                  (nats/subscribe conn codec-pub-sub-subject #(p/resolve! received %) {:codec :bytes})
+                  (nats/publish conn codec-pub-sub-subject "hi" {:codec :string})
+                  (-> (p/timeout received 5000)
+                      (p/then (fn [msg]
+                                (is (= "hi" (raw->str (:data msg)))
+                                    "per-call :string on publish + :bytes on subscribe override the :edn default"))))))))))
 
 (deftest status-connected-delivered
-  #?(:clj
-     (let [[seen on-status] (status-collector)
-           conn @(nats/connect {:servers   [server-url]
-                                :on-status on-status})]
-       (try
-         (is (wait-for #(some #{{:type :connected}} @seen) 2000)
-             ":connected reaches :on-status as a {:type ...} map")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (let [[seen on-status] (status-collector)]
-              (-> (nats/connect {:servers   [server-url]
-                                 :on-status on-status})
-                  (p/then (fn [conn]
-                            (is (some #{{:type :connected}} @seen)
-                                ":connected reaches :on-status as a {:type ...} map")
-                            (close! conn)))
-                  (p/catch (fn [e] (is false (str "connect failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+  (let [[seen on-status] (status-collector)
+        opts {:servers [server-url] :on-status on-status}]
+    #?(:clj
+       (with-conn opts
+         (fn [_conn]
+           (is (wait-for #(some #{{:type :connected}} @seen) 2000)
+               ":connected reaches :on-status as a {:type ...} map")))
+       :cljs
+       (async done
+              (with-conn opts done
+                (fn [_conn]
+                  (is (some #{{:type :connected}} @seen)
+                      ":connected reaches :on-status as a {:type ...} map")))))))
 
 (deftest close-settles-fires-closed-and-ends-subs
-  #?(:clj
-     (let [[seen on-status] (status-collector)
-           conn      @(nats/connect {:servers [server-url] :on-status on-status})
-           sub       (nats/subscribe conn subject (fn [_] nil))
-           close-ret (nats/close conn)]
-       (is (not= ::timeout (deref close-ret 2000 ::timeout))
-           "close returns a promise that settles")
-       (is (wait-for #(some #{{:type :closed}} @seen) 2000)
-           ":closed reaches :on-status")
-       (is (wait-for #(sub-ended? sub) 2000)
-           "close ends the connection's subscriptions"))
-     :cljs
-     (async done
-            (let [[seen on-status] (status-collector)]
-              (-> (nats/connect {:servers [server-url] :on-status on-status})
-                  (p/then (fn [conn]
-                            (let [sub       (nats/subscribe conn subject (fn [_] nil))
-                                  close-ret (nats/close conn)]
-                              (is (some? close-ret) "close returns a promise")
-                              (-> close-ret
-                                  (p/then (fn [_] (p/delay 100)))
-                                  (p/then (fn [_]
-                                            (is (some #{{:type :closed}} @seen)
-                                                ":closed reaches :on-status")
-                                            (is (sub-ended? sub)
-                                                "close ends the connection's subscriptions")))))))
-                  (p/catch (fn [e] (is false (str "close test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+  (let [[seen on-status] (status-collector)
+        opts {:servers [server-url] :on-status on-status}]
+    #?(:clj
+       (with-conn opts
+         (fn [conn]
+           (let [sub       (nats/subscribe conn subject (fn [_] nil))
+                 close-ret (nats/close conn)]
+             (is (not= ::timeout (deref close-ret 2000 ::timeout))
+                 "close returns a promise that settles")
+             (is (wait-for #(some #{{:type :closed}} @seen) 2000)
+                 ":closed reaches :on-status")
+             (is (wait-for #(sub-ended? sub) 2000)
+                 "close ends the connection's subscriptions"))))
+       :cljs
+       (async done
+              (with-conn opts done
+                (fn [conn]
+                  (let [sub       (nats/subscribe conn subject (fn [_] nil))
+                        close-ret (nats/close conn)]
+                    (is (some? close-ret) "close returns a promise")
+                    (-> close-ret
+                        (p/then (fn [_] (p/delay 100)))
+                        (p/then (fn [_]
+                                  (is (some #{{:type :closed}} @seen)
+                                      ":closed reaches :on-status")
+                                  (is (sub-ended? sub)
+                                      "close ends the connection's subscriptions")))))))))))
 
 (deftest disconnected-fires-on-drop
-  #?(:clj
-     (let [[seen on-status] (status-collector)
-           conn @(nats/connect {:servers [server-url] :on-status on-status})]
-       (try
-         (force-drop! conn)
-         (is (wait-for #(some #{{:type :disconnected}} @seen) 5000)
-             ":disconnected reaches :on-status on a real link drop")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (let [[seen on-status] (status-collector)]
-              (-> (nats/connect {:servers [server-url] :on-status on-status})
-                  (p/then (fn [conn]
-                            (force-drop! conn)
-                            (-> (wait-for #(some #{{:type :disconnected}} @seen) 5000)
-                                (p/then (fn [hit?]
-                                          (is hit? ":disconnected reaches :on-status on a real link drop")
-                                          (close! conn))))))
-                  (p/catch (fn [e] (is false (str "disconnect test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+  (let [[seen on-status] (status-collector)
+        opts {:servers [server-url] :on-status on-status}]
+    #?(:clj
+       (with-conn opts
+         (fn [conn]
+           (force-drop! conn)
+           (is (wait-for #(some #{{:type :disconnected}} @seen) 5000)
+               ":disconnected reaches :on-status on a real link drop")))
+       :cljs
+       (async done
+              (with-conn opts done
+                (fn [conn]
+                  (force-drop! conn)
+                  (-> (wait-for #(some #{{:type :disconnected}} @seen) 5000)
+                      (p/then (fn [hit?]
+                                (is hit? ":disconnected reaches :on-status on a real link drop"))))))))))
 
 ;; One real drop drives the whole disconnect->reconnecting->reconnected cycle, so
 ;; both reconnect events are asserted from a single connection. We wait for
@@ -474,51 +442,40 @@
 ;; the JVM synthesizes one :reconnecting per loss, nats.js emits one per dial
 ;; attempt, so the count is not asserted, only that the shape arrives in order.
 (deftest reconnect-cycle-fires-reconnecting-then-reconnected
-  #?(:clj
-     (let [[seen on-status] (status-collector)
-           conn @(nats/connect {:servers   [server-url]
-                                :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
-                                :on-status on-status})]
-       (try
-         (force-drop! conn)
-         (is (wait-for #(some #{{:type :reconnected}} @seen) 5000)
-             ":reconnected reaches :on-status after a real drop when :reconnect is configured")
-         (is (precedes? @seen :reconnecting :reconnected)
-             ":reconnecting reaches :on-status and precedes :reconnected in the cycle")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (let [[seen on-status] (status-collector)]
-              (-> (nats/connect {:servers   [server-url]
-                                 :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
-                                 :on-status on-status})
-                  (p/then (fn [conn]
-                            (force-drop! conn)
-                            (-> (wait-for #(some #{{:type :reconnected}} @seen) 5000)
-                                (p/then (fn [hit?]
-                                          (is hit? ":reconnected reaches :on-status after a real drop when :reconnect is configured")
-                                          (is (precedes? @seen :reconnecting :reconnected)
-                                              ":reconnecting reaches :on-status and precedes :reconnected in the cycle")
-                                          (close! conn))))))
-                  (p/catch (fn [e] (is false (str "reconnect test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+  (let [[seen on-status] (status-collector)
+        opts {:servers   [server-url]
+              :reconnect {:max 5 :wait-ms 50 :jitter-ms 10}
+              :on-status on-status}]
+    #?(:clj
+       (with-conn opts
+         (fn [conn]
+           (force-drop! conn)
+           (is (wait-for #(some #{{:type :reconnected}} @seen) 5000)
+               ":reconnected reaches :on-status after a real drop when :reconnect is configured")
+           (is (precedes? @seen :reconnecting :reconnected)
+               ":reconnecting reaches :on-status and precedes :reconnected in the cycle")))
+       :cljs
+       (async done
+              (with-conn opts done
+                (fn [conn]
+                  (force-drop! conn)
+                  (-> (wait-for #(some #{{:type :reconnected}} @seen) 5000)
+                      (p/then (fn [hit?]
+                                (is hit? ":reconnected reaches :on-status after a real drop when :reconnect is configured")
+                                (is (precedes? @seen :reconnecting :reconnected)
+                                    ":reconnecting reaches :on-status and precedes :reconnected in the cycle"))))))))))
 
 ;; :reconnect {:max -1} is the unlimited sentinel — honored natively on both
 ;; platforms (jnats .maxReconnects(-1); nats.js maxReconnectAttempts -1). Can't
 ;; assert "never gives up", so this just locks that -1 passes through and connects.
 (deftest reconnect-unlimited-connects
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url] :reconnect {:max -1}})]
-       (is (some? conn) ":reconnect {:max -1} (unlimited) connects without error")
-       (close! conn))
+     (with-conn {:servers [server-url] :reconnect {:max -1}}
+       (fn [conn] (is (some? conn) ":reconnect {:max -1} (unlimited) connects without error")))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url] :reconnect {:max -1}})
-                (p/then (fn [conn]
-                          (is (some? conn) ":reconnect {:max -1} (unlimited) connects without error")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "unlimited reconnect connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url] :reconnect {:max -1}} done
+              (fn [conn] (is (some? conn) ":reconnect {:max -1} (unlimited) connects without error"))))))
 
 ;; Translation pin (CLJS only): :reconnect {:max 0} must disable reconnection via
 ;; nats.js' `reconnect` boolean, NOT via maxReconnectAttempts 0 (which leaves
@@ -574,84 +531,72 @@
 
 (deftest flush-settles
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})]
-       (try
+     (with-conn {:servers [server-url]}
+       (fn [conn]
          (nats/publish conn subject payload)
          (let [flush-ret (nats/flush conn)]
            (is (not= ::timeout (deref flush-ret 5000 ::timeout))
-               "flush returns a promise that settles"))
-         (finally (close! conn))))
+               "flush returns a promise that settles"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (nats/publish conn subject payload)
-                          (let [flush-ret (nats/flush conn)]
-                            (is (some? flush-ret) "flush returns a promise")
-                            ;; reaching this then means the promise settled
-                            (-> flush-ret
-                                (p/then (fn [_] (is true "flush settles")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "flush test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (nats/publish conn subject payload)
+                (let [flush-ret (nats/flush conn)]
+                  (is (some? flush-ret) "flush returns a promise")
+                  ;; reaching this then means the promise settled
+                  (-> flush-ret
+                      (p/then (fn [_] (is true "flush settles"))))))))))
 
 (deftest drain-connection-settles-and-ends-subs
   #?(:clj
-     (let [conn      @(nats/connect {:servers [server-url]})
-           sub       (nats/subscribe conn subject (fn [_] nil))
-           drain-ret (nats/drain conn)]
-       (try
-         (is (not= ::timeout (deref drain-ret 5000 ::timeout))
-             "drain returns a promise that settles")
-         (is (wait-for #(sub-ended? sub) 2000)
-             "drain ends the connection's subscriptions")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [sub       (nats/subscribe conn subject (fn [_] nil))
+               drain-ret (nats/drain conn)]
+           (is (not= ::timeout (deref drain-ret 5000 ::timeout))
+               "drain returns a promise that settles")
+           (is (wait-for #(sub-ended? sub) 2000)
+               "drain ends the connection's subscriptions"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [sub       (nats/subscribe conn subject (fn [_] nil))
-                                drain-ret (nats/drain conn)]
-                            (is (some? drain-ret) "drain returns a promise")
-                            (-> drain-ret
-                                (p/then (fn [_] (wait-for #(sub-ended? sub) 2000)))
-                                (p/then (fn [ended?]
-                                          (is ended? "drain ends the connection's subscriptions")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "drain test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [sub       (nats/subscribe conn subject (fn [_] nil))
+                      drain-ret (nats/drain conn)]
+                  (is (some? drain-ret) "drain returns a promise")
+                  (-> drain-ret
+                      (p/then (fn [_] (wait-for #(sub-ended? sub) 2000)))
+                      (p/then (fn [ended?]
+                                (is ended? "drain ends the connection's subscriptions"))))))))))
 
 (deftest drain-subscription-settles-and-ends-only-it
   #?(:clj
-     (let [conn      @(nats/connect {:servers [server-url]})
-           sub-a     (nats/subscribe conn (str subject ".a") (fn [_] nil))
-           sub-b     (nats/subscribe conn (str subject ".b") (fn [_] nil))
-           drain-ret (nats/drain sub-a)]
-       (try
-         (is (not= ::timeout (deref drain-ret 5000 ::timeout))
-             "subscription drain returns a promise that settles")
-         (is (wait-for #(sub-ended? sub-a) 2000)
-             "draining a subscription ends it")
-         (is (not (sub-ended? sub-b))
-             "draining one subscription leaves the connection's others active")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [sub-a     (nats/subscribe conn (str subject ".a") (fn [_] nil))
+               sub-b     (nats/subscribe conn (str subject ".b") (fn [_] nil))
+               drain-ret (nats/drain sub-a)]
+           (is (not= ::timeout (deref drain-ret 5000 ::timeout))
+               "subscription drain returns a promise that settles")
+           (is (wait-for #(sub-ended? sub-a) 2000)
+               "draining a subscription ends it")
+           (is (not (sub-ended? sub-b))
+               "draining one subscription leaves the connection's others active"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [sub-a     (nats/subscribe conn (str subject ".a") (fn [_] nil))
-                                sub-b     (nats/subscribe conn (str subject ".b") (fn [_] nil))
-                                drain-ret (nats/drain sub-a)]
-                            (is (some? drain-ret) "subscription drain returns a promise")
-                            (-> drain-ret
-                                (p/then (fn [_] (wait-for #(sub-ended? sub-a) 2000)))
-                                (p/then (fn [ended?]
-                                          (is ended? "draining a subscription ends it")
-                                          (is (not (sub-ended? sub-b))
-                                              "draining one subscription leaves the connection's others active")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "subscription drain test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [sub-a     (nats/subscribe conn (str subject ".a") (fn [_] nil))
+                      sub-b     (nats/subscribe conn (str subject ".b") (fn [_] nil))
+                      drain-ret (nats/drain sub-a)]
+                  (is (some? drain-ret) "subscription drain returns a promise")
+                  (-> drain-ret
+                      (p/then (fn [_] (wait-for #(sub-ended? sub-a) 2000)))
+                      (p/then (fn [ended?]
+                                (is ended? "draining a subscription ends it")
+                                (is (not (sub-ended? sub-b))
+                                    "draining one subscription leaves the connection's others active"))))))))))
 
 ;; Unsubscribe (ADR 0012) is the abrupt sibling of drain: it stops the
 ;; subscription synchronously, returning nil, and DROPS not-yet-delivered
@@ -661,39 +606,35 @@
 ;; still-1 count after the flush settles is a deterministic "no further delivery".
 (deftest unsubscribe-stops-delivery-abruptly-and-returns-nil
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (atom [])
-           sub      (nats/subscribe conn unsub-subject (fn [msg] (swap! received conj (:data msg))))]
-       (try
-         (nats/publish conn unsub-subject :one)
-         (is (wait-for #(= 1 (count @received)) 2000) "the first message is delivered")
-         (is (nil? (nats/unsubscribe sub)) "unsubscribe returns nil synchronously")
-         (is (wait-for #(sub-ended? sub) 2000) "unsubscribe ends the subscription")
-         (nats/publish conn unsub-subject :two)
-         @(nats/flush conn)
-         (is (= [:one] @received) "no message is delivered after unsubscribe")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (atom [])
+               sub      (nats/subscribe conn unsub-subject (fn [msg] (swap! received conj (:data msg))))]
+           (nats/publish conn unsub-subject :one)
+           (is (wait-for #(= 1 (count @received)) 2000) "the first message is delivered")
+           (is (nil? (nats/unsubscribe sub)) "unsubscribe returns nil synchronously")
+           (is (wait-for #(sub-ended? sub) 2000) "unsubscribe ends the subscription")
+           (nats/publish conn unsub-subject :two)
+           @(nats/flush conn)
+           (is (= [:one] @received) "no message is delivered after unsubscribe"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (atom [])
-                                sub      (nats/subscribe conn unsub-subject (fn [msg] (swap! received conj (:data msg))))]
-                            (nats/publish conn unsub-subject :one)
-                            (-> (wait-for #(= 1 (count @received)) 2000)
-                                (p/then (fn [hit?]
-                                          (is hit? "the first message is delivered")
-                                          (is (nil? (nats/unsubscribe sub)) "unsubscribe returns nil synchronously")
-                                          (wait-for #(sub-ended? sub) 2000)))
-                                (p/then (fn [ended?]
-                                          (is ended? "unsubscribe ends the subscription")
-                                          (nats/publish conn unsub-subject :two)
-                                          (nats/flush conn)))
-                                (p/then (fn [_]
-                                          (is (= [:one] @received) "no message is delivered after unsubscribe")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "unsubscribe test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (atom [])
+                      sub      (nats/subscribe conn unsub-subject (fn [msg] (swap! received conj (:data msg))))]
+                  (nats/publish conn unsub-subject :one)
+                  (-> (wait-for #(= 1 (count @received)) 2000)
+                      (p/then (fn [hit?]
+                                (is hit? "the first message is delivered")
+                                (is (nil? (nats/unsubscribe sub)) "unsubscribe returns nil synchronously")
+                                (wait-for #(sub-ended? sub) 2000)))
+                      (p/then (fn [ended?]
+                                (is ended? "unsubscribe ends the subscription")
+                                (nats/publish conn unsub-subject :two)
+                                (nats/flush conn)))
+                      (p/then (fn [_]
+                                (is (= [:one] @received) "no message is delivered after unsubscribe"))))))))))
 
 ;; `(unsubscribe sub max)` auto-unsubscribes once the subscription has received
 ;; `max` messages over its lifetime (ADR 0012). Arm max=3 before any publish,
@@ -703,38 +644,34 @@
 (deftest unsubscribe-max-auto-unsubscribes-after-n
   (let [max 3 n 10]
     #?(:clj
-       (let [conn     @(nats/connect {:servers [server-url]})
-             received (atom [])
-             sub      (nats/subscribe conn unsub-max-subject (fn [msg] (swap! received conj (:data msg))))]
-         (try
-           (is (nil? (nats/unsubscribe sub max)) "unsubscribe with max returns nil synchronously")
-           (dotimes [i n] (nats/publish conn unsub-max-subject i))
-           @(nats/flush conn)
-           (is (wait-for #(= max (count @received)) 2000)
-               "exactly max messages are delivered")
-           (is (wait-for #(sub-ended? sub) 2000)
-               "reaching max ends the subscription")
-           (is (= [0 1 2] @received) "the first max messages are delivered, the rest dropped")
-           (finally (close! conn))))
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [received (atom [])
+                 sub      (nats/subscribe conn unsub-max-subject (fn [msg] (swap! received conj (:data msg))))]
+             (is (nil? (nats/unsubscribe sub max)) "unsubscribe with max returns nil synchronously")
+             (dotimes [i n] (nats/publish conn unsub-max-subject i))
+             @(nats/flush conn)
+             (is (wait-for #(= max (count @received)) 2000)
+                 "exactly max messages are delivered")
+             (is (wait-for #(sub-ended? sub) 2000)
+                 "reaching max ends the subscription")
+             (is (= [0 1 2] @received) "the first max messages are delivered, the rest dropped"))))
        :cljs
        (async done
-              (-> (nats/connect {:servers [server-url]})
-                  (p/then (fn [conn]
-                            (let [received (atom [])
-                                  sub      (nats/subscribe conn unsub-max-subject (fn [msg] (swap! received conj (:data msg))))]
-                              (is (nil? (nats/unsubscribe sub max)) "unsubscribe with max returns nil synchronously")
-                              (dotimes [i n] (nats/publish conn unsub-max-subject i))
-                              (-> (nats/flush conn)
-                                  (p/then (fn [_] (wait-for #(= max (count @received)) 2000)))
-                                  (p/then (fn [hit?]
-                                            (is hit? "exactly max messages are delivered")
-                                            (wait-for #(sub-ended? sub) 2000)))
-                                  (p/then (fn [ended?]
-                                            (is ended? "reaching max ends the subscription")
-                                            (is (= [0 1 2] @received) "the first max messages are delivered, the rest dropped")))
-                                  (p/finally (fn [_ _] (close! conn)))))))
-                  (p/catch (fn [e] (is false (str "unsubscribe-max test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [received (atom [])
+                        sub      (nats/subscribe conn unsub-max-subject (fn [msg] (swap! received conj (:data msg))))]
+                    (is (nil? (nats/unsubscribe sub max)) "unsubscribe with max returns nil synchronously")
+                    (dotimes [i n] (nats/publish conn unsub-max-subject i))
+                    (-> (nats/flush conn)
+                        (p/then (fn [_] (wait-for #(= max (count @received)) 2000)))
+                        (p/then (fn [hit?]
+                                  (is hit? "exactly max messages are delivered")
+                                  (wait-for #(sub-ended? sub) 2000)))
+                        (p/then (fn [ended?]
+                                  (is ended? "reaching max ends the subscription")
+                                  (is (= [0 1 2] @received) "the first max messages are delivered, the rest dropped")))))))))))
 
 ;; An invalid `max` is caller misuse the facade rejects synchronously with a
 ;; portable `:type :invalid-max` on every platform (parallel to
@@ -745,38 +682,34 @@
 ;; ArithmeticException there while succeeding on JS — reject it the same on both).
 (deftest unsubscribe-invalid-max-rejected
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})
-           sub  (nats/subscribe conn unsub-max-subject (fn [_]))]
-       (try
-         (is (= :invalid-max
-                (try (nats/unsubscribe sub 0)
-                     :no-throw
-                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
-             "max 0 is rejected as :invalid-max, not armed as a zero auto-unsubscribe")
-         (is (= :invalid-max
-                (try (nats/unsubscribe sub (inc 2147483647))
-                     :no-throw
-                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
-             "max above Integer/MAX_VALUE is rejected as :invalid-max, not thrown as ArithmeticException")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [sub (nats/subscribe conn unsub-max-subject (fn [_]))]
+           (is (= :invalid-max
+                  (try (nats/unsubscribe sub 0)
+                       :no-throw
+                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+               "max 0 is rejected as :invalid-max, not armed as a zero auto-unsubscribe")
+           (is (= :invalid-max
+                  (try (nats/unsubscribe sub (inc 2147483647))
+                       :no-throw
+                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+               "max above Integer/MAX_VALUE is rejected as :invalid-max, not thrown as ArithmeticException"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [sub (nats/subscribe conn unsub-max-subject (fn [_]))]
-                            (is (= :invalid-max
-                                   (try (nats/unsubscribe sub 0)
-                                        :no-throw
-                                        (catch :default e (:type (ex-data e)))))
-                                "max 0 is rejected as :invalid-max, not armed as a zero auto-unsubscribe")
-                            (is (= :invalid-max
-                                   (try (nats/unsubscribe sub (inc 2147483647))
-                                        :no-throw
-                                        (catch :default e (:type (ex-data e)))))
-                                "max above Integer/MAX_VALUE is rejected the same as on JVM")
-                            (close! conn))))
-                (p/catch (fn [e] (is false (str "connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [sub (nats/subscribe conn unsub-max-subject (fn [_]))]
+                  (is (= :invalid-max
+                         (try (nats/unsubscribe sub 0)
+                              :no-throw
+                              (catch :default e (:type (ex-data e)))))
+                      "max 0 is rejected as :invalid-max, not armed as a zero auto-unsubscribe")
+                  (is (= :invalid-max
+                         (try (nats/unsubscribe sub (inc 2147483647))
+                              :no-throw
+                              (catch :default e (:type (ex-data e)))))
+                      "max above Integer/MAX_VALUE is rejected the same as on JVM")))))))
 
 ;; Unsubscribe is idempotent (ADR 0012): unsubscribing an already-ended
 ;; subscription — ended by a prior unsubscribe, a drain, or the connection
@@ -786,34 +719,30 @@
 ;; the same silent no-op.
 (deftest unsubscribe-is-idempotent
   #?(:clj
-     (let [conn  @(nats/connect {:servers [server-url]})
-           sub-a (nats/subscribe conn (str unsub-subject ".idem.a") (fn [_]))
-           sub-b (nats/subscribe conn (str unsub-subject ".idem.b") (fn [_]))]
-       (try
-         (nats/unsubscribe sub-a)
-         (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after a prior unsubscribe is a no-op")
-         @(nats/drain sub-b)
-         (is (nil? (nats/unsubscribe sub-b)) "unsubscribe after drain is a no-op")
-         @(nats/close conn)
-         (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after connection close is a no-op")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [sub-a (nats/subscribe conn (str unsub-subject ".idem.a") (fn [_]))
+               sub-b (nats/subscribe conn (str unsub-subject ".idem.b") (fn [_]))]
+           (nats/unsubscribe sub-a)
+           (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after a prior unsubscribe is a no-op")
+           @(nats/drain sub-b)
+           (is (nil? (nats/unsubscribe sub-b)) "unsubscribe after drain is a no-op")
+           @(nats/close conn)
+           (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after connection close is a no-op"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [sub-a (nats/subscribe conn (str unsub-subject ".idem.a") (fn [_]))
-                                sub-b (nats/subscribe conn (str unsub-subject ".idem.b") (fn [_]))]
-                            (nats/unsubscribe sub-a)
-                            (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after a prior unsubscribe is a no-op")
-                            (-> (nats/drain sub-b)
-                                (p/then (fn [_]
-                                          (is (nil? (nats/unsubscribe sub-b)) "unsubscribe after drain is a no-op")
-                                          (nats/close conn)))
-                                (p/then (fn [_]
-                                          (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after connection close is a no-op")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "unsubscribe idempotency test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [sub-a (nats/subscribe conn (str unsub-subject ".idem.a") (fn [_]))
+                      sub-b (nats/subscribe conn (str unsub-subject ".idem.b") (fn [_]))]
+                  (nats/unsubscribe sub-a)
+                  (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after a prior unsubscribe is a no-op")
+                  (-> (nats/drain sub-b)
+                      (p/then (fn [_]
+                                (is (nil? (nats/unsubscribe sub-b)) "unsubscribe after drain is a no-op")
+                                (nats/close conn)))
+                      (p/then (fn [_]
+                                (is (nil? (nats/unsubscribe sub-a)) "unsubscribe after connection close is a no-op"))))))))))
 
 ;; Delivery semantics (ADR 0007). With a SINGLE publisher, a subscription sees that
 ;; publisher's messages in publish order, one at a time — that per-publisher order is
@@ -825,30 +754,26 @@
 (deftest single-subscription-delivers-in-order
   (let [n 50]
     #?(:clj
-       (let [conn  @(nats/connect {:servers [server-url]})
-             order (atom [])]
-         (try
-           (nats/subscribe conn order-subject (fn [msg] (swap! order conj (:data msg))))
-           (dotimes [i n] (nats/publish conn order-subject i))
-           (is (wait-for #(= n (count @order)) 5000) "all messages delivered")
-           (is (= (vec (range n)) @order)
-               "a single subscription delivers one publisher's messages in publish order")
-           (finally (close! conn))))
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [order (atom [])]
+             (nats/subscribe conn order-subject (fn [msg] (swap! order conj (:data msg))))
+             (dotimes [i n] (nats/publish conn order-subject i))
+             (is (wait-for #(= n (count @order)) 5000) "all messages delivered")
+             (is (= (vec (range n)) @order)
+                 "a single subscription delivers one publisher's messages in publish order"))))
        :cljs
        (async done
-              (-> (nats/connect {:servers [server-url]})
-                  (p/then (fn [conn]
-                            (let [order (atom [])]
-                              (nats/subscribe conn order-subject (fn [msg] (swap! order conj (:data msg))))
-                              (dotimes [i n] (nats/publish conn order-subject i))
-                              (-> (wait-for #(= n (count @order)) 5000)
-                                  (p/then (fn [hit?]
-                                            (is hit? "all messages delivered")
-                                            (is (= (vec (range n)) @order)
-                                                "a single subscription delivers one publisher's messages in publish order")))
-                                  (p/finally (fn [_ _] (close! conn)))))))
-                  (p/catch (fn [e] (is false (str "ordering test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [order (atom [])]
+                    (nats/subscribe conn order-subject (fn [msg] (swap! order conj (:data msg))))
+                    (dotimes [i n] (nats/publish conn order-subject i))
+                    (-> (wait-for #(= n (count @order)) 5000)
+                        (p/then (fn [hit?]
+                                  (is hit? "all messages delivered")
+                                  (is (= (vec (range n)) @order)
+                                      "a single subscription delivers one publisher's messages in publish order")))))))))))
 
 ;; Promise-return backpressure (ADR 0007): a handler that returns a pending
 ;; promise suspends delivery of the next message until it settles; a non-promise
@@ -858,50 +783,46 @@
 ;; promesa deferred on CLJS — exactly the shape a real async handler would return.
 (deftest pending-promise-handler-applies-backpressure
   #?(:clj
-     (let [conn  @(nats/connect {:servers [server-url]})
-           order (atom [])
-           gate  (java.util.concurrent.CompletableFuture.)]
-       (try
-         (nats/subscribe conn backpressure-subject
-                         (fn [msg]
-                           (swap! order conj (:data msg))
-                           (when (= 1 (:data msg)) gate)))
-         (nats/publish conn backpressure-subject 1)
-         (nats/publish conn backpressure-subject 2)
-         (is (wait-for #(= [1] @order) 5000) "the first message is delivered")
-         (Thread/sleep 300)
-         (is (= [1] @order)
-             "a pending-promise handler suspends delivery of the next message")
-         (.complete gate nil)
-         (is (wait-for #(= [1 2] @order) 5000)
-             "the next message is delivered once the promise settles")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [order (atom [])
+               gate  (java.util.concurrent.CompletableFuture.)]
+           (nats/subscribe conn backpressure-subject
+                           (fn [msg]
+                             (swap! order conj (:data msg))
+                             (when (= 1 (:data msg)) gate)))
+           (nats/publish conn backpressure-subject 1)
+           (nats/publish conn backpressure-subject 2)
+           (is (wait-for #(= [1] @order) 5000) "the first message is delivered")
+           (Thread/sleep 300)
+           (is (= [1] @order)
+               "a pending-promise handler suspends delivery of the next message")
+           (.complete gate nil)
+           (is (wait-for #(= [1 2] @order) 5000)
+               "the next message is delivered once the promise settles"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [order (atom [])
-                                gate  (p/deferred)]
-                            (nats/subscribe conn backpressure-subject
-                                            (fn [msg]
-                                              (swap! order conj (:data msg))
-                                              (when (= 1 (:data msg)) gate)))
-                            (nats/publish conn backpressure-subject 1)
-                            (nats/publish conn backpressure-subject 2)
-                            (-> (wait-for #(= [1] @order) 5000)
-                                (p/then (fn [hit?]
-                                          (is hit? "the first message is delivered")))
-                                (p/then (fn [_] (p/delay 300)))
-                                (p/then (fn [_]
-                                          (is (= [1] @order)
-                                              "a pending-promise handler suspends delivery of the next message")
-                                          (p/resolve! gate nil)))
-                                (p/then (fn [_] (wait-for #(= [1 2] @order) 5000)))
-                                (p/then (fn [hit?]
-                                          (is hit? "the next message is delivered once the promise settles")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "backpressure test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [order (atom [])
+                      gate  (p/deferred)]
+                  (nats/subscribe conn backpressure-subject
+                                  (fn [msg]
+                                    (swap! order conj (:data msg))
+                                    (when (= 1 (:data msg)) gate)))
+                  (nats/publish conn backpressure-subject 1)
+                  (nats/publish conn backpressure-subject 2)
+                  (-> (wait-for #(= [1] @order) 5000)
+                      (p/then (fn [hit?]
+                                (is hit? "the first message is delivered")))
+                      (p/then (fn [_] (p/delay 300)))
+                      (p/then (fn [_]
+                                (is (= [1] @order)
+                                    "a pending-promise handler suspends delivery of the next message")
+                                (p/resolve! gate nil)))
+                      (p/then (fn [_] (wait-for #(= [1 2] @order) 5000)))
+                      (p/then (fn [hit?]
+                                (is hit? "the next message is delivered once the promise settles"))))))))))
 
 ;; No cross-subscription coupling (ADR 0007): backpressure is per-subscription,
 ;; and a handler that returns a pending promise must never block the underlying
@@ -911,52 +832,48 @@
 ;; no cross-subscription ordering guarantee to assume.
 (deftest subscriptions-are-independent
   #?(:clj
-     (let [conn    @(nats/connect {:servers [server-url]})
-           a-order (atom [])
-           b-order (atom [])
-           gate    (java.util.concurrent.CompletableFuture.)]
-       (try
-         (nats/subscribe conn indep-a-subject
-                         (fn [msg]
-                           (swap! a-order conj (:data msg))
-                           (when (= :a1 (:data msg)) gate)))
-         (nats/subscribe conn indep-b-subject
-                         (fn [msg] (swap! b-order conj (:data msg))))
-         (nats/publish conn indep-a-subject :a1)
-         (nats/publish conn indep-a-subject :a2)
-         (nats/publish conn indep-b-subject :b1)
-         (is (wait-for #(and (= [:a1] @a-order) (= [:b1] @b-order)) 5000)
-             "a second subscription delivers while the first is backpressured (no cross-subscription coupling)")
-         (.complete gate nil)
-         (is (wait-for #(= [:a1 :a2] @a-order) 5000)
-             "the backpressured subscription resumes once its promise settles")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [a-order (atom [])
+               b-order (atom [])
+               gate    (java.util.concurrent.CompletableFuture.)]
+           (nats/subscribe conn indep-a-subject
+                           (fn [msg]
+                             (swap! a-order conj (:data msg))
+                             (when (= :a1 (:data msg)) gate)))
+           (nats/subscribe conn indep-b-subject
+                           (fn [msg] (swap! b-order conj (:data msg))))
+           (nats/publish conn indep-a-subject :a1)
+           (nats/publish conn indep-a-subject :a2)
+           (nats/publish conn indep-b-subject :b1)
+           (is (wait-for #(and (= [:a1] @a-order) (= [:b1] @b-order)) 5000)
+               "a second subscription delivers while the first is backpressured (no cross-subscription coupling)")
+           (.complete gate nil)
+           (is (wait-for #(= [:a1 :a2] @a-order) 5000)
+               "the backpressured subscription resumes once its promise settles"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [a-order (atom [])
-                                b-order (atom [])
-                                gate    (p/deferred)]
-                            (nats/subscribe conn indep-a-subject
-                                            (fn [msg]
-                                              (swap! a-order conj (:data msg))
-                                              (when (= :a1 (:data msg)) gate)))
-                            (nats/subscribe conn indep-b-subject
-                                            (fn [msg] (swap! b-order conj (:data msg))))
-                            (nats/publish conn indep-a-subject :a1)
-                            (nats/publish conn indep-a-subject :a2)
-                            (nats/publish conn indep-b-subject :b1)
-                            (-> (wait-for #(and (= [:a1] @a-order) (= [:b1] @b-order)) 5000)
-                                (p/then (fn [hit?]
-                                          (is hit? "a second subscription delivers while the first is backpressured (no cross-subscription coupling)")
-                                          (p/resolve! gate nil)))
-                                (p/then (fn [_] (wait-for #(= [:a1 :a2] @a-order) 5000)))
-                                (p/then (fn [hit?]
-                                          (is hit? "the backpressured subscription resumes once its promise settles")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "independence test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [a-order (atom [])
+                      b-order (atom [])
+                      gate    (p/deferred)]
+                  (nats/subscribe conn indep-a-subject
+                                  (fn [msg]
+                                    (swap! a-order conj (:data msg))
+                                    (when (= :a1 (:data msg)) gate)))
+                  (nats/subscribe conn indep-b-subject
+                                  (fn [msg] (swap! b-order conj (:data msg))))
+                  (nats/publish conn indep-a-subject :a1)
+                  (nats/publish conn indep-a-subject :a2)
+                  (nats/publish conn indep-b-subject :b1)
+                  (-> (wait-for #(and (= [:a1] @a-order) (= [:b1] @b-order)) 5000)
+                      (p/then (fn [hit?]
+                                (is hit? "a second subscription delivers while the first is backpressured (no cross-subscription coupling)")
+                                (p/resolve! gate nil)))
+                      (p/then (fn [_] (wait-for #(= [:a1 :a2] @a-order) 5000)))
+                      (p/then (fn [hit?]
+                                (is hit? "the backpressured subscription resumes once its promise settles"))))))))))
 
 ;; Queue groups / competing consumers (ADR 0007). Subscriptions sharing a :queue
 ;; group on one subject compete: the server load-balances each matching message to
@@ -966,39 +883,35 @@
 (deftest queue-group-load-balances
   (let [n 50]
     #?(:clj
-       (let [conn @(nats/connect {:servers [server-url]})
-             a    (atom [])
-             b    (atom [])]
-         (try
-           (nats/subscribe conn queue-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
-           (nats/subscribe conn queue-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
-           (dotimes [i n] (nats/publish conn queue-subject i))
-           (is (wait-for #(= n (+ (count @a) (count @b))) 5000)
-               "every published message reaches the queue group")
-           (is (= (vec (range n)) (vec (sort (concat @a @b))))
-               "each message reaches exactly one member — combined delivery is the full set, no duplication")
-           (is (and (seq @a) (seq @b))
-               "both members receive a share (the server load-balances)")
-           (finally (close! conn))))
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [a (atom [])
+                 b (atom [])]
+             (nats/subscribe conn queue-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
+             (nats/subscribe conn queue-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
+             (dotimes [i n] (nats/publish conn queue-subject i))
+             (is (wait-for #(= n (+ (count @a) (count @b))) 5000)
+                 "every published message reaches the queue group")
+             (is (= (vec (range n)) (vec (sort (concat @a @b))))
+                 "each message reaches exactly one member — combined delivery is the full set, no duplication")
+             (is (and (seq @a) (seq @b))
+                 "both members receive a share (the server load-balances)"))))
        :cljs
        (async done
-              (-> (nats/connect {:servers [server-url]})
-                  (p/then (fn [conn]
-                            (let [a (atom [])
-                                  b (atom [])]
-                              (nats/subscribe conn queue-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
-                              (nats/subscribe conn queue-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
-                              (dotimes [i n] (nats/publish conn queue-subject i))
-                              (-> (wait-for #(= n (+ (count @a) (count @b))) 5000)
-                                  (p/then (fn [hit?]
-                                            (is hit? "every published message reaches the queue group")
-                                            (is (= (vec (range n)) (vec (sort (concat @a @b))))
-                                                "each message reaches exactly one member — combined delivery is the full set, no duplication")
-                                            (is (and (seq @a) (seq @b))
-                                                "both members receive a share (the server load-balances)")))
-                                  (p/finally (fn [_ _] (close! conn)))))))
-                  (p/catch (fn [e] (is false (str "queue group test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [a (atom [])
+                        b (atom [])]
+                    (nats/subscribe conn queue-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
+                    (nats/subscribe conn queue-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
+                    (dotimes [i n] (nats/publish conn queue-subject i))
+                    (-> (wait-for #(= n (+ (count @a) (count @b))) 5000)
+                        (p/then (fn [hit?]
+                                  (is hit? "every published message reaches the queue group")
+                                  (is (= (vec (range n)) (vec (sort (concat @a @b))))
+                                      "each message reaches exactly one member — combined delivery is the full set, no duplication")
+                                  (is (and (seq @a) (seq @b))
+                                      "both members receive a share (the server load-balances)")))))))))))
 
 ;; A queue group only competes within itself: a plain (non-queue) subscription on
 ;; the same subject is a separate interest, so it still receives every message
@@ -1007,43 +920,39 @@
 (deftest non-queue-subscription-receives-all-alongside-a-queue-group
   (let [n 50]
     #?(:clj
-       (let [conn @(nats/connect {:servers [server-url]})
-             a    (atom [])
-             b    (atom [])
-             all  (atom [])]
-         (try
-           (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
-           (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
-           (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! all conj (:data msg))))
-           (dotimes [i n] (nats/publish conn queue-mixed-subject i))
-           (is (wait-for #(and (= n (count @all)) (= n (+ (count @a) (count @b)))) 5000)
-               "the plain subscription and the queue group both finish")
-           (is (= (vec (range n)) (vec (sort @all)))
-               "a non-queue subscription on the same subject receives every message")
-           (is (= (vec (range n)) (vec (sort (concat @a @b))))
-               "the queue group still splits the same stream into a disjoint share")
-           (finally (close! conn))))
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [a   (atom [])
+                 b   (atom [])
+                 all (atom [])]
+             (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
+             (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
+             (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! all conj (:data msg))))
+             (dotimes [i n] (nats/publish conn queue-mixed-subject i))
+             (is (wait-for #(and (= n (count @all)) (= n (+ (count @a) (count @b)))) 5000)
+                 "the plain subscription and the queue group both finish")
+             (is (= (vec (range n)) (vec (sort @all)))
+                 "a non-queue subscription on the same subject receives every message")
+             (is (= (vec (range n)) (vec (sort (concat @a @b))))
+                 "the queue group still splits the same stream into a disjoint share"))))
        :cljs
        (async done
-              (-> (nats/connect {:servers [server-url]})
-                  (p/then (fn [conn]
-                            (let [a   (atom [])
-                                  b   (atom [])
-                                  all (atom [])]
-                              (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
-                              (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
-                              (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! all conj (:data msg))))
-                              (dotimes [i n] (nats/publish conn queue-mixed-subject i))
-                              (-> (wait-for #(and (= n (count @all)) (= n (+ (count @a) (count @b)))) 5000)
-                                  (p/then (fn [hit?]
-                                            (is hit? "the plain subscription and the queue group both finish")
-                                            (is (= (vec (range n)) (vec (sort @all)))
-                                                "a non-queue subscription on the same subject receives every message")
-                                            (is (= (vec (range n)) (vec (sort (concat @a @b))))
-                                                "the queue group still splits the same stream into a disjoint share")))
-                                  (p/finally (fn [_ _] (close! conn)))))))
-                  (p/catch (fn [e] (is false (str "mixed queue/plain test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [a   (atom [])
+                        b   (atom [])
+                        all (atom [])]
+                    (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! a conj (:data msg))) {:queue "workers"})
+                    (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! b conj (:data msg))) {:queue "workers"})
+                    (nats/subscribe conn queue-mixed-subject (fn [msg] (swap! all conj (:data msg))))
+                    (dotimes [i n] (nats/publish conn queue-mixed-subject i))
+                    (-> (wait-for #(and (= n (count @all)) (= n (+ (count @a) (count @b)))) 5000)
+                        (p/then (fn [hit?]
+                                  (is hit? "the plain subscription and the queue group both finish")
+                                  (is (= (vec (range n)) (vec (sort @all)))
+                                      "a non-queue subscription on the same subject receives every message")
+                                  (is (= (vec (range n)) (vec (sort (concat @a @b))))
+                                      "the queue group still splits the same stream into a disjoint share")))))))))))
 
 ;; Request/reply over the core round-trip (ADR 0002/0006). A responder subscribes
 ;; to `request-subject` and answers via `reply` (sugar that publishes to the
@@ -1052,34 +961,30 @@
 ;; `:reply` key (nil when there is no reply subject).
 (deftest request-reply-round-trip
   #?(:clj
-     (let [conn    @(nats/connect {:servers [server-url]})
-           replied (promise)]
-       (try
-         (nats/subscribe conn request-subject
-                         (fn [msg]
-                           (deliver replied (nats/reply conn msg {:pong (:n (:data msg))}))))
-         (let [resp (deref (nats/request conn request-subject {:n 7} {:timeout-ms 5000}) 5000 ::timeout)]
-           (is (not= ::timeout resp) "request resolves within 5s")
-           (is (= {:pong 7} (:data resp)) "request resolves to the decoded reply payload")
-           (is (contains? resp :reply) "resolved message always carries a :reply key")
-           (is (nil? (deref replied 5000 ::unset)) "reply returns nil"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [replied (promise)]
+           (nats/subscribe conn request-subject
+                           (fn [msg]
+                             (deliver replied (nats/reply conn msg {:pong (:n (:data msg))}))))
+           (let [resp (deref (nats/request conn request-subject {:n 7} {:timeout-ms 5000}) 5000 ::timeout)]
+             (is (not= ::timeout resp) "request resolves within 5s")
+             (is (= {:pong 7} (:data resp)) "request resolves to the decoded reply payload")
+             (is (contains? resp :reply) "resolved message always carries a :reply key")
+             (is (nil? (deref replied 5000 ::unset)) "reply returns nil")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [replied (atom ::unset)]
-                            (nats/subscribe conn request-subject
-                                            (fn [msg]
-                                              (reset! replied (nats/reply conn msg {:pong (:n (:data msg))}))))
-                            (-> (p/timeout (nats/request conn request-subject {:n 7} {:timeout-ms 5000}) 5000)
-                                (p/then (fn [resp]
-                                          (is (= {:pong 7} (:data resp)) "request resolves to the decoded reply payload")
-                                          (is (contains? resp :reply) "resolved message always carries a :reply key")
-                                          (is (nil? @replied) "reply returns nil")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "request/reply round-trip failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [replied (atom ::unset)]
+                  (nats/subscribe conn request-subject
+                                  (fn [msg]
+                                    (reset! replied (nats/reply conn msg {:pong (:n (:data msg))}))))
+                  (-> (p/timeout (nats/request conn request-subject {:n 7} {:timeout-ms 5000}) 5000)
+                      (p/then (fn [resp]
+                                (is (= {:pong 7} (:data resp)) "request resolves to the decoded reply payload")
+                                (is (contains? resp :reply) "resolved message always carries a :reply key")
+                                (is (nil? @replied) "reply returns nil"))))))))))
 
 ;; AC1: a per-call :codec overrides the connection default on request, and reply
 ;; gains an opts arity so the response leg matches. The connection defaults to
@@ -1098,77 +1003,69 @@
 ;; the handler, so the report lands on the test thread.
 (deftest per-call-codec-overrides-request-and-reply
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (promise)]
-       (try
-         (nats/subscribe conn codec-request-subject
-                         (fn [msg]
-                           (deliver received (:data msg))
-                           (nats/reply conn msg "pong" {:codec :string}))
-                         {:codec :string})
-         (let [resp (deref (nats/request conn codec-request-subject "hi" {:codec :string :timeout-ms 5000}) 5000 ::timeout)]
-           (is (not= ::timeout resp) "request resolves within 5s")
-           (is (= "hi" (deref received 5000 ::timeout))
-               "the per-call :string on request encodes the body unquoted (the :edn default would have sent \"\\\"hi\\\"\")")
-           (is (= "pong" (:data resp))
-               "request and reply honor the per-call :string over the :edn default"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (promise)]
+           (nats/subscribe conn codec-request-subject
+                           (fn [msg]
+                             (deliver received (:data msg))
+                             (nats/reply conn msg "pong" {:codec :string}))
+                           {:codec :string})
+           (let [resp (deref (nats/request conn codec-request-subject "hi" {:codec :string :timeout-ms 5000}) 5000 ::timeout)]
+             (is (not= ::timeout resp) "request resolves within 5s")
+             (is (= "hi" (deref received 5000 ::timeout))
+                 "the per-call :string on request encodes the body unquoted (the :edn default would have sent \"\\\"hi\\\"\")")
+             (is (= "pong" (:data resp))
+                 "request and reply honor the per-call :string over the :edn default")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (p/deferred)]
-                            (nats/subscribe conn codec-request-subject
-                                            (fn [msg]
-                                              (p/resolve! received (:data msg))
-                                              (nats/reply conn msg "pong" {:codec :string}))
-                                            {:codec :string})
-                            (-> (p/timeout (nats/request conn codec-request-subject "hi" {:codec :string :timeout-ms 5000}) 5000)
-                                (p/then (fn [resp]
-                                          (is (= "pong" (:data resp))
-                                              "request and reply honor the per-call :string over the :edn default")))
-                                (p/then (fn [_] (p/timeout received 5000)))
-                                (p/then (fn [recvd]
-                                          (is (= "hi" recvd)
-                                              "the per-call :string on request encodes the body unquoted (the :edn default would have sent \"\\\"hi\\\"\")")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "request/reply override failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (p/deferred)]
+                  (nats/subscribe conn codec-request-subject
+                                  (fn [msg]
+                                    (p/resolve! received (:data msg))
+                                    (nats/reply conn msg "pong" {:codec :string}))
+                                  {:codec :string})
+                  (-> (p/timeout (nats/request conn codec-request-subject "hi" {:codec :string :timeout-ms 5000}) 5000)
+                      (p/then (fn [resp]
+                                (is (= "pong" (:data resp))
+                                    "request and reply honor the per-call :string over the :edn default")))
+                      (p/then (fn [_] (p/timeout received 5000)))
+                      (p/then (fn [recvd]
+                                (is (= "hi" recvd)
+                                    "the per-call :string on request encodes the body unquoted (the :edn default would have sent \"\\\"hi\\\"\")"))))))))))
 
 ;; No-responders failure mode (ADR 0006): a request to a subject nobody
 ;; subscribes rejects fast with a normalized `:type :no-responders`, distinct
 ;; from a timeout — the server reports it as soon as it sees no subscribers.
 (deftest request-no-responders-rejects
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})
-           t    (try (deref (nats/request conn no-responders-subject {:n 1} {:timeout-ms 2000}) 5000 ::timeout)
-                     nil
-                     (catch java.util.concurrent.ExecutionException e
-                       (:type (ex-data (.getCause e)))))]
-       (try
-         (is (= :no-responders t)
-             "a request to a subject with no subscribers rejects with :no-responders")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [t (try (deref (nats/request conn no-responders-subject {:n 1} {:timeout-ms 2000}) 5000 ::timeout)
+                      nil
+                      (catch java.util.concurrent.ExecutionException e
+                        (:type (ex-data (.getCause e)))))]
+           (is (= :no-responders t)
+               "a request to a subject with no subscribers rejects with :no-responders"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (-> (nats/request conn no-responders-subject {:n 1} {:timeout-ms 2000})
-                              (p/then (fn [_] (is false "expected the request to reject with :no-responders")))
-                              (p/catch (fn [e]
-                                         (is (= :no-responders (:type (ex-data e)))
-                                             "a request to a subject with no subscribers rejects with :no-responders")))
-                              (p/finally (fn [_ _] (close! conn))))))
-                (p/catch (fn [e] (is false (str "connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (-> (nats/request conn no-responders-subject {:n 1} {:timeout-ms 2000})
+                    (p/then (fn [_] (is false "expected the request to reject with :no-responders")))
+                    (p/catch (fn [e]
+                               (is (= :no-responders (:type (ex-data e)))
+                                   "a request to a subject with no subscribers rejects with :no-responders")))))))))
 
 ;; Timeout failure mode (ADR 0006): responders exist (a subscriber is registered,
 ;; confirmed via flush) but none answer within :timeout-ms, so the request
 ;; rejects with a normalized `:type :timeout` — distinct from :no-responders.
 (deftest request-timeout-rejects
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})]
-       (try
+     (with-conn {:servers [server-url]}
+       (fn [conn]
          (nats/subscribe conn silent-subject (fn [_msg] nil))
          @(nats/flush conn)
          (let [t (try (deref (nats/request conn silent-subject {:n 1} {:timeout-ms 300}) 5000 ::timeout)
@@ -1176,139 +1073,119 @@
                       (catch java.util.concurrent.ExecutionException e
                         (:type (ex-data (.getCause e)))))]
            (is (= :timeout t)
-               "a request whose responders never answer within :timeout-ms rejects with :timeout"))
-         (finally (close! conn))))
+               "a request whose responders never answer within :timeout-ms rejects with :timeout"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (nats/subscribe conn silent-subject (fn [_msg] nil))
-                          (-> (nats/flush conn)
-                              (p/then (fn [_] (nats/request conn silent-subject {:n 1} {:timeout-ms 300})))
-                              (p/then (fn [_] (is false "expected the request to reject with :timeout")))
-                              (p/catch (fn [e]
-                                         (is (= :timeout (:type (ex-data e)))
-                                             "a request whose responders never answer within :timeout-ms rejects with :timeout")))
-                              (p/finally (fn [_ _] (close! conn))))))
-                (p/catch (fn [e] (is false (str "connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (nats/subscribe conn silent-subject (fn [_msg] nil))
+                (-> (nats/flush conn)
+                    (p/then (fn [_] (nats/request conn silent-subject {:n 1} {:timeout-ms 300})))
+                    (p/then (fn [_] (is false "expected the request to reject with :timeout")))
+                    (p/catch (fn [e]
+                               (is (= :timeout (:type (ex-data e)))
+                                   "a request whose responders never answer within :timeout-ms rejects with :timeout")))))))))
 
 ;; Headers round-trip (CONTEXT: Headers). A scalar header value is accepted on
 ;; publish and arrives normalized to a one-element vector of strings under
 ;; :headers — the same shape on every platform.
 (deftest headers-scalar-delivers-as-one-element-vector
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (promise)]
-       (try
-         (nats/subscribe conn headers-scalar-subject #(deliver received %))
-         (nats/publish conn headers-scalar-subject payload {:headers {"X-Trace" "abc"}})
-         (let [msg (deref received 5000 ::timeout)]
-           (is (not= ::timeout msg) "handler is invoked within 5s")
-           (is (= {"X-Trace" ["abc"]} (:headers msg))
-               "a scalar header value is delivered as a one-element vector of strings"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (promise)]
+           (nats/subscribe conn headers-scalar-subject #(deliver received %))
+           (nats/publish conn headers-scalar-subject payload {:headers {"X-Trace" "abc"}})
+           (let [msg (deref received 5000 ::timeout)]
+             (is (not= ::timeout msg) "handler is invoked within 5s")
+             (is (= {"X-Trace" ["abc"]} (:headers msg))
+                 "a scalar header value is delivered as a one-element vector of strings")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (p/deferred)]
-                            (nats/subscribe conn headers-scalar-subject #(p/resolve! received %))
-                            (nats/publish conn headers-scalar-subject payload {:headers {"X-Trace" "abc"}})
-                            (-> (p/timeout received 5000)
-                                (p/then (fn [msg]
-                                          (is (= {"X-Trace" ["abc"]} (:headers msg))
-                                              "a scalar header value is delivered as a one-element vector of strings")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (p/deferred)]
+                  (nats/subscribe conn headers-scalar-subject #(p/resolve! received %))
+                  (nats/publish conn headers-scalar-subject payload {:headers {"X-Trace" "abc"}})
+                  (-> (p/timeout received 5000)
+                      (p/then (fn [msg]
+                                (is (= {"X-Trace" ["abc"]} (:headers msg))
+                                    "a scalar header value is delivered as a one-element vector of strings"))))))))))
 
 ;; When nothing was published under :headers, the delivered message carries no
 ;; :headers key at all — absence, not an empty map (CONTEXT: Headers).
 (deftest headers-absent-when-none-set
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (promise)]
-       (try
-         (nats/subscribe conn headers-absent-subject #(deliver received %))
-         (nats/publish conn headers-absent-subject payload)
-         (let [msg (deref received 5000 ::timeout)]
-           (is (not= ::timeout msg) "handler is invoked within 5s")
-           (is (not (contains? msg :headers))
-               ":headers is absent from the delivered map when none were set"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (promise)]
+           (nats/subscribe conn headers-absent-subject #(deliver received %))
+           (nats/publish conn headers-absent-subject payload)
+           (let [msg (deref received 5000 ::timeout)]
+             (is (not= ::timeout msg) "handler is invoked within 5s")
+             (is (not (contains? msg :headers))
+                 ":headers is absent from the delivered map when none were set")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (p/deferred)]
-                            (nats/subscribe conn headers-absent-subject #(p/resolve! received %))
-                            (nats/publish conn headers-absent-subject payload)
-                            (-> (p/timeout received 5000)
-                                (p/then (fn [msg]
-                                          (is (not (contains? msg :headers))
-                                              ":headers is absent from the delivered map when none were set")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (p/deferred)]
+                  (nats/subscribe conn headers-absent-subject #(p/resolve! received %))
+                  (nats/publish conn headers-absent-subject payload)
+                  (-> (p/timeout received 5000)
+                      (p/then (fn [msg]
+                                (is (not (contains? msg :headers))
+                                    ":headers is absent from the delivered map when none were set"))))))))))
 
 ;; Header names are case-sensitive: two names differing only in case are distinct
 ;; entries that survive the round-trip without collapsing (CONTEXT: Headers).
 (deftest headers-names-are-case-sensitive
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (promise)]
-       (try
-         (nats/subscribe conn headers-case-subject #(deliver received %))
-         (nats/publish conn headers-case-subject payload {:headers {"X-Trace" "upper" "x-trace" "lower"}})
-         (let [msg (deref received 5000 ::timeout)]
-           (is (not= ::timeout msg) "handler is invoked within 5s")
-           (is (= {"X-Trace" ["upper"] "x-trace" ["lower"]} (:headers msg))
-               "names differing only in case are preserved as distinct entries"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (promise)]
+           (nats/subscribe conn headers-case-subject #(deliver received %))
+           (nats/publish conn headers-case-subject payload {:headers {"X-Trace" "upper" "x-trace" "lower"}})
+           (let [msg (deref received 5000 ::timeout)]
+             (is (not= ::timeout msg) "handler is invoked within 5s")
+             (is (= {"X-Trace" ["upper"] "x-trace" ["lower"]} (:headers msg))
+                 "names differing only in case are preserved as distinct entries")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (p/deferred)]
-                            (nats/subscribe conn headers-case-subject #(p/resolve! received %))
-                            (nats/publish conn headers-case-subject payload {:headers {"X-Trace" "upper" "x-trace" "lower"}})
-                            (-> (p/timeout received 5000)
-                                (p/then (fn [msg]
-                                          (is (= {"X-Trace" ["upper"] "x-trace" ["lower"]} (:headers msg))
-                                              "names differing only in case are preserved as distinct entries")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (p/deferred)]
+                  (nats/subscribe conn headers-case-subject #(p/resolve! received %))
+                  (nats/publish conn headers-case-subject payload {:headers {"X-Trace" "upper" "x-trace" "lower"}})
+                  (-> (p/timeout received 5000)
+                      (p/then (fn [msg]
+                                (is (= {"X-Trace" ["upper"] "x-trace" ["lower"]} (:headers msg))
+                                    "names differing only in case are preserved as distinct entries"))))))))))
 
 ;; A vector-valued header carries multiple values for one name; they arrive
 ;; unchanged as a vector of strings, in order (CONTEXT: Headers).
 (deftest headers-vector-delivers-unchanged
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (promise)]
-       (try
-         (nats/subscribe conn headers-vector-subject #(deliver received %))
-         (nats/publish conn headers-vector-subject payload {:headers {"X-Tag" ["a" "b"]}})
-         (let [msg (deref received 5000 ::timeout)]
-           (is (not= ::timeout msg) "handler is invoked within 5s")
-           (is (= {"X-Tag" ["a" "b"]} (:headers msg))
-               "a vector-valued header is delivered unchanged as a vector of strings"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (promise)]
+           (nats/subscribe conn headers-vector-subject #(deliver received %))
+           (nats/publish conn headers-vector-subject payload {:headers {"X-Tag" ["a" "b"]}})
+           (let [msg (deref received 5000 ::timeout)]
+             (is (not= ::timeout msg) "handler is invoked within 5s")
+             (is (= {"X-Tag" ["a" "b"]} (:headers msg))
+                 "a vector-valued header is delivered unchanged as a vector of strings")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (p/deferred)]
-                            (nats/subscribe conn headers-vector-subject #(p/resolve! received %))
-                            (nats/publish conn headers-vector-subject payload {:headers {"X-Tag" ["a" "b"]}})
-                            (-> (p/timeout received 5000)
-                                (p/then (fn [msg]
-                                          (is (= {"X-Tag" ["a" "b"]} (:headers msg))
-                                              "a vector-valued header is delivered unchanged as a vector of strings")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (p/deferred)]
+                  (nats/subscribe conn headers-vector-subject #(p/resolve! received %))
+                  (nats/publish conn headers-vector-subject payload {:headers {"X-Tag" ["a" "b"]}})
+                  (-> (p/timeout received 5000)
+                      (p/then (fn [msg]
+                                (is (= {"X-Tag" ["a" "b"]} (:headers msg))
+                                    "a vector-valued header is delivered unchanged as a vector of strings"))))))))))
 
 ;; Surrounding whitespace on a header value is insignificant and stripped on
 ;; delivery, identically on every platform (CONTEXT: Headers). nats.js trims
@@ -1316,30 +1193,26 @@
 ;; on the underlying client's behavior.
 (deftest headers-whitespace-stripped-on-delivery
   #?(:clj
-     (let [conn     @(nats/connect {:servers [server-url]})
-           received (promise)]
-       (try
-         (nats/subscribe conn headers-trim-subject #(deliver received %))
-         (nats/publish conn headers-trim-subject payload {:headers {"X-Trace" "  abc  "}})
-         (let [msg (deref received 5000 ::timeout)]
-           (is (not= ::timeout msg) "handler is invoked within 5s")
-           (is (= {"X-Trace" ["abc"]} (:headers msg))
-               "surrounding whitespace is stripped from the delivered value"))
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [received (promise)]
+           (nats/subscribe conn headers-trim-subject #(deliver received %))
+           (nats/publish conn headers-trim-subject payload {:headers {"X-Trace" "  abc  "}})
+           (let [msg (deref received 5000 ::timeout)]
+             (is (not= ::timeout msg) "handler is invoked within 5s")
+             (is (= {"X-Trace" ["abc"]} (:headers msg))
+                 "surrounding whitespace is stripped from the delivered value")))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [received (p/deferred)]
-                            (nats/subscribe conn headers-trim-subject #(p/resolve! received %))
-                            (nats/publish conn headers-trim-subject payload {:headers {"X-Trace" "  abc  "}})
-                            (-> (p/timeout received 5000)
-                                (p/then (fn [msg]
-                                          (is (= {"X-Trace" ["abc"]} (:headers msg))
-                                              "surrounding whitespace is stripped from the delivered value")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "headers round-trip failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [received (p/deferred)]
+                  (nats/subscribe conn headers-trim-subject #(p/resolve! received %))
+                  (nats/publish conn headers-trim-subject payload {:headers {"X-Trace" "  abc  "}})
+                  (-> (p/timeout received 5000)
+                      (p/then (fn [msg]
+                                (is (= {"X-Trace" ["abc"]} (:headers msg))
+                                    "surrounding whitespace is stripped from the delivered value"))))))))))
 
 ;; A non-string header value is rejected with a portable `:type :invalid-header`
 ;; ex-info on every platform, rather than leaking the underlying clients'
@@ -1348,26 +1221,22 @@
 ;; before anything reaches the wire.
 (deftest headers-non-string-value-rejected
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})]
-       (try
+     (with-conn {:servers [server-url]}
+       (fn [conn]
          (is (= :invalid-header
                 (try (nats/publish conn "headers.invalid" payload {:headers {"X-Trace" nil}})
                      :no-throw
                      (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
-             "a nil header value is rejected as :invalid-header, not silently dropped")
-         (finally (close! conn))))
+             "a nil header value is rejected as :invalid-header, not silently dropped")))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (is (= :invalid-header
-                                 (try (nats/publish conn "headers.invalid" payload {:headers {"X-Trace" nil}})
-                                      :no-throw
-                                      (catch :default e (:type (ex-data e)))))
-                              "a nil header value is rejected as :invalid-header, not silently dropped")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (is (= :invalid-header
+                       (try (nats/publish conn "headers.invalid" payload {:headers {"X-Trace" nil}})
+                            :no-throw
+                            (catch :default e (:type (ex-data e)))))
+                    "a nil header value is rejected as :invalid-header, not silently dropped"))))))
 
 ;; A non-positive :max-pending is caller misuse — it would otherwise arm a zero
 ;; (or sentinel-unbounded) native cap and silently deafen the subscription — so
@@ -1375,26 +1244,22 @@
 ;; on every platform (parallel to :invalid-header), before any native subscribe.
 (deftest subscribe-non-positive-max-pending-rejected
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})]
-       (try
+     (with-conn {:servers [server-url]}
+       (fn [conn]
          (is (= :invalid-max-pending
                 (try (nats/subscribe conn "mp.invalid" (fn [_]) {:max-pending 0})
                      :no-throw
                      (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
-             "max-pending 0 is rejected as :invalid-max-pending, not armed as a zero cap")
-         (finally (close! conn))))
+             "max-pending 0 is rejected as :invalid-max-pending, not armed as a zero cap")))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (is (= :invalid-max-pending
-                                 (try (nats/subscribe conn "mp.invalid" (fn [_]) {:max-pending 0})
-                                      :no-throw
-                                      (catch :default e (:type (ex-data e)))))
-                              "max-pending 0 is rejected as :invalid-max-pending, not armed as a zero cap")
-                          (close! conn)))
-                (p/catch (fn [e] (is false (str "connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (is (= :invalid-max-pending
+                       (try (nats/subscribe conn "mp.invalid" (fn [_]) {:max-pending 0})
+                            :no-throw
+                            (catch :default e (:type (ex-data e)))))
+                    "max-pending 0 is rejected as :invalid-max-pending, not armed as a zero cap"))))))
 
 ;; ===========================================================================
 ;; Error model (ADR 0006): every canonical Error :type reproduced and asserted
@@ -1428,26 +1293,22 @@
 (deftest max-payload-exceeded-throws
   (let [big (apply str (repeat 1100000 \x))]
     #?(:clj
-       (let [conn @(nats/connect {:servers [server-url]})]
-         (try
+       (with-conn {:servers [server-url]}
+         (fn [conn]
            (is (= :max-payload-exceeded
                   (try (nats/publish conn payload-subject big)
                        :no-throw
                        (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
-               "an oversized publish throws :max-payload-exceeded")
-           (finally (close! conn))))
+               "an oversized publish throws :max-payload-exceeded")))
        :cljs
        (async done
-              (-> (nats/connect {:servers [server-url]})
-                  (p/then (fn [conn]
-                            (is (= :max-payload-exceeded
-                                   (try (nats/publish conn payload-subject big)
-                                        :no-throw
-                                        (catch :default e (:type (ex-data e)))))
-                                "an oversized publish throws :max-payload-exceeded")
-                            (close! conn)))
-                  (p/catch (fn [e] (is false (str "connect failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (is (= :max-payload-exceeded
+                         (try (nats/publish conn payload-subject big)
+                              :no-throw
+                              (catch :default e (:type (ex-data e)))))
+                      "an oversized publish throws :max-payload-exceeded")))))))
 
 ;; :connection-closed (ADR 0006): operating on a closed connection. publish has
 ;; no promise so it throws synchronously; request rejects its promise. Both carry
@@ -1455,36 +1316,35 @@
 ;; :drained (the drain-window refusal).
 (deftest connection-closed-normalized
   #?(:clj
-     (let [conn @(nats/connect {:servers [server-url]})]
-       @(nats/close conn)
-       (is (= :connection-closed
-              (try (nats/publish conn closed-pub-subject {:n 1})
-                   :no-throw
-                   (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
-           "publish on a closed connection throws :connection-closed")
-       (is (= :connection-closed
-              (try (deref (nats/request conn closed-pub-subject {:n 1} {:timeout-ms 500}) 2000 ::timeout)
-                   nil
-                   (catch java.util.concurrent.ExecutionException e (:type (ex-data (.getCause e))))))
-           "request on a closed connection rejects with :connection-closed"))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         @(nats/close conn)
+         (is (= :connection-closed
+                (try (nats/publish conn closed-pub-subject {:n 1})
+                     :no-throw
+                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+             "publish on a closed connection throws :connection-closed")
+         (is (= :connection-closed
+                (try (deref (nats/request conn closed-pub-subject {:n 1} {:timeout-ms 500}) 2000 ::timeout)
+                     nil
+                     (catch java.util.concurrent.ExecutionException e (:type (ex-data (.getCause e))))))
+             "request on a closed connection rejects with :connection-closed")))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (-> (nats/close conn)
-                              (p/then (fn [_]
-                                        (is (= :connection-closed
-                                               (try (nats/publish conn closed-pub-subject {:n 1})
-                                                    :no-throw
-                                                    (catch :default e (:type (ex-data e)))))
-                                            "publish on a closed connection throws :connection-closed")
-                                        (nats/request conn closed-pub-subject {:n 1} {:timeout-ms 500})))
-                              (p/then (fn [_] (is false "expected request to reject with :connection-closed")))
-                              (p/catch (fn [e]
-                                         (is (= :connection-closed (:type (ex-data e)))
-                                             "request on a closed connection rejects with :connection-closed"))))))
-                (p/catch (fn [e] (is false (str "connect failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (-> (nats/close conn)
+                    (p/then (fn [_]
+                              (is (= :connection-closed
+                                     (try (nats/publish conn closed-pub-subject {:n 1})
+                                          :no-throw
+                                          (catch :default e (:type (ex-data e)))))
+                                  "publish on a closed connection throws :connection-closed")
+                              (nats/request conn closed-pub-subject {:n 1} {:timeout-ms 500})))
+                    (p/then (fn [_] (is false "expected request to reject with :connection-closed")))
+                    (p/catch (fn [e]
+                               (is (= :connection-closed (:type (ex-data e)))
+                                   "request on a closed connection rejects with :connection-closed")))))))))
 
 ;; handler-throw → :on-error (ADR 0006/0007, AC#2): a handler that throws is
 ;; caught and routed to the subscription's :on-error — the raw thrown value,
@@ -1492,89 +1352,81 @@
 ;; subscription, so a later message still arrives. :boom throws; :ok is delivered.
 (deftest handler-throw-routes-to-on-error
   #?(:clj
-     (let [conn       @(nats/connect {:servers [server-url]})
-           [errs on-error] (error-collector)
-           got        (atom [])]
-       (try
-         (nats/subscribe conn throw-subject
-                         (fn [msg]
-                           (if (= :boom (:data msg))
-                             (throw (ex-info "boom" {:kaboom true}))
-                             (swap! got conj (:data msg))))
-                         {:on-error on-error})
-         (nats/publish conn throw-subject :boom)
-         (nats/publish conn throw-subject :ok)
-         (is (wait-for #(and (seq @errs) (= [:ok] @got)) 5000)
-             "the throw reaches :on-error and the next message is still delivered")
-         (is (= {:kaboom true} (ex-data (first @errs)))
-             "the raw thrown value reaches :on-error unchanged")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [[errs on-error] (error-collector)
+               got        (atom [])]
+           (nats/subscribe conn throw-subject
+                           (fn [msg]
+                             (if (= :boom (:data msg))
+                               (throw (ex-info "boom" {:kaboom true}))
+                               (swap! got conj (:data msg))))
+                           {:on-error on-error})
+           (nats/publish conn throw-subject :boom)
+           (nats/publish conn throw-subject :ok)
+           (is (wait-for #(and (seq @errs) (= [:ok] @got)) 5000)
+               "the throw reaches :on-error and the next message is still delivered")
+           (is (= {:kaboom true} (ex-data (first @errs)))
+               "the raw thrown value reaches :on-error unchanged"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [[errs on-error] (error-collector)
-                                got        (atom [])]
-                            (nats/subscribe conn throw-subject
-                                            (fn [msg]
-                                              (if (= :boom (:data msg))
-                                                (throw (ex-info "boom" {:kaboom true}))
-                                                (swap! got conj (:data msg))))
-                                            {:on-error on-error})
-                            (nats/publish conn throw-subject :boom)
-                            (nats/publish conn throw-subject :ok)
-                            (-> (wait-for #(and (seq @errs) (= [:ok] @got)) 5000)
-                                (p/then (fn [hit?]
-                                          (is hit? "the throw reaches :on-error and the next message is still delivered")
-                                          (is (= {:kaboom true} (ex-data (first @errs)))
-                                              "the raw thrown value reaches :on-error unchanged")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "handler-throw test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [[errs on-error] (error-collector)
+                      got        (atom [])]
+                  (nats/subscribe conn throw-subject
+                                  (fn [msg]
+                                    (if (= :boom (:data msg))
+                                      (throw (ex-info "boom" {:kaboom true}))
+                                      (swap! got conj (:data msg))))
+                                  {:on-error on-error})
+                  (nats/publish conn throw-subject :boom)
+                  (nats/publish conn throw-subject :ok)
+                  (-> (wait-for #(and (seq @errs) (= [:ok] @got)) 5000)
+                      (p/then (fn [hit?]
+                                (is hit? "the throw reaches :on-error and the next message is still delivered")
+                                (is (= {:kaboom true} (ex-data (first @errs)))
+                                    "the raw thrown value reaches :on-error unchanged"))))))))))
 
 ;; handler-throw → :on-status :error fallback (ADR 0006, AC#2): with NO per-sub
 ;; :on-error, the same thrown value reaches the connection's :on-status — as the
 ;; lone non-bare lifecycle event `{:type :error :error <ex-info>}` — and the
 ;; subscription still survives.
 (deftest handler-throw-falls-back-to-on-status
-  #?(:clj
-     (let [[seen on-status] (status-collector)
-           conn       @(nats/connect {:servers [server-url] :on-status on-status})
-           got        (atom [])]
-       (try
-         (nats/subscribe conn throw-fallback-subject
-                         (fn [msg]
-                           (if (= :boom (:data msg))
-                             (throw (ex-info "boom" {:kaboom true}))
-                             (swap! got conj (:data msg)))))
-         (nats/publish conn throw-fallback-subject :boom)
-         (nats/publish conn throw-fallback-subject :ok)
-         (is (wait-for #(and (some (comp #{:error} :type) @seen) (= [:ok] @got)) 5000)
-             "with no :on-error the throw reaches :on-status and the sub survives")
-         (is (= {:kaboom true} (ex-data (:error (first (filter (comp #{:error} :type) @seen)))))
-             "the :error event wraps the thrown value under :error")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (let [[seen on-status] (status-collector)]
-              (-> (nats/connect {:servers [server-url] :on-status on-status})
-                  (p/then (fn [conn]
-                            (let [got (atom [])]
-                              (nats/subscribe conn throw-fallback-subject
-                                              (fn [msg]
-                                                (if (= :boom (:data msg))
-                                                  (throw (ex-info "boom" {:kaboom true}))
-                                                  (swap! got conj (:data msg)))))
-                              (nats/publish conn throw-fallback-subject :boom)
-                              (nats/publish conn throw-fallback-subject :ok)
-                              (-> (wait-for #(and (some (comp #{:error} :type) @seen) (= [:ok] @got)) 5000)
-                                  (p/then (fn [hit?]
-                                            (is hit? "with no :on-error the throw reaches :on-status and the sub survives")
-                                            (is (= {:kaboom true} (ex-data (:error (first (filter (comp #{:error} :type) @seen)))))
-                                                "the :error event wraps the thrown value under :error")))
-                                  (p/finally (fn [_ _] (close! conn)))))))
-                  (p/catch (fn [e] (is false (str "fallback test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+  (let [[seen on-status] (status-collector)
+        opts {:servers [server-url] :on-status on-status}]
+    #?(:clj
+       (with-conn opts
+         (fn [conn]
+           (let [got (atom [])]
+             (nats/subscribe conn throw-fallback-subject
+                             (fn [msg]
+                               (if (= :boom (:data msg))
+                                 (throw (ex-info "boom" {:kaboom true}))
+                                 (swap! got conj (:data msg)))))
+             (nats/publish conn throw-fallback-subject :boom)
+             (nats/publish conn throw-fallback-subject :ok)
+             (is (wait-for #(and (some (comp #{:error} :type) @seen) (= [:ok] @got)) 5000)
+                 "with no :on-error the throw reaches :on-status and the sub survives")
+             (is (= {:kaboom true} (ex-data (:error (first (filter (comp #{:error} :type) @seen)))))
+                 "the :error event wraps the thrown value under :error"))))
+       :cljs
+       (async done
+              (with-conn opts done
+                (fn [conn]
+                  (let [got (atom [])]
+                    (nats/subscribe conn throw-fallback-subject
+                                    (fn [msg]
+                                      (if (= :boom (:data msg))
+                                        (throw (ex-info "boom" {:kaboom true}))
+                                        (swap! got conj (:data msg)))))
+                    (nats/publish conn throw-fallback-subject :boom)
+                    (nats/publish conn throw-fallback-subject :ok)
+                    (-> (wait-for #(and (some (comp #{:error} :type) @seen) (= [:ok] @got)) 5000)
+                        (p/then (fn [hit?]
+                                  (is hit? "with no :on-error the throw reaches :on-status and the sub survives")
+                                  (is (= {:kaboom true} (ex-data (:error (first (filter (comp #{:error} :type) @seen)))))
+                                      "the :error event wraps the thrown value under :error")))))))))))
 
 ;; decode-failure → :codec-error (ADR 0006, AC#3): a subscriber decoding with
 ;; :edn receives raw non-EDN bytes (a lone "{", published via :string). decode-msg
@@ -1583,39 +1435,35 @@
 ;; subscription: a following valid message is still delivered.
 (deftest decode-failure-routes-to-on-error
   #?(:clj
-     (let [conn       @(nats/connect {:servers [server-url]})
-           [errs on-error] (error-collector)
-           got        (atom [])]
-       (try
-         (nats/subscribe conn codec-error-subject
-                         (fn [msg] (swap! got conj (:data msg)))
-                         {:on-error on-error})
-         (nats/publish conn codec-error-subject "{" {:codec :string})
-         (nats/publish conn codec-error-subject {:ok 1})
-         (is (wait-for #(and (seq @errs) (= [{:ok 1}] @got)) 5000)
-             "the decode failure reaches :on-error and the next message survives")
-         (is (= :codec-error (:type (ex-data (first @errs))))
-             "the failure is a normalized :codec-error ex-info")
-         (finally (close! conn))))
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [[errs on-error] (error-collector)
+               got        (atom [])]
+           (nats/subscribe conn codec-error-subject
+                           (fn [msg] (swap! got conj (:data msg)))
+                           {:on-error on-error})
+           (nats/publish conn codec-error-subject "{" {:codec :string})
+           (nats/publish conn codec-error-subject {:ok 1})
+           (is (wait-for #(and (seq @errs) (= [{:ok 1}] @got)) 5000)
+               "the decode failure reaches :on-error and the next message survives")
+           (is (= :codec-error (:type (ex-data (first @errs))))
+               "the failure is a normalized :codec-error ex-info"))))
      :cljs
      (async done
-            (-> (nats/connect {:servers [server-url]})
-                (p/then (fn [conn]
-                          (let [[errs on-error] (error-collector)
-                                got        (atom [])]
-                            (nats/subscribe conn codec-error-subject
-                                            (fn [msg] (swap! got conj (:data msg)))
-                                            {:on-error on-error})
-                            (nats/publish conn codec-error-subject "{" {:codec :string})
-                            (nats/publish conn codec-error-subject {:ok 1})
-                            (-> (wait-for #(and (seq @errs) (= [{:ok 1}] @got)) 5000)
-                                (p/then (fn [hit?]
-                                          (is hit? "the decode failure reaches :on-error and the next message survives")
-                                          (is (= :codec-error (:type (ex-data (first @errs))))
-                                              "the failure is a normalized :codec-error ex-info")))
-                                (p/finally (fn [_ _] (close! conn)))))))
-                (p/catch (fn [e] (is false (str "decode-failure test failed: " e))))
-                (p/finally (fn [_ _] (done)))))))
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [[errs on-error] (error-collector)
+                      got        (atom [])]
+                  (nats/subscribe conn codec-error-subject
+                                  (fn [msg] (swap! got conj (:data msg)))
+                                  {:on-error on-error})
+                  (nats/publish conn codec-error-subject "{" {:codec :string})
+                  (nats/publish conn codec-error-subject {:ok 1})
+                  (-> (wait-for #(and (seq @errs) (= [{:ok 1}] @got)) 5000)
+                      (p/then (fn [hit?]
+                                (is hit? "the decode failure reaches :on-error and the next message survives")
+                                (is (= :codec-error (:type (ex-data (first @errs))))
+                                    "the failure is a normalized :codec-error ex-info"))))))))))
 
 ;; :slow-consumer + :max-pending (ADR 0006/0007, AC#4): a handler held on a
 ;; pending promise lets a flood pile up past :max-pending 1, so the overflow
@@ -1666,36 +1514,30 @@
 ;; "forbidden.>") reaches :on-status as an :error event ONLY, never a per-sub
 ;; :on-error, carrying a :permissions-violation ex-info.
 (deftest permissions-violation-reaches-on-status
-  #?(:clj
-     (let [[seen on-status] (status-collector)
-           conn @(nats/connect {:servers   [users-server-url]
-                                :auth      {:user restricted-user :pass restricted-pass}
-                                :on-status on-status})]
-       (try
-         (nats/subscribe conn forbidden-subject (fn [_] nil))
-         (is (wait-for #(some (comp #{:error} :type) @seen) 5000)
-             "a forbidden subscribe reaches :on-status as an :error event")
-         (is (= :permissions-violation
-                (:type (ex-data (:error (first (filter (comp #{:error} :type) @seen))))))
-             "the :error event carries a :permissions-violation ex-info")
-         (finally (close! conn))))
-     :cljs
-     (async done
-            (let [[seen on-status] (status-collector)]
-              (-> (nats/connect {:servers   [users-server-url]
-                                 :auth      {:user restricted-user :pass restricted-pass}
-                                 :on-status on-status})
-                  (p/then (fn [conn]
-                            (nats/subscribe conn forbidden-subject (fn [_] nil))
-                            (-> (wait-for #(some (comp #{:error} :type) @seen) 5000)
-                                (p/then (fn [hit?]
-                                          (is hit? "a forbidden subscribe reaches :on-status as an :error event")
-                                          (is (= :permissions-violation
-                                                 (:type (ex-data (:error (first (filter (comp #{:error} :type) @seen))))))
-                                              "the :error event carries a :permissions-violation ex-info")))
-                                (p/finally (fn [_ _] (close! conn))))))
-                  (p/catch (fn [e] (is false (str "permissions test failed: " e))))
-                  (p/finally (fn [_ _] (done))))))))
+  (let [[seen on-status] (status-collector)
+        opts {:servers   [users-server-url]
+              :auth      {:user restricted-user :pass restricted-pass}
+              :on-status on-status}]
+    #?(:clj
+       (with-conn opts
+         (fn [conn]
+           (nats/subscribe conn forbidden-subject (fn [_] nil))
+           (is (wait-for #(some (comp #{:error} :type) @seen) 5000)
+               "a forbidden subscribe reaches :on-status as an :error event")
+           (is (= :permissions-violation
+                  (:type (ex-data (:error (first (filter (comp #{:error} :type) @seen))))))
+               "the :error event carries a :permissions-violation ex-info")))
+       :cljs
+       (async done
+              (with-conn opts done
+                (fn [conn]
+                  (nats/subscribe conn forbidden-subject (fn [_] nil))
+                  (-> (wait-for #(some (comp #{:error} :type) @seen) 5000)
+                      (p/then (fn [hit?]
+                                (is hit? "a forbidden subscribe reaches :on-status as an :error event")
+                                (is (= :permissions-violation
+                                       (:type (ex-data (:error (first (filter (comp #{:error} :type) @seen))))))
+                                    "the :error event carries a :permissions-violation ex-info"))))))))))
 
 ;; :protocol-error (ADR 0006, AC#1): the server emits it for malformed protocol
 ;; exchanges the client never produces, so there is no clean e2e trigger. Both
