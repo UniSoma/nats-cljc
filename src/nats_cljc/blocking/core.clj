@@ -33,11 +33,14 @@
 (def ^:private poison (Object.))
 
 ;; A pull handle (CONTEXT: Pull subscription): the inner async subscription, the
-;; bounded queue its enqueuing handler feeds, an `ended` flag set on teardown, and
-;; the connection's pull-sub `registry` (so a connection close can poison it; nil
-;; when the connection was not opened through this layer). `take-message`/`messages`
-;; drain the queue; the teardown verbs act on the inner sub and poison the queue.
-(defrecord PullSubscription [inner ^BlockingQueue queue ended registry])
+;; bounded queue its enqueuing handler feeds, an `ended` flag set on teardown, the
+;; connection's pull-sub `registry` (so a connection close can poison it; nil when
+;; the connection was not opened through this layer), and a `counter` atom holding
+;; `{:received n :max m}` — `:received` is the lifetime arrival count (every message
+;; that lands in the buffer), `:max` the armed auto-unsubscribe threshold (nil until
+;; `(unsubscribe sub max)` arms it). `take-message`/`messages` drain the queue; the
+;; teardown verbs act on the inner sub and poison the queue.
+(defrecord PullSubscription [inner ^BlockingQueue queue ended registry counter])
 
 (defn- poison!
   "Drop any buffered messages and make the end-of-stream sentinel land at the
@@ -57,6 +60,20 @@
   [sub]
   (reset! (:ended sub) true)
   (poison! (:queue sub)))
+
+(defn- end-after-max!
+  "Graceful auto-end when a sub reaches its armed `max`: unlike abrupt
+   `unsubscribe`, the N already-buffered messages must still reach the consumer, so
+   this does NOT clear the buffer — it appends the end-of-stream sentinel at the
+   tail (after them), the same flush-then-poison shape as `drain`. The native inner
+   sub has already been told to stop at N, so only the blocking handle is finalized.
+   CAS-guarded on `ended` so it fires exactly once even if the enqueuing handler and
+   `unsubscribe` both observe N reached (and `.put` is skipped once another teardown
+   has already ended the sub)."
+  [sub]
+  (when (compare-and-set! (:ended sub) false true)
+    (some-> (:registry sub) (swap! update :subs disj sub))
+    (.put ^BlockingQueue (:queue sub) poison)))
 
 (defn connect
   "Open a connection (blocking): the synchronous twin of `core/connect`. Returns
@@ -127,18 +144,30 @@
                      {:type :invalid-capacity :capacity capacity})))
    (let [^BlockingQueue queue (ArrayBlockingQueue. capacity)
          ended (atom false)
+         counter (atom {:received 0 :max nil})
+         ;; The enqueuing handler reaches the sub it feeds only through this promise:
+         ;; the record is built from `inner`, `inner` from the handler — a cycle a
+         ;; forward reference breaks. Forced only once `:max` is armed (long after
+         ;; the sub is delivered below), so it never actually blocks.
+         self (promise)
          ;; Block for buffer space — backpressure, never drop — but bounded, so a
          ;; producer parked on a full buffer rechecks `ended` and bails on teardown
          ;; rather than leaking the dispatcher thread (e.g. re-parking forever on a
          ;; sole poison sentinel at :capacity 1). While live this is a plain block.
+         ;; A successful offer is one lifetime arrival; reaching an armed `:max`
+         ;; gracefully ends the sub (the N stay buffered for the consumer).
          enqueue (fn [msg]
                    (loop []
                      (when-not @ended
-                       (when-not (.offer queue msg 100 TimeUnit/MILLISECONDS)
+                       (if (.offer queue msg 100 TimeUnit/MILLISECONDS)
+                         (let [{:keys [received max]} (swap! counter update :received inc)]
+                           (when (and max (>= received max))
+                             (end-after-max! @self)))
                          (recur)))))
          registry (::registry (meta conn))
          inner (core/subscribe conn subject enqueue opts)
-         sub (->PullSubscription inner queue ended registry)]
+         sub (->PullSubscription inner queue ended registry counter)]
+     (deliver self sub)
      ;; Register, then self-poison if the connection closed during the
      ;; subscribe→register window: the close sweep and this conj hit the same atom,
      ;; so the CAS orders them — exactly one side ends the sub, never neither.
@@ -196,17 +225,34 @@
    poison the buffer so a parked `take-message` wakes and a parked producer
    unblocks. Idempotent.
 
-   Only the `[sub]` arity exists here: the async core's `[sub max]`
-   auto-unsubscribe-after-N is not yet supported in the pull model. Wiring it needs
-   the buffer poisoned when the inner sub reaches N (a bare
-   `(core/unsubscribe (:inner sub) max)` would leave the buffer un-poisoned and hang
-   the next `take-message`); tracked as a follow-up."
-  [sub]
-  (core/unsubscribe (:inner sub))
-  (reset! (:ended sub) true)
-  (poison! (:queue sub))
-  (some-> (:registry sub) (swap! update :subs disj sub))
-  nil)
+   With `max`, the sub auto-unsubscribes once `max` messages have arrived over its
+   lifetime — counted from subscription start, consistent with the async core's
+   `[sub max]` (ADR 0008/0012). Unlike the abrupt arity, the already-buffered N are
+   still delivered (the consumer sees exactly N, in order) before
+   `take-message`/`messages` reach end-of-stream; if the sub has already received
+   `max`, it ends now. `max` must be a positive integer no greater than 2147483647
+   (the JVM `Dispatcher.unsubscribe(sub, int)` cap), enforced before the native call
+   — parity with core; anything else throws a `:type :invalid-max` ex-info."
+  ([sub]
+   (core/unsubscribe (:inner sub))
+   (reset! (:ended sub) true)
+   (poison! (:queue sub))
+   (some-> (:registry sub) (swap! update :subs disj sub))
+   nil)
+  ([sub max]
+   (when-not (and (pos-int? max) (<= max 2147483647))
+     (throw (ex-info "unsubscribe max must be a positive integer no greater than 2147483647"
+                     {:type :invalid-max :max max})))
+   ;; Stop the server at N (native lifetime auto-unsubscribe), then arm the buffer's
+   ;; threshold so the enqueuing handler poisons gracefully at the Nth arrival. Arm
+   ;; `:max` and read `:received` in one swap so a concurrent arrival can't slip past
+   ;; both checks: whichever of this call and the handler observes received >= max
+   ;; ends the sub (end-after-max! is fire-once). If N already arrived, end now.
+   (core/unsubscribe (:inner sub) max)
+   (let [{:keys [received]} (swap! (:counter sub) assoc :max max)]
+     (when (>= received max)
+       (end-after-max! sub)))
+   nil))
 
 (defn drain
   "Drain a connection or a single pull sub (blocking), returning nil once draining

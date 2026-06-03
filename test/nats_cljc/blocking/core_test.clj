@@ -283,6 +283,99 @@
       @worker
       (finally (nats/close conn)))))
 
+;; Auto-unsubscribe-after-N parity (AC1/AC2/AC4): (unsubscribe sub max) arms the
+;; sub to end once N messages have arrived over its lifetime. Arm max=3 before any
+;; publish, fire 5 on the shared connection (so SUB and the PUBs need no flush);
+;; the consumer pulls exactly the first 3, in order, then take-message returns nil
+;; for end-of-stream — the buffer is gracefully poisoned at N (the N are delivered,
+;; not dropped), with no hang on the (N+1)th pull.
+(deftest unsubscribe-max-delivers-exactly-n-then-end-of-stream
+  (let [max  3
+        n    5
+        conn (nats/connect {:servers [server-url]})
+        sub  (nats/subscribe conn "blocking.unsub-max")]
+    (try
+      (is (nil? (nats/unsubscribe sub max)) "unsubscribe with max returns nil synchronously")
+      (dotimes [i n] (nats/publish conn "blocking.unsub-max" i))
+      (let [received (mapv (fn [_] (:data (nats/take-message sub 5000))) (range max))]
+        (is (= (vec (range max)) received) "the consumer pulls exactly the first max messages, in order"))
+      (is (nil? (nats/take-message sub 2000)) "the (N+1)th pull returns nil for end-of-stream — no hang")
+      (finally (nats/close conn)))))
+
+;; The ergonomic path under auto-after-N (AC3): a `reduce` over `(messages sub)`
+;; terminates on its own once the armed max is reached — no explicit teardown — and
+;; yields exactly the first N messages, in order. The graceful poison sits after the
+;; N, so the reduce drains them before seeing end-of-stream.
+(deftest unsubscribe-max-messages-reduce-terminates-at-n
+  (let [max  4
+        n    9
+        conn (nats/connect {:servers [server-url]})
+        sub  (nats/subscribe conn "blocking.unsub-max.reduce")]
+    (try
+      (nats/unsubscribe sub max)
+      (dotimes [i n] (nats/publish conn "blocking.unsub-max.reduce" i))
+      (let [collected (reduce (fn [acc m] (conj acc (:data m))) [] (nats/messages sub))]
+        (is (= (vec (range max)) collected)
+            "reduce over messages terminates at max on its own, yielding exactly the first N in order"))
+      (finally (nats/close conn)))))
+
+;; active? disambiguates take-message's nil under auto-after-N (AC2): a live sub is
+;; active; once the armed max is reached and the consumer has drained the N, the sub
+;; has ended and its buffer holds only the poison sentinel — active? flips false, so
+;; a caller can tell end-of-stream from a mere timeout.
+(deftest unsubscribe-max-active?-false-once-drained
+  (let [max  2
+        conn (nats/connect {:servers [server-url]})
+        sub  (nats/subscribe conn "blocking.unsub-max.active")]
+    (try
+      (is (nats/active? sub) "a freshly-subscribed sub is active")
+      (nats/unsubscribe sub max)
+      (dotimes [i 5] (nats/publish conn "blocking.unsub-max.active" i))
+      (is (= [0 1] (mapv (fn [_] (:data (nats/take-message sub 5000))) (range max)))
+          "the consumer drains exactly the N buffered messages")
+      (is (nil? (nats/take-message sub 2000)) "the next pull is end-of-stream")
+      (is (not (nats/active? sub)) "active? is false once the sub has ended and the buffer is drained")
+      (finally (nats/close conn)))))
+
+;; An invalid `max` is caller misuse the blocking layer rejects synchronously with a
+;; portable `:type :invalid-max` (AC1) — parity with core, which validates before
+;; its native call. Two ways to be invalid: non-positive (would arm a zero/sentinel
+;; native auto-unsubscribe) and above Integer/MAX_VALUE (the JVM native overload
+;; takes an int). Rejected before the inner sub is touched.
+(deftest unsubscribe-max-invalid-rejected
+  (let [conn (nats/connect {:servers [server-url]})
+        sub  (nats/subscribe conn "blocking.unsub-max.invalid")]
+    (try
+      (is (= :invalid-max
+             (try (nats/unsubscribe sub 0)
+                  :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          "max 0 is rejected as :invalid-max, not armed as a zero auto-unsubscribe")
+      (is (= :invalid-max
+             (try (nats/unsubscribe sub (inc 2147483647))
+                  :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          "max above Integer/MAX_VALUE is rejected as :invalid-max, not thrown as ArithmeticException")
+      (finally (nats/close conn)))))
+
+;; The pinned already-received semantic: arming max on a sub that has ALREADY
+;; received >= max ends it now, rather than parking for a future Nth arrival that
+;; will never come. Drain all 3 first (received reaches 3 — counted from
+;; subscription start, independent of takes), then arm max=2; received (3) is already
+;; past max, so the sub ends immediately — the next pull is end-of-stream, no hang.
+(deftest unsubscribe-max-already-received-ends-now
+  (let [conn (nats/connect {:servers [server-url]})
+        sub  (nats/subscribe conn "blocking.unsub-max.already")]
+    (try
+      (dotimes [i 3] (nats/publish conn "blocking.unsub-max.already" i))
+      (is (= [0 1 2] (mapv (fn [_] (:data (nats/take-message sub 5000))) (range 3)))
+          "all three arrive and are taken — received is now 3")
+      (nats/unsubscribe sub 2)
+      (is (nil? (nats/take-message sub 2000))
+          "arming max=2 when 3 have already arrived ends the sub now — end-of-stream, no hang")
+      (is (not (nats/active? sub)) "the sub is ended")
+      (finally (nats/close conn)))))
+
 ;; The remaining one-shot (flush) and the re-exported version: flush blocks until
 ;; the server has processed the buffer and returns nil; version mirrors the core.
 (deftest flush-blocks-and-version-re-exported
