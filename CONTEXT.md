@@ -69,6 +69,10 @@ _Avoid_: serializer, serde, marshaller (encoder/decoder are the two directions *
 The active interest in a subject that `subscribe` returns synchronously, delivering each matching message to its handler until unsubscribed or drained. May belong to a queue group.
 _Avoid_: subscriber, listener
 
+**Unsubscribe**:
+Ending a subscription *abruptly*: the server is told to stop and any not-yet-delivered messages are dropped, returning `nil` synchronously. Contrast *draining* a subscription, which delivers the already-buffered messages first and is awaitable — both end a subscription, but unsubscribe discards the backlog where drain flushes it. An optional `max` makes the subscription auto-unsubscribe once it has received that many messages over its lifetime (counted from subscription start; messages already delivered past the limit are never recalled).
+_Avoid_: cancel, stop, remove (a *Subscription* is unsubscribed; a *Connection* is closed)
+
 **Queue group**:
 A named set of subscriptions to the same subject among which the server load-balances, so each message reaches exactly one member. Selected with the `:queue` option on `subscribe`.
 _Avoid_: consumer group, worker pool
