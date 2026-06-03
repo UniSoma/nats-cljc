@@ -6,7 +6,7 @@ type: feature
 priority: 2
 mode: afk
 created: '2026-05-29T22:23:06.980203620Z'
-updated: '2026-05-29T23:03:13.044582578Z'
+updated: '2026-06-03T02:09:43.923672742Z'
 acceptance:
 - title: '`nats-cljc.blocking.core` exists and is JVM-only (not compiled or loaded on ClojureScript)'
   done: false
@@ -18,9 +18,14 @@ acceptance:
   done: false
 - title: A JVM-only test suite exercises the connect -> subscribe -> take-message loop -> close path
   done: false
+- title: messages returns an IReduceInit (reduce/run!) of decoded messages that terminates on teardown
+  done: false
+- title: unsubscribe/drain/active? wired over the PullSubscription handle; :capacity validated (non-positive throws :type :invalid-capacity); abrupt teardown clears + poisons the buffer, unblocking a parked producer
+  done: false
 deps:
 - nts-01kstxatbw6k
 - nts-01kstzmd6d2v
+- nts-01kt5jvdy5s1
 ---
 
 ## Description
@@ -40,3 +45,27 @@ Added dependency on nts-01kstxatbw6k (Error-model completion across both clients
 Rationale: the criterion "a failed one-shot throws an `ex-info` carrying the same canonical `:type` as the async core rejected promise" requires the normalized error model to exist. The body already says "ships after slices 2-9", but `deps` listed only #7 (nts-01kstxa377qb), so `knot ready` would have surfaced this the moment #7 closed. The #9 edge transitively enforces the #3/#4/#7 -> #2 ordering.
 
 Cleared `needs-triage` -> ready-for-agent (mode afk).
+
+## Design
+
+Resolved in a grilling session (2026-06-03, grill-with-docs). ADR 0008 Consequences amended with the concrete overflow/teardown contract; CONTEXT.md gained a **Pull subscription** glossary term.
+
+### Layer shape
+- `nats-cljc.blocking.core` is a plain `.clj` file (`src/nats_cljc/blocking/core.clj`) — JVM-only by being `.clj` (shadow-cljs never loads it), not a `.cljc` with reader conditionals. A **pure consumer of `nats-cljc.core`**: no protocol/impl access.
+
+### Verb surface (single-require swap from the async core)
+- **Block-and-unwrap one-shots** — `connect`, `request`, `flush`, `drain`, `close`: deref the `CompletableFuture` through a private `await!` that peels `ExecutionException` → `CompletionException` → cause, so the bare canonical `ex-info` (same `:type` as the async reject) is thrown.
+- **Plain `def` aliases** — `publish`, `reply`, `version` (already synchronous).
+- **Pull reshape** — `subscribe`, `take-message`, `messages`, plus pull-aware `unsubscribe`/`drain`/`active?` as thin wrappers over the handle (NOT plain aliases — the handle is our wrapper record, not the async `Sub`).
+- `request` may add a 3-arity `(request conn subject data)` defaulting `{}` (a superset of async's 4-arity, so require-swap parity holds; implementer's call).
+
+### Pull model
+- `(subscribe conn subject)` / `(subscribe conn subject opts)` — no handler arg; returns an opaque `PullSubscription` record (inner async sub + bounded `BlockingQueue`). opts: `:codec`, `:queue`, `:capacity` (default 1024, bounded-only, throws `:invalid-capacity` on a non-positive value), passthrough `:on-error`/`:max-pending`.
+- Internal enqueuing handler uses **blocking `.put`** — backpressure, never drop. Under Road 2 (ADR 0007) the dispatcher thread is already blocked on the handler's `CompletionStage`, so `.put` adds no new pinning; backlog builds in jnats' own queue and its native 512K/64MB ceiling stays the floor.
+- `(take-message sub)` blocks until a message or end-of-stream; `(take-message sub timeout-ms)` blocks up to the timeout (`0` = poll). Returns the decoded `{:subject :data :reply (:headers)}` map, or **`nil` for both timeout and end-of-stream** — disambiguate with `(active? sub)` (false once the sub has ended AND the buffer is drained). A poison-pill enqueued on teardown wakes blocked takers.
+- `(messages sub)` → **`IReduceInit`** (use `reduce`/`run!`, not bare `doseq`); terminates on its own at end-of-stream.
+- **Teardown:** `unsubscribe` (abrupt — clears + poisons, which also unblocks any producer parked in `.put`; returns `nil` synchronously, idempotent); `drain(sub)` (graceful — flushes the buffer, so requires concurrent consumption); connection `close`/`drain` poison every pull sub.
+- **Errors:** passthrough — decode failures / `:slow-consumer` reach `:on-error`/`:on-status` exactly as async; the queue carries only decoded messages; `take-message` never throws mid-stream; the sub survives decode errors.
+
+### Tests
+JVM-only `test/nats_cljc/blocking/core_test.clj` over TCP `:4222`: named path; one-shot-throws-canonical-type (`:no-responders`, `:connect-failed`); sync `connect`/`close`; timeout/poll; poison-termination + `active?`; `messages`; `unsubscribe` idempotent; `:invalid-capacity`; overflow-via-small-`:capacity` (no loss under a slow consumer — a robustness test, not a timing assertion).
