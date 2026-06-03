@@ -6,7 +6,7 @@ type: feature
 priority: 1
 mode: afk
 created: '2026-06-03T01:51:29.733323655Z'
-updated: '2026-06-03T12:56:57.098439770Z'
+updated: '2026-06-03T17:36:44.252981133Z'
 closed: '2026-06-03T12:56:57.098439770Z'
 tags:
 - subscription
@@ -22,6 +22,8 @@ acceptance:
   done: true
 - title: README/CONTEXT/ADR-0012 stay accurate; suite green on JVM + Node (browser CI-only per ADR 0010)
   done: true
+links:
+- nts-01kt78y774j0
 ---
 
 ## Description

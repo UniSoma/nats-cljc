@@ -1,31 +1,34 @@
 ---
 id: nts-01kstxb0758h
 title: Blocking convenience layer (Phase 1.5, JVM-only)
-status: open
+status: closed
 type: feature
 priority: 2
 mode: afk
 created: '2026-05-29T22:23:06.980203620Z'
-updated: '2026-06-03T02:09:43.923672742Z'
+updated: '2026-06-03T17:57:48.553629424Z'
+closed: '2026-06-03T17:57:48.553629424Z'
 acceptance:
 - title: '`nats-cljc.blocking.core` exists and is JVM-only (not compiled or loaded on ClojureScript)'
-  done: false
+  done: true
 - title: '`connect` and `close` block and return / complete synchronously'
-  done: false
+  done: true
 - title: '`subscribe` returns a pull handle; `(take-message sub timeout-ms)` blocks for at most the timeout and returns the next `{:subject :data}` or `nil`, draining in order from a bounded queue'
-  done: false
+  done: true
 - title: A failed one-shot throws an `ex-info` carrying the same canonical `:type` as the async core rejected promise
-  done: false
+  done: true
 - title: A JVM-only test suite exercises the connect -> subscribe -> take-message loop -> close path
-  done: false
+  done: true
 - title: messages returns an IReduceInit (reduce/run!) of decoded messages that terminates on teardown
-  done: false
+  done: true
 - title: unsubscribe/drain/active? wired over the PullSubscription handle; :capacity validated (non-positive throws :type :invalid-capacity); abrupt teardown clears + poisons the buffer, unblocking a parked producer
-  done: false
+  done: true
 deps:
 - nts-01kstxatbw6k
 - nts-01kstzmd6d2v
 - nts-01kt5jvdy5s1
+links:
+- nts-01kt78y774j0
 ---
 
 ## Description
@@ -45,6 +48,17 @@ Added dependency on nts-01kstxatbw6k (Error-model completion across both clients
 Rationale: the criterion "a failed one-shot throws an `ex-info` carrying the same canonical `:type` as the async core rejected promise" requires the normalized error model to exist. The body already says "ships after slices 2-9", but `deps` listed only #7 (nts-01kstxa377qb), so `knot ready` would have surfaced this the moment #7 closed. The #9 edge transitively enforces the #3/#4/#7 -> #2 ordering.
 
 Cleared `needs-triage` -> ready-for-agent (mode afk).
+
+**2026-06-03T17:54:10.877288840Z**
+
+Post-implementation review (code-review medium + grill-with-docs, 2026-06-03) over the staged blocking layer surfaced 3 findings; dispositions:
+- drain pull-sub deadlock: document-as-intended — ADR 0008 already requires concurrent consumption; fixed the docstring off-by-one ('exceeds'->'reaches' capacity). No behaviour change.
+- subscribe->registry close race: real bug, fixed now — folded a :closed? flag into the registry atom so a sub going live in the subscribe->register window is poisoned by whichever side wins the CAS. Added a white-box regression test. JVM suite green (78 tests / 170 assertions).
+- dropped unsubscribe [sub max] arity: deliberate fast-follow — documented the gap in the blocking unsubscribe docstring; parity tracked in nts-01kt78y774j0.
+
+**2026-06-03T17:57:48.553629424Z**
+
+Shipped the JVM-only blocking convenience layer (nats-cljc.blocking.core): pull subscriptions over a bounded BlockingQueue drained by take-message/messages, block-and-unwrap one-shots (connect/request/flush/drain/close), plain aliases (publish/reply/version), and pull-aware unsubscribe/drain/active?. Backpressure-never-drop via blocking enqueue; teardown poisons buffers (abrupt unsubscribe + connection close/drain). Post-implementation review (grill-with-docs) fixed a subscribe->registry close race (combined-atom CAS), clarified drain's concurrent-consumption docstring off-by-one, and deferred unsubscribe [sub max] parity to nts-01kt78y774j0. JVM 78/170 green, Node 62/118 green, clj-kondo clean.
 
 ## Design
 
