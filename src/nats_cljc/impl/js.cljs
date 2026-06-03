@@ -272,17 +272,32 @@
     wait-ms                (assoc :reconnectTimeWait wait-ms)
     jitter-ms              (assoc :reconnectJitter jitter-ms)))
 
+(defn- auth-variant
+  "Derive the tagged `:auth` variant — exactly one of :token / :user-pass / :nkey /
+   :jwt / :creds, or nil when no auth is configured. The shapes are mutually
+   exclusive, so each is keyed off its own discriminating field; :seed is therefore
+   read by exactly one variant (:jwt when a jwt is present, else :nkey) rather than
+   shared across two. A stray field beside another shape can no longer silently
+   switch methods."
+  [{:keys [token user nkey jwt creds]}]
+  (cond
+    token :token
+    user  :user-pass
+    jwt   :jwt
+    nkey  :nkey
+    creds :creds))
+
 (defn- with-auth
-  "Merge the `:auth` connect-option into the nats-core options map. The auth seam
-   the advanced-auth slices extend."
-  [opts {:keys [token user pass nkey seed jwt creds]}]
-  (cond-> opts
-    token (assoc :token token)
-    user  (assoc :user user :pass pass)
-    seed  (assoc :authenticator (if jwt
-                                  (nats-core/jwtAuthenticator jwt (->bytes seed))
-                                  (nkey-authenticator nkey seed)))
-    creds (assoc :authenticator (nats-core/credsAuthenticator (->bytes creds)))))
+  "Merge the `:auth` connect-option into the nats-core options map, dispatching on
+   the explicit `auth-variant`. The auth seam the advanced-auth slices extend."
+  [opts {:keys [token user pass nkey seed jwt creds] :as auth}]
+  (case (auth-variant auth)
+    :token     (assoc opts :token token)
+    :user-pass (assoc opts :user user :pass pass)
+    :nkey      (assoc opts :authenticator (nkey-authenticator nkey seed))
+    :jwt       (assoc opts :authenticator (nats-core/jwtAuthenticator jwt (->bytes seed)))
+    :creds     (assoc opts :authenticator (nats-core/credsAuthenticator (->bytes creds)))
+    nil        opts))
 
 (defn connect
   "Open a WebSocket connection to `:servers`, returning a js/Promise that resolves
