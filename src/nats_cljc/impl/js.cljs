@@ -78,6 +78,17 @@
     (ex-info "Connection is draining" {:type :drained :subject subject})
     (ex-info "Connection is closed" {:type :connection-closed :subject subject})))
 
+(defn- max-payload-error
+  "Build the `:max-payload-exceeded` ex-info for an over-max publish/request (ADR
+   0006). nats.js raises a bare InvalidArgumentError only for over-max at our call
+   sites (subject is validated separately, and we never pass reply/noMux/headers),
+   so the type match at the call site IS the discrimination — no size check needed,
+   unlike the JVM where IllegalArgumentException is ambiguous."
+  [^js client subject bytes]
+  (ex-info "Message payload exceeds the server's max payload"
+           {:type :max-payload-exceeded :subject subject
+            :size (.-length bytes) :max (some-> (.-info ^js client) .-max_payload)}))
+
 (defn- consume!
   "Drive a no-callback nats.js Subscription as an async-iterable (road 2, ADR
    0007): a detached `.next` loop (mirroring `pump-status!`) awaits the handler
@@ -123,8 +134,9 @@
   (-publish [_ subject headers bytes]
     ;; The headers map rides in nats.js' PublishOptions; omit it for a plain
     ;; publish (no header frame on the wire). nats.js rejects an over-max payload
-    ;; with an InvalidArgumentError; normalize it to a synchronous
-    ;; `:max-payload-exceeded` (fire-and-forget has no promise to reject — ADR 0006).
+    ;; with an InvalidArgumentError; normalize it via the shared helper to a
+    ;; synchronous `:max-payload-exceeded` (fire-and-forget has no promise to
+    ;; reject — ADR 0006).
     (try
       (if-let [h (->headers headers)]
         (.publish ^js client subject bytes #js {:headers h})
@@ -132,9 +144,7 @@
       (catch :default e
         (cond
           (instance? nats-core/InvalidArgumentError e)
-          (throw (ex-info "Message payload exceeds the server's max payload"
-                          {:type :max-payload-exceeded :subject subject
-                           :size (.-length bytes) :max (some-> (.-info ^js client) .-max_payload)}))
+          (throw (max-payload-error client subject bytes))
           ;; A closed or draining connection refuses the publish (nats.js, unlike
           ;; jnats, rejects a draining publish too); normalize by drain state (ADR 0006).
           (instance? nats-core/ClosedConnectionError e)
@@ -192,6 +202,11 @@
                            (timeout? e)
                            (ex-info "Request timed out"
                                     {:type :timeout :subject subject :timeout-ms timeout-ms})
+                           ;; An over-max payload rejects with a bare
+                           ;; InvalidArgumentError (nats.js cancels the mux entry);
+                           ;; normalize it to `:max-payload-exceeded` (ADR 0006).
+                           (instance? nats-core/InvalidArgumentError e)
+                           (max-payload-error client subject bytes)
                            ;; A closed or draining connection rejects the request
                            ;; with `:connection-closed` (retry-able) or `:drained`,
                            ;; by drain state (ADR 0006).
@@ -336,5 +351,19 @@
   "Map `f` over the value the native promise `p` resolves to, returning a new
    native promise. The facade uses it to decode a raw message map without touching
    nats.js' Msg type (ADR 0005); a rejection propagates untouched."
+  [p f]
+  (.then ^js p f))
+
+(defn resolved
+  "An already-resolved native promise of `x` — the seed of a promise chain so the
+   first stage's throw rejects instead of escaping synchronously (ADR 0002/0006)."
+  [x]
+  (js/Promise.resolve x))
+
+(defn bind
+  "Like `then`, but `f` returns a native promise to be flattened into the result.
+   The facade uses it to splice an async `-request` into an encode/decode chain;
+   `.then` already flattens a returned thenable, so on JS bind is `then` (the
+   distinction matters on the JVM, where thenApply does not flatten)."
   [p f]
   (.then ^js p f))

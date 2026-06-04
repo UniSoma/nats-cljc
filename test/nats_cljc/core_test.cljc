@@ -98,6 +98,10 @@
 ;; requester's reply arrives on a per-request inbox the client manages.
 (def ^:private request-subject "rr.request")
 
+;; A distinct request subject for the 3-arity (no-opts) path, so it can't
+;; cross-feed with the explicit-timeout round-trip on the shared server.
+(def ^:private request-default-subject "rr.default")
+
 ;; A subject no test ever subscribes — exercises the :no-responders failure mode.
 (def ^:private no-responders-subject "rr.no-responders")
 
@@ -986,6 +990,56 @@
                                 (is (contains? resp :reply) "resolved message always carries a :reply key")
                                 (is (nil? @replied) "reply returns nil"))))))))))
 
+;; AC1: the documented 3-arity `(request conn subject data)` exists and issues a
+;; request with the 5000 ms default timeout — kept separate from the 4-arity
+;; round-trip so the explicit-timeout path keeps its own coverage.
+(deftest request-3-arity-uses-default-timeout
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (nats/subscribe conn request-default-subject
+                         (fn [msg] (nats/reply conn msg {:pong (:n (:data msg))})))
+         (let [resp (deref (nats/request conn request-default-subject {:n 7}) 5000 ::timeout)]
+           (is (not= ::timeout resp) "3-arity request resolves within the 5000 ms default")
+           (is (= {:pong 7} (:data resp)) "3-arity request resolves to the decoded reply payload"))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (nats/subscribe conn request-default-subject
+                                (fn [msg] (nats/reply conn msg {:pong (:n (:data msg))})))
+                (-> (p/timeout (nats/request conn request-default-subject {:n 7}) 5000)
+                    (p/then (fn [resp]
+                              (is (= {:pong 7} (:data resp))
+                                  "3-arity request resolves to the decoded reply payload")))))))))
+
+;; AC2: request encodes its payload inside the promise chain, so an encode
+;; failure (`:bytes` codec on a non-byte value — codec_test proves it throws
+;; :codec-error on both legs) REJECTS the returned promise rather than throwing
+;; synchronously at the call site. The JVM leg splits the call from the deref so
+;; a regression throws where `p` is bound, not in the caught deref. No responder
+;; is needed — encode fails before anything reaches the wire.
+(deftest request-encode-failure-rejects
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [p (nats/request conn codec-error-subject "not bytes" {:codec :bytes})]
+           (is (= :codec-error
+                  (try (deref p 2000 ::timeout)
+                       nil
+                       (catch java.util.concurrent.ExecutionException e
+                         (:type (ex-data (.getCause e))))))
+               "an encode failure rejects with :codec-error rather than throwing synchronously"))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (-> (nats/request conn codec-error-subject "not bytes" {:codec :bytes})
+                    (p/then (fn [_] (is false "expected the request to reject with :codec-error")))
+                    (p/catch (fn [e]
+                               (is (= :codec-error (:type (ex-data e)))
+                                   "an encode failure rejects with :codec-error rather than throwing synchronously")))))))))
+
 ;; AC1: a per-call :codec overrides the connection default on request, and reply
 ;; gains an opts arity so the response leg matches. The connection defaults to
 ;; :edn; the requester sends "hi" with :codec :string and the responder both
@@ -1287,10 +1341,12 @@
                                "connecting to a dead server rejects with :connect-failed")))
                 (p/finally (fn [_ _] (done)))))))
 
-;; :max-payload-exceeded (ADR 0006): a publish whose bytes exceed the server's
-;; max_payload throws synchronously — fire-and-forget has no promise to reject —
-;; with a normalized `:type :max-payload-exceeded`. ~1.1 MB vs the default 1 MB.
-(deftest max-payload-exceeded-throws
+;; :max-payload-exceeded (ADR 0006): bytes exceeding the server's max_payload are
+;; normalized to a `:type :max-payload-exceeded` on both verbs. publish has no
+;; promise so it throws synchronously; request rejects its promise (never a raw
+;; native throw). ~1.1 MB vs the default 1 MB. The two verbs discriminate over-max
+;; identically — both ride the shared `max-payload-error` helper.
+(deftest max-payload-exceeded-normalized
   (let [big (apply str (repeat 1100000 \x))]
     #?(:clj
        (with-conn {:servers [server-url]}
@@ -1299,7 +1355,12 @@
                   (try (nats/publish conn payload-subject big)
                        :no-throw
                        (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
-               "an oversized publish throws :max-payload-exceeded")))
+               "an oversized publish throws :max-payload-exceeded")
+           (is (= :max-payload-exceeded
+                  (try (deref (nats/request conn payload-subject big {:timeout-ms 500}) 2000 ::timeout)
+                       nil
+                       (catch java.util.concurrent.ExecutionException e (:type (ex-data (.getCause e))))))
+               "an oversized request rejects with :max-payload-exceeded")))
        :cljs
        (async done
               (with-conn {:servers [server-url]} done
@@ -1308,7 +1369,12 @@
                          (try (nats/publish conn payload-subject big)
                               :no-throw
                               (catch :default e (:type (ex-data e)))))
-                      "an oversized publish throws :max-payload-exceeded")))))))
+                      "an oversized publish throws :max-payload-exceeded")
+                  (-> (nats/request conn payload-subject big {:timeout-ms 500})
+                      (p/then (fn [_] (is false "expected the request to reject with :max-payload-exceeded")))
+                      (p/catch (fn [e]
+                                 (is (= :max-payload-exceeded (:type (ex-data e)))
+                                     "an oversized request rejects with :max-payload-exceeded"))))))))))
 
 ;; :connection-closed (ADR 0006): operating on a closed connection. publish has
 ;; no promise so it throws synchronously; request rejects its promise. Both carry

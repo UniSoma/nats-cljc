@@ -132,10 +132,19 @@
    with an `ex-info` whose `:type` is `:no-responders` (nobody subscribes
    `subject`) or `:timeout` (responders exist but none answer within
    `:timeout-ms`) (ADR 0006)."
-  [conn subject data opts]
-  (let [codec (effective-codec conn opts)]
-    (impl/then (proto/-request conn subject (codec/encode codec data) (:timeout-ms opts 5000))
-               (fn [raw] (decode-msg codec raw)))))
+  ([conn subject data] (request conn subject data {}))
+  ([conn subject data opts]
+   ;; Encode and decode are BOTH `then` stages and `-request` is the lone
+   ;; flattening `bind`, so an encode failure rejects the returned promise exactly
+   ;; as a reply-decode failure already does — never a synchronous throw at the
+   ;; call site (ADR 0006). `effective-codec` is a pure `or` (can't throw), so the
+   ;; encode is the only sync-throw site, and seeding from a resolved promise turns
+   ;; its throw into a rejection.
+   (let [codec (effective-codec conn opts)]
+     (-> (impl/resolved nil)
+         (impl/then (fn [_]     (codec/encode codec data)))
+         (impl/bind (fn [bytes] (proto/-request conn subject bytes (:timeout-ms opts 5000))))
+         (impl/then (fn [raw]   (decode-msg codec raw)))))))
 
 (defn reply
   "Reply to a request message `msg` with `data`, encoding it with the connection's

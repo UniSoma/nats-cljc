@@ -78,6 +78,20 @@
       (ex-info "Connection is closed" {:type :connection-closed :subject subject} e)
       :else e)))
 
+(defn- max-payload-error
+  "Normalize an IllegalArgumentException from a publish/request to a typed
+   `:max-payload-exceeded` ex-info (ADR 0006) when `bytes` actually exceeds the
+   connection's max payload, else return the original exception to rethrow. jnats
+   throws IllegalArgumentException for an over-max payload AND for a bad subject,
+   so discriminate by SIZE rather than blanket-mapping the type — keeping publish
+   and request from diverging on what counts as over-max."
+  [^Connection client subject ^bytes bytes ^Throwable e]
+  (let [max (.getMaxPayload client)]
+    (if (and (pos? max) (> (alength bytes) max))
+      (ex-info "Message payload exceeds the server's max payload"
+               {:type :max-payload-exceeded :subject subject :size (alength bytes) :max max} e)
+      e)))
+
 (defrecord JvmSubscription [^Subscription sub registry ^Dispatcher dispatcher]
   proto/Drainable
   ;; jnats sub.drain returns a CompletableFuture<Boolean> that settles once the
@@ -109,17 +123,14 @@
     ;; The headers map selects jnats' publish(subject, Headers, body) overload; a
     ;; nil headers map is a plain publish (no header frame on the wire). jnats
     ;; rejects an over-max payload with an IllegalArgumentException; normalize it
-    ;; to a synchronous `:max-payload-exceeded` (fire-and-forget has no promise to
-    ;; reject — ADR 0006).
+    ;; via the shared helper to a synchronous `:max-payload-exceeded` (fire-and-forget
+    ;; has no promise to reject — ADR 0006). A non-over-max IAE rethrows raw.
     (try
       (if-let [^Headers h (->headers headers)]
         (.publish client ^String subject h ^bytes bytes)
         (.publish client ^String subject ^bytes bytes))
       (catch IllegalArgumentException e
-        (throw (ex-info "Message payload exceeds the server's max payload"
-                        {:type :max-payload-exceeded :subject subject
-                         :size (alength ^bytes bytes) :max (.getMaxPayload client)}
-                        e)))
+        (throw (max-payload-error client subject bytes e)))
       ;; A closed connection refuses the publish; surface it as the retry-able
       ;; `:connection-closed` (publish is allowed during drain, so it never sees
       ;; `:drained`). `op-state-error` returns the original for unrecognized states.
@@ -193,7 +204,9 @@
     ;; promise rejects with it.
     ;; A closed or draining connection makes requestWithTimeout throw
     ;; synchronously; convert that to a rejected future so request rejects (never
-    ;; throws) with `:connection-closed` (retry-able) or `:drained` (ADR 0006).
+    ;; throws) with `:connection-closed` (retry-able) or `:drained`. An over-max
+    ;; payload throws IllegalArgumentException synchronously the same way; the
+    ;; shared helper normalizes it to a rejected `:max-payload-exceeded` (ADR 0006).
     (try
       (.handle ^CompletableFuture (.requestWithTimeout client ^String subject ^bytes bytes (Duration/ofMillis timeout-ms))
                (reify BiFunction
@@ -209,6 +222,11 @@
                                      {:type :no-responders :subject subject}))
                      :else
                      (throw ex)))))
+      (catch IllegalArgumentException e
+        (let [x (max-payload-error client subject bytes e)]
+          (if (identical? x e)
+            (throw e)
+            (CompletableFuture/failedFuture x))))
       (catch IllegalStateException e
         (let [x (op-state-error subject e)]
           (if (identical? x e)
@@ -375,3 +393,18 @@
    jnats' Message type (ADR 0005); a rejection propagates untouched."
   [^CompletableFuture p f]
   (.thenApply p (reify Function (apply [_ x] (f x)))))
+
+(defn resolved
+  "An already-resolved native promise of `x` — the seed of a promise chain so the
+   first stage's throw rejects instead of escaping synchronously (ADR 0002/0006)."
+  [x]
+  (CompletableFuture/completedFuture x))
+
+(defn bind
+  "Like `then`, but `f` returns a native promise that is flattened into the
+   result (thenApply does NOT flatten on the JVM, hence the distinct primitive).
+   The facade uses it to splice an async `-request` into an encode/decode chain
+   without nesting a CompletableFuture<CompletableFuture>; a rejection propagates
+   untouched, and the cause stays flat (no extra CompletionException layer)."
+  [^CompletableFuture p f]
+  (.thenCompose p (reify Function (apply [_ x] (f x)))))
