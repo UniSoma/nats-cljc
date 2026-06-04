@@ -1292,6 +1292,55 @@
                             (catch :default e (:type (ex-data e)))))
                     "a nil header value is rejected as :invalid-header, not silently dropped"))))))
 
+;; An invalid header NAME — one that is not a printable-ASCII token (here a colon,
+;; the name/value delimiter) — is caller misuse. Left unvalidated it reaches the
+;; native client, whose throw publish would otherwise mislabel as the unrelated
+;; :max-payload-exceeded (a header-name typo surfacing as a payload-size error).
+;; normalize-headers rejects it synchronously with a portable `:type :invalid-header`
+;; on every leg, before the wire (CONTEXT: Headers).
+(deftest headers-invalid-name-rejected
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (is (= :invalid-header
+                (try (nats/publish conn "headers.invalid" payload {:headers {"Bad:Name" "x"}})
+                     :no-throw
+                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+             "a header name containing a colon is rejected as :invalid-header, never :max-payload-exceeded")))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (is (= :invalid-header
+                       (try (nats/publish conn "headers.invalid" payload {:headers {"Bad:Name" "x"}})
+                            :no-throw
+                            (catch :default e (:type (ex-data e)))))
+                    "a header name containing a colon is rejected as :invalid-header, never :max-payload-exceeded"))))))
+
+;; A non-ASCII header VALUE is where the native clients silently diverge: jnats
+;; rejects it, nats.js publishes it (CONTEXT: Headers). normalize-headers pins one
+;; rule — values must be printable ASCII (CR/LF and any non-ASCII rejected) — so a
+;; non-ASCII value is rejected synchronously with the same `:type :invalid-header`
+;; on every leg, before the wire.
+(deftest headers-non-ascii-value-rejected
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (is (= :invalid-header
+                (try (nats/publish conn "headers.invalid" payload {:headers {"X-Trace" "café"}})
+                     :no-throw
+                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+             "a non-ASCII header value is rejected as :invalid-header identically on both legs")))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (is (= :invalid-header
+                       (try (nats/publish conn "headers.invalid" payload {:headers {"X-Trace" "café"}})
+                            :no-throw
+                            (catch :default e (:type (ex-data e)))))
+                    "a non-ASCII header value is rejected as :invalid-header identically on both legs"))))))
+
 ;; A non-positive :max-pending is caller misuse — it would otherwise arm a zero
 ;; (or sentinel-unbounded) native cap and silently deafen the subscription — so
 ;; subscribe rejects it synchronously with a portable `:type :invalid-max-pending`
