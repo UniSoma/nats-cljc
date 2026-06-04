@@ -232,3 +232,11 @@
    subscriptions; a final `:closed` status reaches `:on-status` (ADR 0002/0006)."
   [conn]
   (proto/-close conn))
+
+(defn subject
+  "Compose the canonical dot-delimited Subject string from `parts`, each
+   stringified and joined with `.` — e.g. (subject \"orders\" id \"created\")
+   => \"orders.<id>.created\". The string form is canonical; this is just sugar
+   for building one from its tokens (CONTEXT: Subject)."
+  [& parts]
+  (str/join "." parts))

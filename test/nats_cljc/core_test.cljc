@@ -1729,3 +1729,15 @@
                                 (p/finally (fn [_ _] (p/resolve! gate nil) (close! conn)))))))
                 (p/catch (fn [e] (is false (str "drain-window test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
+
+;; The `subject` builder is pure sugar for composing the canonical dot-delimited
+;; Subject string from parts (CONTEXT: Subject) — no connection, no async — so
+;; these run identically on both legs straight from the .cljc, with no server.
+(deftest subject-builds-the-documented-example
+  (let [id "123"]
+    (is (= "orders.123.created" (nats/subject "orders" id "created"))
+        "(subject \"orders\" id \"created\") dot-joins its parts into orders.<id>.created")))
+
+(deftest subject-stringifies-non-string-parts
+  (is (= "orders.123.created" (nats/subject "orders" 123 "created"))
+      "a non-string part (here a number) is stringified before the dot-join"))
