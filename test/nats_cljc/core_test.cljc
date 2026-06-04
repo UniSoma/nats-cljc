@@ -261,6 +261,19 @@
             (with-conn {:servers [server-url]} done
               (fn [conn] (is (some? conn) "connect resolves to a non-nil Connection"))))))
 
+;; `:servers` is the one non-portable value documented as a string in the README
+;; quick-start. nats.js normalizes a bare string to a one-element list; the JVM
+;; must do the same before (into-array String ...) seqs the string into chars
+;; and throws "array element type mismatch".
+(deftest connect-accepts-string-servers
+  #?(:clj
+     (with-conn {:servers server-url}
+       (fn [conn] (is (some? conn) "string :servers connects on the JVM")))
+     :cljs
+     (async done
+            (with-conn {:servers server-url} done
+              (fn [conn] (is (some? conn) "string :servers connects on CLJS"))))))
+
 ;; The five happy-path auth shapes (one named deftest each, sharing `auth-cases` +
 ;; the connect/teardown envelope): connecting against the matching server resolves
 ;; to a Connection.

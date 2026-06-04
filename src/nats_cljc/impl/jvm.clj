@@ -364,7 +364,12 @@
        ;; reconnect? gates the synthesized :reconnecting: it is on unless the
        ;; caller explicitly disabled reconnection with :reconnect {:max 0} (0 is
        ;; jnats' "off" sentinel; absent :max keeps the client default, which is on).
-       (let [reconnect?    (not= 0 (:max reconnect))
+       (let [;; A bare-string :servers is the one non-portable value the README
+             ;; quick-start documents; nats.js normalizes it to a one-element list,
+             ;; so the JVM does too — otherwise (into-array String ...) seqs the
+             ;; string into chars and throws "array element type mismatch".
+             servers       (cond-> servers (string? servers) vector)
+             reconnect?    (not= 0 (:max reconnect))
              ;; dispatcher→sink registry the ErrorListener routes slowConsumerDetected
              ;; through, and -subscribe assocs into (ADR 0006/0007).
              registry      (atom {})
