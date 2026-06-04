@@ -1,6 +1,7 @@
 (ns nats-cljc.core-test
   (:require #?(:clj  [clojure.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is async]])
+            [clojure.string :as str]
             [nats-cljc.core :as nats]
             [nats-cljc.codec :as codec]
             [nats-cljc.error :as error]
@@ -316,6 +317,52 @@
        :cljs
        (async done
               (with-conn {:servers [server] :auth auth} done (fn [conn] (is (some? conn) msg)))))))
+
+;; The `:name` connect-option (nts-01kt87wh29be). Both legs wire it to the native
+;; connection name (jnats `.connectionName` / nats.js `name`), where it surfaces
+;; in the anonymous server's /connz monitoring (http_port in ci/nats.conf).
+;; Distinct per leg so a JVM and a Node connection that briefly coexist on the
+;; shared server can't make each other's connz assertion pass.
+(def ^:private connection-name
+  #?(:clj "orders-service-jvm" :cljs "orders-service-node"))
+
+(def ^:private monitor-connz-url "http://127.0.0.1:8222/connz")
+
+;; Read the anonymous server's /connz as a string — a blocking slurp on the JVM,
+;; a js/fetch→text promise on Node — so a test can assert a connection name
+;; reached the server's monitoring view rather than just the client's options.
+#?(:clj  (defn- connz [] (slurp monitor-connz-url))
+   :cljs (defn- connz [] (-> (js/fetch monitor-connz-url) (p/then #(.text %)))))
+
+(deftest connect-name-reaches-the-server
+  #?(:clj
+     (with-conn {:servers [server-url] :name connection-name}
+       (fn [_]
+         (is (str/includes? (connz) connection-name)
+             ":name surfaces in the server's /connz connection info")))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url] :name connection-name} done
+              (fn [_]
+                (-> (connz)
+                    (p/then (fn [body]
+                              (is (str/includes? body connection-name)
+                                  ":name surfaces in the server's /connz connection info")))))))))
+
+;; Omitting :name must not override the native default; the connection then
+;; carries no name (jnats reports nil, nats.js leaves the option unset).
+(deftest connect-without-name-keeps-the-native-default
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (is (nil? (.getConnectionName (.getOptions ^io.nats.client.Connection (:client conn))))
+             "omitting :name leaves jnats' default (no connection name)")))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (is (nil? (.-name (.-options ^js (:client conn))))
+                    "omitting :name leaves nats.js' default (no connection name)"))))))
 
 (deftest auth-with-mismatched-nkey-rejects
   #?(:clj

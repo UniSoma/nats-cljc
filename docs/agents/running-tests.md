@@ -7,7 +7,7 @@ One portable `.cljc` suite (`test/nats_cljc/`) runs on every platform. **Locally
 Every leg talks to a real server — no mocks. NATS forces anonymous, token, and operator/JWT auth onto separate servers, but static users combine, so four servers cover every leg:
 
 ```bash
-nats-server -c ci/nats.conf       &   # anonymous            — TCP :4222 / ws :8080
+nats-server -c ci/nats.conf       &   # anonymous            — TCP :4222 / ws :8080 / http :8222 (monitoring)
 nats-server -c ci/nats-token.conf &   # token                — TCP :4223 / ws :8081
 nats-server -c ci/nats-users.conf &   # user/pass + nkey     — TCP :4224 / ws :8082
 nats-server -c ci/nats-jwt.conf   &   # jwt + creds          — TCP :4225 / ws :8083

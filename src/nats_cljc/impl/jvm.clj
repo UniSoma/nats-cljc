@@ -352,7 +352,7 @@
   "Open a TCP connection to the first of `:servers`, resolving a CompletableFuture
    to a JvmConnection (ADR 0002: connect returns the platform-native promise).
    `:codec` defaults to :edn. `:auth` selects an auth method (e.g. `{:token ...}`)."
-  [{:keys [servers codec auth on-status reconnect] :or {codec :edn}}]
+  [{:keys [servers codec auth on-status reconnect name] :or {codec :edn}}]
   (CompletableFuture/supplyAsync
    (reify Supplier
      (get [_]
@@ -381,6 +381,10 @@
                                ;; tell the two failure modes apart (ADR 0006).
                                (.useTimeoutException)
                                (cond-> on-status (.connectionListener (status-listener on-status reconnect?)))
+                               ;; The connection name surfaces in the server's
+                               ;; monitoring (/connz); absent :name leaves jnats'
+                               ;; own default (no name) in place.
+                               (cond-> name (.connectionName name))
                                (.errorListener (error-listener on-status registry))
                                (with-reconnect reconnect)
                                (with-auth auth)

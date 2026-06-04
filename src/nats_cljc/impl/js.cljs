@@ -323,13 +323,18 @@
   "Open a WebSocket connection to `:servers`, returning a js/Promise that resolves
    to a JsConnection (ADR 0002). `:codec` defaults to :edn. `:auth` selects an auth
    method (e.g. `{:token ...}`)."
-  [{:keys [servers codec auth on-status reconnect] :or {codec :edn}}]
+  [{:keys [servers codec auth on-status reconnect name] :or {codec :edn}}]
   ;; A client-side auth error (e.g. an :nkey/seed mismatch) thrown while building
   ;; the options rejects the returned promise — with its own ex-info, unwrapped —
   ;; rather than throwing synchronously from connect (ADR 0002/0006: connect
   ;; rejects its promise). Only the wsconnect failure is wrapped as :connect-failed.
   (try
     (-> (nats-core/wsconnect (clj->js (-> {:servers servers}
+                                          ;; The connection name surfaces in the
+                                          ;; server's monitoring (/connz); absent
+                                          ;; :name leaves nats.js' own default in
+                                          ;; place.
+                                          (cond-> name (assoc :name name))
                                           (with-reconnect reconnect)
                                           (with-auth auth))))
         (.then (fn [nc]
