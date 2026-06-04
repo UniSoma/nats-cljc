@@ -42,16 +42,24 @@
 ;; teardown verbs act on the inner sub and poison the queue.
 (defrecord PullSubscription [inner ^BlockingQueue queue ended registry counter])
 
-(defn- poison!
-  "Drop any buffered messages and make the end-of-stream sentinel land at the
-   tail, even if the feeding producer races one last in-flight message back in
-   after the clear (abrupt teardown drops it). The bounded-wait enqueuing handler
-   stops the producer once `ended` is set, so at most one such message arrives and
-   this converges."
+(defn- poison-tail!
+  "Seat the end-of-stream sentinel at the tail without blocking: it lands after the
+   already-buffered messages, but on a full buffer evict the oldest (head) to make
+   room rather than block. Bounded — the bounded-wait enqueuing handler stops the
+   producer once `ended` is set, so at most one in-flight message races back in and
+   this converges (ADR 0013)."
   [^BlockingQueue queue]
-  (.clear queue)
   (while (not (.offer queue poison))
     (.poll queue)))
+
+(defn- poison!
+  "Abrupt teardown: drop any buffered messages, then seat the end-of-stream
+   sentinel. The leading `.clear` is the whole difference from graceful
+   `poison-tail!` — the backlog is discarded, not delivered (a producer racing one
+   last message back in after the clear is dropped the same way)."
+  [^BlockingQueue queue]
+  (.clear queue)
+  (poison-tail! queue))
 
 (defn- end-sub!
   "Mark a pull sub ended and poison its buffer to wake any parked `take-message`,
@@ -63,17 +71,19 @@
 
 (defn- end-after-max!
   "Graceful auto-end when a sub reaches its armed `max`: unlike abrupt
-   `unsubscribe`, the N already-buffered messages must still reach the consumer, so
-   this does NOT clear the buffer — it appends the end-of-stream sentinel at the
-   tail (after them), the same flush-then-poison shape as `drain`. The native inner
-   sub has already been told to stop at N, so only the blocking handle is finalized.
-   CAS-guarded on `ended` so it fires exactly once even if the enqueuing handler and
-   `unsubscribe` both observe N reached (and `.put` is skipped once another teardown
-   has already ended the sub)."
+   `unsubscribe`, the N already-buffered messages should still reach the consumer,
+   so this does NOT clear the buffer — `poison-tail!` seats the end-of-stream
+   sentinel after them. On a full buffer it cannot both block and stay synchronous
+   (ADR 0008/0012 require `unsubscribe` to return now), so it evicts the oldest to
+   seat the sentinel rather than hang; exactly-N reaches the consumer only when
+   `:capacity` > `max` (ADR 0013). The native inner sub has already been told to
+   stop at N, so only the blocking handle is finalized. CAS-guarded on `ended` so it
+   fires exactly once even if the enqueuing handler and `unsubscribe` both observe N
+   reached (and the seat is skipped once another teardown has already ended the sub)."
   [sub]
   (when (compare-and-set! (:ended sub) false true)
     (some-> (:registry sub) (swap! update :subs disj sub))
-    (.put ^BlockingQueue (:queue sub) poison)))
+    (poison-tail! (:queue sub))))
 
 (defn connect
   "Open a connection (blocking): the synchronous twin of `core/connect`. Returns
@@ -133,7 +143,9 @@
    `:type :invalid-capacity` ex-info — there is no unbounded escape hatch), plus
    the core's `:codec`/`:queue`/`:on-error`/`:max-pending`, passed through
    unchanged. A full buffer blocks the feeding dispatcher — backpressure, never
-   drop (ADR 0008)."
+   drop (ADR 0008). Keep `:capacity` greater than any `max` armed via `unsubscribe`
+   so a graceful auto-end still delivers all N buffered messages; at or below `max`,
+   a full buffer evicts the oldest to keep teardown non-blocking (ADR 0013)."
   ([conn subject] (subscribe conn subject {}))
   ([conn subject {:keys [capacity] :or {capacity 1024} :as opts}]
    ;; Fail fast on caller misuse before constructing the queue: ArrayBlockingQueue
@@ -229,8 +241,10 @@
    lifetime — counted from subscription start, consistent with the async core's
    `[sub max]` (ADR 0008/0012). Unlike the abrupt arity, the already-buffered N are
    still delivered (the consumer sees exactly N, in order) before
-   `take-message`/`messages` reach end-of-stream; if the sub has already received
-   `max`, it ends now. `max` must be a positive integer no greater than 2147483647
+   `take-message`/`messages` reach end-of-stream — guaranteed when `:capacity` >
+   `max`; on a full buffer (a `:capacity` ≤ `max` with a lagging consumer) the
+   oldest are evicted to keep teardown non-blocking (ADR 0013). If the sub has
+   already received `max`, it ends now. `max` must be a positive integer no greater than 2147483647
    (the JVM `Dispatcher.unsubscribe(sub, int)` cap), enforced before the native call
    — parity with core; anything else throws a `:type :invalid-max` ex-info."
   ([sub]

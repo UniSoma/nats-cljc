@@ -376,6 +376,55 @@
       (is (not (nats/active? sub)) "the sub is ended")
       (finally (nats/close conn)))))
 
+;; Regression — graceful auto-end must not hang on a full buffer (AC1/AC3, ADR 0013).
+;; capacity == max == 2 with no consumer: two messages fill the buffer, then arming
+;; `(unsubscribe sub 2)` finds received already == max and ends the sub. The sentinel
+;; can't fit, so `poison-tail!` evicts the oldest (head) to seat it and the call
+;; returns nil promptly — pre-fix the unbounded `.put` blocks here forever. capacity
+;; == max is below the `capacity > max` exactly-N guarantee, so this is the
+;; documented best-effort path: the consumer sees the most-recent message, in order.
+(deftest unsubscribe-max-on-a-full-buffer-returns-without-hang
+  (let [conn (nats/connect {:servers [server-url]})
+        sub  (nats/subscribe conn "blocking.unsub-max.full" {:capacity 2})]
+    (try
+      (dotimes [i 2] (nats/publish conn "blocking.unsub-max.full" i))
+      (Thread/sleep 300) ; let both messages fill the 2-slot buffer (no consumer)
+      ;; Deref once into a local — never an unbounded `@done`: if the bug regresses the
+      ;; future blocks forever, and the test must fail loudly, not hang the runner.
+      (let [result (deref (future (nats/unsubscribe sub 2)) 2000 ::timeout)]
+        (is (not= ::timeout result)
+            "unsubscribe with max returns promptly on a full buffer — no .put hang")
+        (is (nil? result) "...returning nil"))
+      (let [collected (future (reduce (fn [acc m] (conj acc (:data m))) [] (nats/messages sub)))
+            result    (deref collected 2000 ::timeout)]
+        (is (not= ::timeout result)
+            "messages terminates — the sentinel seated despite the full buffer, no hang")
+        (is (= [1] result)
+            "the oldest was evicted to seat the sentinel; the consumer sees the most-recent (ADR 0013)"))
+      (finally (nats/close conn)))))
+
+;; Regression — the handler-path auto-end must not pin the dispatcher (AC2, ADR 0013).
+;; Arm max=2 BEFORE any message (received 0, so no immediate end), capacity 2, then
+;; publish past capacity. The enqueue handler offers the first two, hits max on the
+;; now-full buffer, and ends the sub *on the dispatcher thread* — `poison-tail!` must
+;; evict-and-seat without blocking. Pre-fix the dispatcher pins on `.put`, the
+;; sentinel never seats, and the consumer never reaches end-of-stream. The sleep lets
+;; the dispatcher fill+end before any consumption, so the eviction is deterministic.
+(deftest end-after-max-on-a-full-buffer-does-not-pin-the-dispatcher
+  (let [conn (nats/connect {:servers [server-url]})
+        sub  (nats/subscribe conn "blocking.end-max.full" {:capacity 2})]
+    (try
+      (nats/unsubscribe sub 2)                ; arm max=2 before any message arrives
+      (dotimes [i 4] (nats/publish conn "blocking.end-max.full" i))
+      (Thread/sleep 300) ; dispatcher fills [0 1], hits max, evicts+seats — before any consumer
+      (let [collected (future (reduce (fn [acc m] (conj acc (:data m))) [] (nats/messages sub)))
+            result    (deref collected 2000 ::timeout)]
+        (is (not= ::timeout result)
+            "messages terminates — the dispatcher seated the sentinel and bailed, not pinned on .put")
+        (is (= [1] result)
+            "the handler evicted the oldest at max to seat the sentinel; consumer sees the most-recent (ADR 0013)"))
+      (finally (nats/close conn)))))
+
 ;; The remaining one-shot (flush) and the re-exported version: flush blocks until
 ;; the server has processed the buffer and returns nil; version mirrors the core.
 (deftest flush-blocks-and-version-re-exported
