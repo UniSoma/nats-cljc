@@ -6,6 +6,7 @@
             [nats-cljc.protocol :as proto])
   (:import [io.nats.client Nats Options Options$Builder Connection Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener]
            [io.nats.client.impl Headers]
+           [java.nio.charset StandardCharsets]
            [java.time Duration]
            [java.util.concurrent CompletableFuture CompletionStage CompletionException ExecutionException CancellationException TimeoutException]
            [java.util.function Supplier Function BiFunction BiConsumer]))
@@ -376,7 +377,7 @@
     :user-pass (.userInfo builder (char-array user) (char-array pass))
     :nkey      (.authHandler builder (nkey-auth-handler nkey seed))
     :jwt       (.authHandler builder (Nats/staticCredentials (char-array jwt) (char-array seed)))
-    :creds     (.authHandler builder (Nats/staticCredentials (.getBytes ^String creds)))
+    :creds     (.authHandler builder (Nats/staticCredentials (.getBytes ^String creds StandardCharsets/UTF_8)))
     nil        builder))
 
 (defn connect
