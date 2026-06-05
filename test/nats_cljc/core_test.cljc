@@ -130,6 +130,7 @@
 (def ^:private payload-subject "err.payload")
 (def ^:private closed-pub-subject "err.closed.pub")
 (def ^:private drain-window-subject "err.drain")
+(def ^:private drain-window-pub-subject "err.drain.pub")
 
 ;; A server nothing listens on — exercises the :connect-failed dial failure.
 (def ^:private dead-server-url
@@ -1860,6 +1861,76 @@
                                                 (p/then (fn [_] drain-ret))))))
                                 (p/finally (fn [_ _] (p/resolve! gate nil) (close! conn)))))))
                 (p/catch (fn [e] (is false (str "drain-window test failed: " e))))
+                (p/finally (fn [_ _] (done)))))))
+
+;; publish-during-drain is best-effort (ADR 0014, AC#1/#3): unlike request, a
+;; publish in the drain WINDOW never yields :drained — it is swallowed (jnats
+;; allows it and returns nil; nats.js accepts it natively in the sync tick after
+;; drain()). Only a CLOSED connection refuses it as :connection-closed. The
+;; in-window publish must be issued SYNCHRONOUSLY right after (drain conn) — any
+;; delay lets the conn close on JS and the publish would map :connection-closed.
+;; A gated handler holds the window open on JVM (status stays CONNECTED).
+(deftest publish-during-drain-window-returns-nil
+  #?(:clj
+     (let [conn @(nats/connect {:servers [server-url]})
+           gate (java.util.concurrent.CompletableFuture.)]
+       (try
+         (nats/subscribe conn drain-window-pub-subject (fn [_] gate))
+         (nats/publish conn drain-window-pub-subject {:n 1})
+         @(nats/flush conn)
+         (Thread/sleep 200)
+         (let [drain-ret (nats/drain conn)]
+           ;; (a) in-window publish: the gated handler keeps drain in flight (status
+           ;;     CONNECTED), so jnats accepts the publish and returns nil — assert
+           ;;     it does NOT throw (publish always returns nil, so the throw is the
+           ;;     only observable signal).
+           (is (= :no-throw
+                  (try (nats/publish conn drain-window-pub-subject {:n 2})
+                       :no-throw
+                       (catch clojure.lang.ExceptionInfo _ :threw)))
+               "a publish in the drain window does not throw — best-effort (ADR 0014)")
+           (.complete gate nil)
+           (deref drain-ret 3000 ::timeout)
+           ;; (b) boundary guard: once drain completes the conn is closed, so the
+           ;;     same publish throws :connection-closed — never :drained.
+           (is (= :connection-closed
+                  (try (nats/publish conn drain-window-pub-subject {:n 3})
+                       :no-throw
+                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+               "a publish after drain completes throws :connection-closed, not :drained"))
+         (finally
+           (.complete gate nil)
+           (close! conn))))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url]})
+                (p/then (fn [conn]
+                          (let [gate (p/deferred)]
+                            (nats/subscribe conn drain-window-pub-subject (fn [_] gate))
+                            (nats/publish conn drain-window-pub-subject {:n 1})
+                            (-> (nats/flush conn)
+                                (p/then (fn [_] (p/delay 200)))
+                                (p/then (fn [_]
+                                          (let [drain-ret (nats/drain conn)
+                                                ;; (a) issued SYNCHRONOUSLY — no await between drain and
+                                                ;;     publish, so it lands in nats.js' native sync-success
+                                                ;;     tick and returns nil; a delay would close the conn.
+                                                in-window (try (nats/publish conn drain-window-pub-subject {:n 2})
+                                                               :no-throw
+                                                               (catch :default _ :threw))]
+                                            (is (= :no-throw in-window)
+                                                "a publish in the drain window does not throw — best-effort (ADR 0014)")
+                                            (p/resolve! gate nil)
+                                            (-> drain-ret
+                                                ;; (b) boundary guard: conn is now closed → :connection-closed.
+                                                (p/then (fn [_]
+                                                          (is (= :connection-closed
+                                                                 (try (nats/publish conn drain-window-pub-subject {:n 3})
+                                                                      :no-throw
+                                                                      (catch :default e (:type (ex-data e)))))
+                                                              "a publish after drain completes throws :connection-closed, not :drained")))))))
+                                (p/finally (fn [_ _] (p/resolve! gate nil) (close! conn)))))))
+                (p/catch (fn [e] (is false (str "publish-during-drain test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 
 ;; The `subject` builder is pure sugar for composing the canonical dot-delimited

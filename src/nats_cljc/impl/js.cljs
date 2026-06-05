@@ -69,11 +69,12 @@
     nil))
 
 (defn- op-state-error
-  "Build the ex-info for a nats.js ClosedConnectionError from a publish/request on
-   a non-open connection (ADR 0006): the drain WINDOW → `:drained` (a don't-retry
+  "Build the ex-info for a nats.js ClosedConnectionError from a request on a
+   non-open connection (ADR 0006): the drain WINDOW → `:drained` (a don't-retry
    signal), else fully closed → `:connection-closed` (retry-able). nats.js raises
    the same ClosedConnectionError for both, so the live `isDraining` — not the
-   error type — distinguishes them."
+   error type — distinguishes them. publish no longer routes through here — it is
+   best-effort during drain (→ nil) and maps closed directly (ADR 0014)."
   [^js client subject]
   (if (.isDraining client)
     (ex-info "Connection is draining" {:type :drained :subject subject})
@@ -146,10 +147,14 @@
         (cond
           (instance? nats-core/InvalidArgumentError e)
           (throw (max-payload-error client subject bytes))
-          ;; A closed or draining connection refuses the publish (nats.js, unlike
-          ;; jnats, rejects a draining publish too); normalize by drain state (ADR 0006).
+          ;; A publish during the drain window is best-effort: swallow it to nil,
+          ;; matching jnats — which keeps getStatus CONNECTED through drain and so
+          ;; never rejects an in-window publish. publish NEVER yields :drained
+          ;; (ADR 0014); only a CLOSED connection refuses it as :connection-closed.
+          (instance? nats-core/DrainingConnectionError e)
+          nil
           (instance? nats-core/ClosedConnectionError e)
-          (throw (op-state-error client subject))
+          (throw (ex-info "Connection is closed" {:type :connection-closed :subject subject}))
           :else (throw e)))))
   (-subscribe [_ subject queue {:keys [on-error max-pending]} handler]
     ;; Road 2 (ADR 0007): NO :callback — the subscription is an async-iterable that
@@ -208,9 +213,15 @@
                            ;; normalize it to `:max-payload-exceeded` (ADR 0006).
                            (instance? nats-core/InvalidArgumentError e)
                            (max-payload-error client subject bytes)
-                           ;; A closed or draining connection rejects the request
-                           ;; with `:connection-closed` (retry-able) or `:drained`,
-                           ;; by drain state (ADR 0006).
+                           ;; A request during the drain window rejects with a native
+                           ;; DrainingConnectionError; normalize it to `:drained`
+                           ;; directly (request keeps its :drained contract — it has a
+                           ;; promise to reject, and jnats throws "Draining" here too,
+                           ;; ADR 0014). The closed-after-drain case still rejects with
+                           ;; ClosedConnectionError below, mapped to :drained via
+                           ;; isDraining (ADR 0006).
+                           (instance? nats-core/DrainingConnectionError e)
+                           (ex-info "Connection is draining" {:type :drained :subject subject})
                            (instance? nats-core/ClosedConnectionError e)
                            (op-state-error client subject)
                            :else e))))))

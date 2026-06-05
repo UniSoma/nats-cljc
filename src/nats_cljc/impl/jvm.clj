@@ -94,12 +94,14 @@
     (catch Exception _ nil)))
 
 (defn- op-state-error
-  "Normalize an IllegalStateException from a publish/request on a non-open
+  "Normalize an IllegalStateException from a request (or publish) on a non-open
    connection by its jnats message (ADR 0006): the drain WINDOW (`Draining`) →
    `:drained` — a don't-retry signal — and a fully closed connection (`Closed`) →
    `:connection-closed`, which is retry-able. jnats keeps `getStatus` CONNECTED
-   during drain, so the message — not the status — distinguishes the two.
-   Unrecognized states return the original exception for the caller to rethrow."
+   during drain, so the message — not the status — distinguishes the two. Only a
+   request reaches the `Draining` branch: jnats allows a publish during drain (it
+   returns nil, no exception), so publish only ever maps via the `Closed` branch
+   (ADR 0014). Unrecognized states return the original exception to rethrow."
   [subject ^Throwable e]
   (let [msg (str (.getMessage e))]
     (cond
