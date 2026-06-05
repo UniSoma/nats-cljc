@@ -1,4 +1,9 @@
-(ns nats-cljc.codec.json
+;; ^:no-doc not because this is internal (it's a public opt-in feature) but because
+;; cljdoc analyses by `require`-ing every namespace, and data.json is deliberately
+;; absent from the published pom (ADR 0004's clean forced footprint) — so cljdoc
+;; cannot load this ns and the whole build fails. Excluding it keeps cljdoc green;
+;; the codec stays documented via the README, ADR 0011, and `nats-cljc.codec`.
+(ns ^:no-doc nats-cljc.codec.json
   "Opt-in JSON codec (ADR 0004/0011). Requiring this namespace registers `:json` —
    never forced on consumers. org.clojure/data.json on the JVM, ambient js/JSON on
    cljs. Keys are keywordized on decode. Lossy by design: it is a polyglot wire,

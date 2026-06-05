@@ -16,7 +16,7 @@
 
 (def version
   "Current library version."
-  "0.1.0")
+  "0.1.1")
 
 (defn connect
   "Open a connection to the NATS server(s) in `:servers`, returning a

@@ -26,6 +26,17 @@ fetches the articles** — README, CHANGELOG, CONTEXT, the ADRs, and
 docs *before* cljdoc ingests the Clojars release. Hence: tag and push **before**
 deploy.
 
+## cljdoc must be able to load every analysed namespace
+
+cljdoc documents a library by **`require`-ing each namespace** on a classpath built
+from the *published pom* — runtime deps only (`clojure` + `jnats`). A namespace that
+pulls a dependency we deliberately keep out of the pom — the opt-in `:json` /
+`:transit` codecs need `data.json` / `transit-*` (ADR 0004's clean forced footprint)
+— cannot load there and fails the **whole** doc build (it broke the `0.1.0` build;
+fixed in `0.1.1`). Mark such namespaces `^:no-doc` at the ns level: cljdoc filters
+those out *before* it tries to load them. Rule of thumb: if a new namespace requires
+anything outside `deps.edn`'s `:deps`, it must be `^:no-doc`.
+
 ## Per-release steps
 
 The version lives in two spots — `build.clj` (`version`) and `nats-cljc.core/version`
