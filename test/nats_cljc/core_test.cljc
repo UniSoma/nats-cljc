@@ -189,6 +189,19 @@
                       :else                      (resolve false)))]
             (check)))))))
 
+;; Capture the value the native promise REJECTS with at the non-blocking
+;; async-reject seam — `.whenComplete`, the JVM analog of JS's `.then` reject arm —
+;; rather than `deref`, whose ExecutionException wrapper is inherent to `.get` (and
+;; peeled by the blocking layer, ADR 0008). This is the seam ADR 0006's portable
+;; `(:type (ex-data e))` contract targets: it must hand back the BARE ex-info,
+;; matching JS — a CompletionException here (whose own ex-data is nil) is the bug.
+#?(:clj
+   (defn- reject-reason [^java.util.concurrent.CompletableFuture cf]
+     (let [a (promise)]
+       (.whenComplete cf (reify java.util.function.BiConsumer
+                           (accept [_ _ e] (deliver a e))))
+       (deref a 5000 ::timeout))))
+
 (defn- status-collector
   "An :on-status handler closing over an atom of the status maps it receives."
   []
@@ -1157,11 +1170,8 @@
   #?(:clj
      (with-conn {:servers [server-url]}
        (fn [conn]
-         (let [t (try (deref (nats/request conn no-responders-subject {:n 1} {:timeout-ms 2000}) 5000 ::timeout)
-                      nil
-                      (catch java.util.concurrent.ExecutionException e
-                        (:type (ex-data (.getCause e)))))]
-           (is (= :no-responders t)
+         (let [e (reject-reason (nats/request conn no-responders-subject {:n 1} {:timeout-ms 2000}))]
+           (is (= :no-responders (:type (ex-data e)))
                "a request to a subject with no subscribers rejects with :no-responders"))))
      :cljs
      (async done
@@ -1182,11 +1192,8 @@
        (fn [conn]
          (nats/subscribe conn silent-subject (fn [_msg] nil))
          @(nats/flush conn)
-         (let [t (try (deref (nats/request conn silent-subject {:n 1} {:timeout-ms 300}) 5000 ::timeout)
-                      nil
-                      (catch java.util.concurrent.ExecutionException e
-                        (:type (ex-data (.getCause e)))))]
-           (is (= :timeout t)
+         (let [e (reject-reason (nats/request conn silent-subject {:n 1} {:timeout-ms 300}))]
+           (is (= :timeout (:type (ex-data e)))
                "a request whose responders never answer within :timeout-ms rejects with :timeout"))))
      :cljs
      (async done
@@ -1435,11 +1442,8 @@
 ;; `:type :connect-failed`, distinct from the client-side :auth-invalid.
 (deftest connect-failed-rejects
   #?(:clj
-     (let [t (try @(nats/connect {:servers [dead-server-url] :reconnect {:max 0}})
-                  nil
-                  (catch java.util.concurrent.ExecutionException e
-                    (:type (ex-data (.getCause e)))))]
-       (is (= :connect-failed t)
+     (let [e (reject-reason (nats/connect {:servers [dead-server-url] :reconnect {:max 0}}))]
+       (is (= :connect-failed (:type (ex-data e)))
            "connecting to a dead server rejects with :connect-failed"))
      :cljs
      (async done

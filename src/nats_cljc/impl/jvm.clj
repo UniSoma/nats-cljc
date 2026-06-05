@@ -7,8 +7,8 @@
   (:import [io.nats.client Nats Options Options$Builder Connection Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener]
            [io.nats.client.impl Headers]
            [java.time Duration]
-           [java.util.concurrent CompletableFuture CompletionStage CompletionException CancellationException TimeoutException]
-           [java.util.function Supplier Function BiFunction]))
+           [java.util.concurrent CompletableFuture CompletionStage CompletionException ExecutionException CancellationException TimeoutException]
+           [java.util.function Supplier Function BiFunction BiConsumer]))
 
 ;; Upper bound for the blocking flush/drain one-shots; a healthy connection
 ;; settles in milliseconds. Finite (not Duration.ZERO = wait-forever) so a dead
@@ -46,11 +46,34 @@
    :headers (raw-headers msg)})
 
 (defn- unwrap-completion
-  "jnats reports an async handler rejection wrapped in a CompletionException (from
-   blocking on its CompletionStage); unwrap to the value the handler actually
-   threw, so a thrown handler value passes through unchanged (ADR 0006)."
+  "Peel the wrapper CompletableFuture puts around a value thrown inside a stage: a
+   CompletionException on the async-reject / blocked-CompletionStage paths, an
+   ExecutionException from a blocking `.get`. Unwrap to the value actually thrown so
+   a thrown handler value / typed ex-info passes through unchanged and a reader of
+   `(ex-data e)` sees its `:type` (ADR 0006)."
   [e]
-  (if (instance? CompletionException e) (or (.getCause ^CompletionException e) e) e))
+  (if (or (instance? CompletionException e) (instance? ExecutionException e))
+    (or (.getCause ^Throwable e) e)
+    e))
+
+(defn- deliver-bare
+  "Return a native promise that re-completes `p`'s rejection with the BARE ex-info.
+   CompletableFuture wraps a value thrown inside a stage in a CompletionException
+   (its .handle/.exceptionally/.whenComplete all surface that wrapper, whose own
+   ex-data is nil), so a consumer reading `(:type (ex-data e))` — true on JS, where
+   the native promise rejects with the bare value — would read nil on the JVM.
+   `completeExceptionally` stores the cause unwrapped, so the async-reject seam
+   matches JS and ADR 0006. (deref/`.get` still reports an ExecutionException —
+   inherent to `.get`, peeled by the blocking layer — ADR 0008.)"
+  [^CompletableFuture p]
+  (let [out (CompletableFuture.)]
+    (.whenComplete p
+                   (reify BiConsumer
+                     (accept [_ v e]
+                       (if e
+                         (.completeExceptionally out ^Throwable (unwrap-completion e))
+                         (.complete out v)))))
+    out))
 
 (defn- route-error!
   "Route a caught async dispatch failure to its sink (ADR 0006): the per-sub
@@ -353,55 +376,57 @@
    to a JvmConnection (ADR 0002: connect returns the platform-native promise).
    `:codec` defaults to :edn. `:auth` selects an auth method (e.g. `{:token ...}`)."
   [{:keys [servers codec auth on-status reconnect name] :or {codec :edn}}]
-  (CompletableFuture/supplyAsync
-   (reify Supplier
-     (get [_]
-       ;; Build options inside the supplier so a client-side auth error (e.g. an
-       ;; :nkey/seed mismatch) completes the future exceptionally — with its own
-       ;; ex-info, unwrapped — rather than throwing synchronously from connect
-       ;; (ADR 0002/0006: connect rejects its promise). Only the server-side
-       ;; Nats/connect is wrapped as :connect-failed.
-       ;; reconnect? gates the synthesized :reconnecting: it is on unless the
-       ;; caller explicitly disabled reconnection with :reconnect {:max 0} (0 is
-       ;; jnats' "off" sentinel; absent :max keeps the client default, which is on).
-       (let [;; A bare-string :servers is the one non-portable value the README
-             ;; quick-start documents; nats.js normalizes it to a one-element list,
-             ;; so the JVM does too — otherwise (into-array String ...) seqs the
-             ;; string into chars and throws "array element type mismatch".
-             servers       (cond-> servers (string? servers) vector)
-             reconnect?    (not= 0 (:max reconnect))
-             ;; dispatcher→sink registry the ErrorListener routes slowConsumerDetected
-             ;; through, and -subscribe assocs into (ADR 0006/0007).
-             registry      (atom {})
-             ^Options opts (-> (Options/builder)
-                               (.servers (into-array String servers))
-                               ;; Surface a request timeout as a TimeoutException
-                               ;; (vs the default CancellationException, which a
-                               ;; no-responders 503 also raises) so -request can
-                               ;; tell the two failure modes apart (ADR 0006).
-                               (.useTimeoutException)
-                               (cond-> on-status (.connectionListener (status-listener on-status reconnect?)))
-                               ;; The connection name surfaces in the server's
-                               ;; monitoring (/connz); absent :name leaves jnats'
-                               ;; own default (no name) in place.
-                               (cond-> name (.connectionName name))
-                               (.errorListener (error-listener on-status registry))
-                               (with-reconnect reconnect)
-                               (with-auth auth)
-                               (.build))]
-         (try
-           (->JvmConnection (Nats/connect opts) codec on-status registry)
-           (catch Exception e
-             (throw (ex-info "Failed to connect to NATS"
-                             {:type :connect-failed :servers servers}
-                             e)))))))))
+  (deliver-bare
+   (CompletableFuture/supplyAsync
+    (reify Supplier
+      (get [_]
+        ;; Build options inside the supplier so a client-side auth error (e.g. an
+        ;; :nkey/seed mismatch) completes the future exceptionally — with its own
+        ;; ex-info, unwrapped — rather than throwing synchronously from connect
+        ;; (ADR 0002/0006: connect rejects its promise). Only the server-side
+        ;; Nats/connect is wrapped as :connect-failed.
+        ;; reconnect? gates the synthesized :reconnecting: it is on unless the
+        ;; caller explicitly disabled reconnection with :reconnect {:max 0} (0 is
+        ;; jnats' "off" sentinel; absent :max keeps the client default, which is on).
+        (let [;; A bare-string :servers is the one non-portable value the README
+              ;; quick-start documents; nats.js normalizes it to a one-element list,
+              ;; so the JVM does too — otherwise (into-array String ...) seqs the
+              ;; string into chars and throws "array element type mismatch".
+              servers       (cond-> servers (string? servers) vector)
+              reconnect?    (not= 0 (:max reconnect))
+              ;; dispatcher→sink registry the ErrorListener routes slowConsumerDetected
+              ;; through, and -subscribe assocs into (ADR 0006/0007).
+              registry      (atom {})
+              ^Options opts (-> (Options/builder)
+                                (.servers (into-array String servers))
+                                ;; Surface a request timeout as a TimeoutException
+                                ;; (vs the default CancellationException, which a
+                                ;; no-responders 503 also raises) so -request can
+                                ;; tell the two failure modes apart (ADR 0006).
+                                (.useTimeoutException)
+                                (cond-> on-status (.connectionListener (status-listener on-status reconnect?)))
+                                ;; The connection name surfaces in the server's
+                                ;; monitoring (/connz); absent :name leaves jnats'
+                                ;; own default (no name) in place.
+                                (cond-> name (.connectionName name))
+                                (.errorListener (error-listener on-status registry))
+                                (with-reconnect reconnect)
+                                (with-auth auth)
+                                (.build))]
+          (try
+            (->JvmConnection (Nats/connect opts) codec on-status registry)
+            (catch Exception e
+              (throw (ex-info "Failed to connect to NATS"
+                              {:type :connect-failed :servers servers}
+                              e))))))))))
 
 (defn then
   "Map `f` over the value the native promise `p` resolves to, returning a new
    native promise. The facade uses it to decode a raw message map without touching
-   jnats' Message type (ADR 0005); a rejection propagates untouched."
+   jnats' Message type (ADR 0005); a rejection surfaces as the bare ex-info
+   (`deliver-bare`), matching JS and ADR 0006."
   [^CompletableFuture p f]
-  (.thenApply p (reify Function (apply [_ x] (f x)))))
+  (deliver-bare (.thenApply p (reify Function (apply [_ x] (f x))))))
 
 (defn resolved
   "An already-resolved native promise of `x` — the seed of a promise chain so the
@@ -413,7 +438,7 @@
   "Like `then`, but `f` returns a native promise that is flattened into the
    result (thenApply does NOT flatten on the JVM, hence the distinct primitive).
    The facade uses it to splice an async `-request` into an encode/decode chain
-   without nesting a CompletableFuture<CompletableFuture>; a rejection propagates
-   untouched, and the cause stays flat (no extra CompletionException layer)."
+   without nesting a CompletableFuture<CompletableFuture>; a rejection surfaces as
+   the bare ex-info (`deliver-bare`), matching JS and ADR 0006."
   [^CompletableFuture p f]
-  (.thenCompose p (reify Function (apply [_ x] (f x)))))
+  (deliver-bare (.thenCompose p (reify Function (apply [_ x] (f x))))))
