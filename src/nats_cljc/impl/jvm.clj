@@ -1,11 +1,10 @@
 (ns nats-cljc.impl.jvm
   "JVM platform implementation: a Connection record wrapping io.nats:jnats over
    TCP (ADR 0001/0003). All jnats interop is quarantined here (ADR 0005)."
-  (:require [clojure.string :as str]
-            [nats-cljc.auth :as auth]
+  (:require [nats-cljc.auth :as auth]
             [nats-cljc.error :as error]
             [nats-cljc.protocol :as proto])
-  (:import [io.nats.client Nats Options Options$Builder Connection Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener]
+  (:import [io.nats.client Nats Options Options$Builder Connection Connection$Status Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener]
            [io.nats.client.impl Headers]
            [java.nio.charset StandardCharsets]
            [java.time Duration]
@@ -95,21 +94,22 @@
 
 (defn- op-state-error
   "Normalize an IllegalStateException from a request (or publish) on a non-open
-   connection by its jnats message (ADR 0006): the drain WINDOW (`Draining`) →
-   `:drained` — a don't-retry signal — and a fully closed connection (`Closed`) →
-   `:connection-closed`, which is retry-able. jnats keeps `getStatus` CONNECTED
-   during drain, so the message — not the status — distinguishes the two. Only a
-   request reaches the `Draining` branch: jnats allows a publish during drain (it
-   returns nil, no exception), so publish only ever maps via the `Closed` branch
-   (ADR 0014). Unrecognized states return the original exception to rethrow."
-  [subject ^Throwable e]
-  (let [msg (str (.getMessage e))]
-    (cond
-      (str/includes? msg "Draining")
-      (ex-info "Connection is draining" {:type :drained :subject subject} e)
-      (str/includes? msg "Closed")
-      (ex-info "Connection is closed" {:type :connection-closed :subject subject} e)
-      :else e)))
+   connection by the client's STRUCTURED state, not jnats' message text — so a
+   jnats reword can't change the mapping (ADR 0006/0014). Called only from inside
+   `(catch IllegalStateException ...)`, where jnats raises from the publish/request
+   path at exactly three sites: `isClosed` (getStatus CLOSED), the drain-block flag
+   (getStatus still CONNECTED — drain hasn't closed the conn yet), and the
+   reconnect-buffer-full guard (getStatus RECONNECTING/DISCONNECTED). So among the
+   only reachable ISEs, CLOSED → `:connection-closed` (retry-able) and CONNECTED
+   uniquely selects the drain → `:drained` (don't-retry). Only a request reaches
+   the drain branch: a publish during drain returns nil rather than throwing
+   (ADR 0014), so publish maps only via CLOSED. Any other status returns the
+   original exception so the caller rethrows the reconnect-buffer ISE raw."
+  [^Connection client subject ^Throwable e]
+  (condp = (.getStatus client)
+    Connection$Status/CLOSED    (ex-info "Connection is closed" {:type :connection-closed :subject subject} e)
+    Connection$Status/CONNECTED (ex-info "Connection is draining" {:type :drained :subject subject} e)
+    e))
 
 (defn- max-payload-error
   "Normalize an IllegalArgumentException from a publish/request to a typed
@@ -168,7 +168,7 @@
       ;; `:connection-closed` (publish is allowed during drain, so it never sees
       ;; `:drained`). `op-state-error` returns the original for unrecognized states.
       (catch IllegalStateException e
-        (throw (op-state-error subject e)))))
+        (throw (op-state-error client subject e)))))
   (-subscribe [_ subject queue {:keys [on-error max-pending]} handler]
     ;; Road 2 (ADR 0007): onMessage BLOCKS this dispatcher's thread on the
     ;; handler's CompletionStage (no timeout). Serial, one-at-a-time delivery and
@@ -261,7 +261,7 @@
             (throw e)
             (CompletableFuture/failedFuture x))))
       (catch IllegalStateException e
-        (let [x (op-state-error subject e)]
+        (let [x (op-state-error client subject e)]
           (if (identical? x e)
             (throw e)
             (CompletableFuture/failedFuture x))))))

@@ -1933,6 +1933,45 @@
                 (p/catch (fn [e] (is false (str "publish-during-drain test failed: " e))))
                 (p/finally (fn [_ _] (done)))))))
 
+;; op-state-error keys on jnats' structured connection state, not its exception
+;; message text (nts-01kt87wgwyez, ADR 0006/0014): getStatus CLOSED →
+;; :connection-closed, CONNECTED → :drained (the drain window holds the conn
+;; CONNECTED), any other status → the original exception, rethrown raw. A
+;; reworded jnats message can no longer flip the classification. The live drain
+;; (request-during-drain-window-rejects-drained) and close
+;; (connection-closed-normalized) paths pin the two mapped statuses against a
+;; real server; this hits the private classifier directly with deliberately
+;; reworded messages to prove independence. JVM-only — JS already reads
+;; structured state, so there is nothing to mirror.
+(deftest op-state-error-classifies-by-connection-status-not-message
+  #?(:clj
+     (do
+       ;; CLOSED → :connection-closed even though the message never says "Closed".
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           @(nats/close conn)
+           (let [^io.nats.client.Connection client (:client conn)
+                 ise (IllegalStateException. "Connection terminated")]
+             (is (= :connection-closed
+                    (:type (ex-data (#'impl/op-state-error client "s.closed" ise))))
+                 "a CLOSED connection classifies as :connection-closed regardless of message"))))
+       ;; CONNECTED → :drained even though the message never says "Draining".
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [^io.nats.client.Connection client (:client conn)
+                 ise (IllegalStateException. "drain in progress")]
+             (is (= :drained
+                    (:type (ex-data (#'impl/op-state-error client "s.drain" ise))))
+                 "a CONNECTED connection classifies as :drained regardless of message"))))
+       ;; Any other status (e.g. the reconnect-buffer-full ISE thrown while
+       ;; RECONNECTING) falls through to :else and is returned unchanged for the
+       ;; caller to rethrow raw — never misclassified as :drained.
+       (let [client (proxy [io.nats.client.Connection] []
+                      (getStatus [] io.nats.client.Connection$Status/RECONNECTING))
+             ise (IllegalStateException. "Unable to queue any more messages during reconnect, max buffer is 1234")]
+         (is (identical? ise (#'impl/op-state-error client "s.reconnect" ise))
+             "a reconnect-buffer IllegalStateException falls through to :else and is rethrown raw")))))
+
 ;; The `subject` builder is pure sugar for composing the canonical dot-delimited
 ;; Subject string from parts (CONTEXT: Subject) — no connection, no async — so
 ;; these run identically on both legs straight from the .cljc, with no server.
