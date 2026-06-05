@@ -124,6 +124,7 @@
 ;; shared server doesn't cross-feed between tests.
 (def ^:private throw-subject "err.handler-throw")
 (def ^:private throw-fallback-subject "err.handler-throw.fallback")
+(def ^:private throw-sink-subject "err.handler-throw.sink")
 (def ^:private codec-error-subject "err.codec")
 (def ^:private slow-subject "err.slow")
 (def ^:private payload-subject "err.payload")
@@ -1628,6 +1629,64 @@
                                   (is hit? "with no :on-error the throw reaches :on-status and the sub survives")
                                   (is (= {:kaboom true} (ex-data (:error (first (filter (comp #{:error} :type) @seen)))))
                                       "the :error event wraps the thrown value under :error")))))))))))
+
+;; route-error! must SWALLOW a throwing sink (ADR 0007, AC#2). It runs inside the
+;; onMessage catch, so a rethrow escapes into jnats' dispatcher run-loop — but on
+;; this jnats version the dispatcher's default exceptionOccurred swallows the
+;; escape silently, leaving no clean e2e trigger (cf.
+;; server-error-classifier-maps-protocol-error). So assert at the seam — like
+;; deliver-status! — that route-error! never rethrows, on BOTH arms: the :on-error
+;; sink and the :on-status fallback. JVM-only; JS guards this inline in consume!.
+#?(:clj
+   (deftest route-error-swallows-a-throwing-sink
+     (let [boom (fn [& _] (throw (ex-info "sink boom" {:sink true})))]
+       (is (nil? (#'impl/route-error! boom nil (ex-info "e" {})))
+           "a throwing :on-error is swallowed, not rethrown into the dispatcher")
+       (is (nil? (#'impl/route-error! nil boom (ex-info "e" {})))
+           "a throwing :on-status fallback is likewise swallowed"))))
+
+;; throwing :on-error sink still delivers (ADR 0007, AC#1/#2): when the sub's own
+;; :on-error throws, JS's `consume!` swallows it and keeps delivering; the JVM must
+;; match — the throw must not escape onMessage into jnats' dispatcher run-loop, so
+;; a later message still arrives. :boom makes the handler throw, routing to an
+;; :on-error that ALSO throws; :ok must still land and the sink must have fired.
+(deftest throwing-on-error-sink-still-delivers
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [calls (atom 0)
+               got   (atom [])]
+           (nats/subscribe conn throw-sink-subject
+                           (fn [msg]
+                             (if (= :boom (:data msg))
+                               (throw (ex-info "boom" {:kaboom true}))
+                               (swap! got conj (:data msg))))
+                           {:on-error (fn [_]
+                                        (swap! calls inc)
+                                        (throw (ex-info "sink boom" {:sink true})))})
+           (nats/publish conn throw-sink-subject :boom)
+           (nats/publish conn throw-sink-subject :ok)
+           (is (wait-for #(and (pos? @calls) (= [:ok] @got)) 5000)
+               "a throwing :on-error is swallowed and the next message still arrives"))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [calls (atom 0)
+                      got   (atom [])]
+                  (nats/subscribe conn throw-sink-subject
+                                  (fn [msg]
+                                    (if (= :boom (:data msg))
+                                      (throw (ex-info "boom" {:kaboom true}))
+                                      (swap! got conj (:data msg))))
+                                  {:on-error (fn [_]
+                                               (swap! calls inc)
+                                               (throw (ex-info "sink boom" {:sink true})))})
+                  (nats/publish conn throw-sink-subject :boom)
+                  (nats/publish conn throw-sink-subject :ok)
+                  (-> (wait-for #(and (pos? @calls) (= [:ok] @got)) 5000)
+                      (p/then (fn [hit?]
+                                (is hit? "a throwing :on-error is swallowed and the next message still arrives"))))))))))
 
 ;; decode-failure → :codec-error (ADR 0006, AC#3): a subscriber decoding with
 ;; :edn receives raw non-EDN bytes (a lone "{", published via :string). decode-msg

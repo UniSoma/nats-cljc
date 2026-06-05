@@ -81,11 +81,17 @@
   "Route a caught async dispatch failure to its sink (ADR 0006): the per-sub
    `on-error` if set (the bare value), else the connection `on-status` as a
    non-bare `{:type :error :error e}` event; both nil drops it. Strict override —
-   never both."
+   never both. A throwing sink is SWALLOWED (ADR 0007): this runs inside the
+   onMessage catch, so a rethrow would escape into jnats' dispatcher run-loop —
+   version-dependent fallout instead of the sub-survives contract JS's `consume!`
+   route funnel already honors. Catch Exception, not Throwable, so a JVM Error
+   (OOM, etc.) still propagates — matching the onMessage catch."
   [on-error on-status e]
-  (if on-error
-    (on-error e)
-    (when on-status (on-status {:type :error :error e}))))
+  (try
+    (if on-error
+      (on-error e)
+      (when on-status (on-status {:type :error :error e})))
+    (catch Exception _ nil)))
 
 (defn- op-state-error
   "Normalize an IllegalStateException from a publish/request on a non-open
