@@ -570,6 +570,28 @@
      (is (= {} (impl/with-reconnect {} {}))
          "an absent :max leaves nats.js' own default in place")))
 
+;; The Integer cap on :reconnect {:max}: jnats' .maxReconnects takes an int, so a
+;; value beyond Integer/MAX_VALUE overflows at (int max) — an uncaught
+;; ArithmeticException that rejects connect untyped on the JVM, silently accepted
+;; on JS. The shared guard rejects it portably as :invalid-max (mirroring
+;; unsubscribe-max), so both legs reject connect with the same typed outcome.
+(deftest reconnect-max-beyond-integer-range-rejects
+  #?(:clj
+     (let [fut (nats/connect {:servers [server-url] :reconnect {:max 2147483648}})
+           t   (try @fut nil
+                    (catch java.util.concurrent.ExecutionException e
+                      (:type (ex-data (.getCause e)))))]
+       (is (= :invalid-max t)
+           ":reconnect {:max beyond Integer range} rejects connect with :invalid-max"))
+     :cljs
+     (async done
+            (-> (nats/connect {:servers [server-url] :reconnect {:max 2147483648}})
+                (p/then (fn [_] (is false "expected an out-of-range :reconnect :max to reject connect")))
+                (p/catch (fn [e]
+                           (is (= :invalid-max (:type (ex-data e)))
+                               ":reconnect {:max beyond Integer range} rejects connect with :invalid-max")))
+                (p/finally (fn [_ _] (done)))))))
+
 ;; Regression for the synthesis gate (JVM only — nats.js has no such gate):
 ;; disabling reconnection (:reconnect {:max 0} → reconnect? false) must NOT
 ;; silence the status spine. Driving the real ConnectionListener with reconnect?

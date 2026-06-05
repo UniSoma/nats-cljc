@@ -339,6 +339,14 @@
    Options builder. `:max 0` disables reconnection, `:max -1` is unlimited (jnats'
    own sentinels); absent keys leave jnats' own defaults in place."
   ^Options$Builder [^Options$Builder builder {:keys [max wait-ms jitter-ms]}]
+  ;; Bound by Integer/MAX_VALUE: jnats' .maxReconnects takes an int, so a larger
+  ;; value would throw an uncaught ArithmeticException at (int max) here while JS
+  ;; accepts it silently. Reject portably before native (mirroring the
+  ;; core/unsubscribe max guard), letting the -1 (unlimited) and 0 (off) sentinels
+  ;; through.
+  (when (and max (not (and (int? max) (<= -1 max 2147483647))))
+    (throw (ex-info "reconnect :max must be an integer in [-1, 2147483647]"
+                    {:type :invalid-max :max max})))
   (cond-> builder
     max       (.maxReconnects (int max))
     wait-ms   (.reconnectWait (Duration/ofMillis wait-ms))

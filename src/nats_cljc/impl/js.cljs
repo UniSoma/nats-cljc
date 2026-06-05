@@ -286,6 +286,14 @@
    the `reconnect` boolean, not `maxReconnectAttempts 0` (which keeps reconnecting)
    — and `:max -1` is unlimited; absent keys leave nats.js' own defaults in place."
   [opts {:keys [max wait-ms jitter-ms]}]
+  ;; Match the JVM's Integer cap so both legs agree: jnats' .maxReconnects takes an
+  ;; int, so a value beyond Integer/MAX_VALUE overflows there while nats.js would
+  ;; accept it silently. Reject it portably as :invalid-max (mirroring the
+  ;; core/unsubscribe max guard), letting the -1 (unlimited) and 0 (off) sentinels
+  ;; through.
+  (when (and max (not (and (int? max) (<= -1 max 2147483647))))
+    (throw (ex-info "reconnect :max must be an integer in [-1, 2147483647]"
+                    {:type :invalid-max :max max})))
   (cond-> opts
     (= max 0)              (assoc :reconnect false)
     (and max (not= max 0)) (assoc :maxReconnectAttempts max)
