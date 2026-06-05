@@ -2,6 +2,7 @@
   "JVM platform implementation: a Connection record wrapping io.nats:jnats over
    TCP (ADR 0001/0003). All jnats interop is quarantined here (ADR 0005)."
   (:require [clojure.string :as str]
+            [nats-cljc.auth :as auth]
             [nats-cljc.error :as error]
             [nats-cljc.protocol :as proto])
   (:import [io.nats.client Nats Options Options$Builder Connection Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener]
@@ -353,26 +354,11 @@
     wait-ms   (.reconnectWait (Duration/ofMillis wait-ms))
     jitter-ms (.reconnectJitter (Duration/ofMillis jitter-ms))))
 
-(defn- auth-variant
-  "Derive the tagged `:auth` variant — exactly one of :token / :user-pass / :nkey /
-   :jwt / :creds, or nil when no auth is configured. The shapes are mutually
-   exclusive, so each is keyed off its own discriminating field; :seed is therefore
-   read by exactly one variant (:jwt when a jwt is present, else :nkey) rather than
-   shared across two. A stray field beside another shape can no longer silently
-   switch methods."
-  [{:keys [token user nkey jwt creds]}]
-  (cond
-    token :token
-    user  :user-pass
-    jwt   :jwt
-    nkey  :nkey
-    creds :creds))
-
 (defn- with-auth
   "Apply the `:auth` connect-option to the jnats Options builder, dispatching on the
-   explicit `auth-variant`. The auth seam the advanced-auth slices extend."
+   shared `auth/auth-variant`. The auth seam the advanced-auth slices extend."
   ^Options$Builder [^Options$Builder builder {:keys [token user pass nkey seed jwt creds] :as auth}]
-  (case (auth-variant auth)
+  (case (auth/auth-variant auth)
     :token     (.token builder (char-array token))
     :user-pass (.userInfo builder (char-array user) (char-array pass))
     :nkey      (.authHandler builder (nkey-auth-handler nkey seed))

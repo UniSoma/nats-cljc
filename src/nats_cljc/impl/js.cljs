@@ -2,7 +2,8 @@
   "ClojureScript platform implementation: a Connection record wrapping
    @nats-io/nats-core over WebSocket (ADR 0001/0003), serving browser and Node
    from one package. All JS interop is quarantined here (ADR 0005)."
-  (:require [nats-cljc.error :as error]
+  (:require [nats-cljc.auth :as auth]
+            [nats-cljc.error :as error]
             [nats-cljc.protocol :as proto]
             ["@nats-io/nats-core" :as nats-core]))
 
@@ -300,26 +301,11 @@
     wait-ms                (assoc :reconnectTimeWait wait-ms)
     jitter-ms              (assoc :reconnectJitter jitter-ms)))
 
-(defn- auth-variant
-  "Derive the tagged `:auth` variant — exactly one of :token / :user-pass / :nkey /
-   :jwt / :creds, or nil when no auth is configured. The shapes are mutually
-   exclusive, so each is keyed off its own discriminating field; :seed is therefore
-   read by exactly one variant (:jwt when a jwt is present, else :nkey) rather than
-   shared across two. A stray field beside another shape can no longer silently
-   switch methods."
-  [{:keys [token user nkey jwt creds]}]
-  (cond
-    token :token
-    user  :user-pass
-    jwt   :jwt
-    nkey  :nkey
-    creds :creds))
-
 (defn- with-auth
   "Merge the `:auth` connect-option into the nats-core options map, dispatching on
-   the explicit `auth-variant`. The auth seam the advanced-auth slices extend."
+   the shared `auth/auth-variant`. The auth seam the advanced-auth slices extend."
   [opts {:keys [token user pass nkey seed jwt creds] :as auth}]
-  (case (auth-variant auth)
+  (case (auth/auth-variant auth)
     :token     (assoc opts :token token)
     :user-pass (assoc opts :user user :pass pass)
     :nkey      (assoc opts :authenticator (nkey-authenticator nkey seed))
