@@ -106,13 +106,13 @@ One-shot operations return the **platform-native promise** — a `js/Promise` on
 
 ## Messages
 
-A delivered or published message is a plain map. `:data` is the **decoded** value; `:headers`/`:reply` appear only when set.
+A delivered or published message is a plain map. `:data` is the **decoded** value; `:reply` is always present (nil when the sender expects no reply); only `:headers` appears when set.
 
 ```clojure
 {:subject "orders.123.created"
  :data    {:id 123 :total 49.90}        ; decoded via the codec
  :headers {"Nats-Msg-Id" ["abc-123"]}   ; string keys, vector-of-string values
- :reply   "_INBOX.x9f…"}                ; present when the sender expects a reply
+ :reply   "_INBOX.x9f…"}                ; always present; nil when the sender expects no reply
 ```
 
 ## Request / reply
