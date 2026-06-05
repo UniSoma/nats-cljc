@@ -25,7 +25,13 @@
    is `:codec` (default `:edn`). Transport is fixed per platform: TCP on the JVM,
    WebSocket on ClojureScript (ADR 0001)."
   [opts]
-  (impl/connect opts))
+  ;; Resolve the default codec once here (ADR 0011) and store the resolved
+  ;; `Prepared` on the connection, so steady-state encode/decode never deref the
+  ;; codec registry. Done in an `impl/then` stage so an unresolvable default codec
+  ;; rejects the connect promise — matching connect's contract (ADR 0002/0006) —
+  ;; rather than throwing synchronously or surfacing lazily on first publish.
+  (impl/then (impl/connect opts)
+             (fn [conn] (assoc conn :codec (codec/prepare (:codec conn))))))
 
 ;; A valid header name is a non-empty printable-ASCII token with no colon (the
 ;; name/value delimiter): every char in 0x20–0x7E except 0x3A. The class is split
@@ -79,8 +85,10 @@
 
 (defn- effective-codec
   "The codec for a single call: a per-call `:codec` in `opts` overrides the
-   connection default, else the connection's `:codec` (ADR 0011). The one place
-   the precedence rule lives, so publish/subscribe/request/reply can't drift."
+   connection default, else the connection's `:codec` — the `Prepared` resolved
+   once at connect, so the default path skips the registry deref (ADR 0011). The
+   one place the precedence rule lives, so publish/subscribe/request/reply can't
+   drift. A raw override resolves through the registry in `codec/encode`/`decode`."
   [conn opts]
   (or (:codec opts) (:codec conn)))
 

@@ -105,6 +105,16 @@
 (register! :string (->StringCodec))
 (register! :bytes  (->BytesCodec))
 
+;; A connection's default codec, resolved once at connect (ADR 0011): `impl` is the
+;; `ICodec` the hot path calls; `id` is the stable keyword (or `:custom`) error
+;; stamping needs. Holding both lets steady-state encode/decode skip the registry
+;; deref while a failure still names `:edn` (not the resolved record). Per-call
+;; `:codec` overrides stay raw keyword/instance refs — the rare path — and resolve
+;; through the registry as before. Internal plumbing — `^:no-doc` so it stays out
+;; of the codec extension API (ICodec/register!/encode/decode/str->bytes), which is
+;; the only codec surface a consumer is meant to touch.
+(defrecord ^:no-doc Prepared [impl id])
+
 (defn- opt-in-ns
   "The namespace a keyword codec registers from, by convention
    `nats-cljc.codec.<name>` (ADR 0011), so a registry miss can point at a namespace
@@ -117,31 +127,49 @@
   (symbol (str "nats-cljc.codec." (name codec))))
 
 (defn- resolve-codec
-  "Resolve a codec reference to an `ICodec`. The common argument is a keyword, so
-   that path runs first — `keyword?` plus a registry lookup — reserving the slower,
-   uncached `satisfies?` for the rare instance case. A keyword miss throws
-   `:codec-error` with a `:require '<ns>` hint (ADR 0011); a non-keyword that is
-   not an `ICodec` is genuinely unknown. Either is a *resolution* failure, so no
-   `:op` (distinct from an encode/decode failure)."
+  "Resolve a codec reference to an `ICodec`. A `Prepared` (the connection default,
+   resolved once at connect) returns its `impl` with no registry deref — the hot
+   path. Otherwise the common argument is a keyword, so that path runs next —
+   `keyword?` plus a registry lookup — reserving the slower, uncached `satisfies?`
+   for the rare instance case. A keyword miss throws `:codec-error` with a
+   `:require '<ns>` hint (ADR 0011); a non-keyword that is not an `ICodec` is
+   genuinely unknown. Either is a *resolution* failure, so no `:op` (distinct from
+   an encode/decode failure)."
   [codec]
-  (if (keyword? codec)
+  (cond
+    (instance? Prepared codec) (:impl codec)
+    (keyword? codec)
     (or (get @registry codec)
         (let [ns (opt-in-ns codec)]
           (throw (ex-info (str "Codec " codec " is not loaded — (require '" ns ")")
                           {:type :codec-error :codec codec :require ns}))))
-    (if (satisfies? ICodec codec)
-      codec
-      (throw (ex-info (str "Unknown codec: " codec)
-                      {:type :codec-error :codec codec})))))
+    (satisfies? ICodec codec) codec
+    :else (throw (ex-info (str "Unknown codec: " codec)
+                          {:type :codec-error :codec codec}))))
 
 (defn- codec-id
-  "A stable, keyword-shaped identifier for `codec` in error ex-data: a registry
-   keyword passes through; an `ICodec` instance becomes the sentinel `:custom`.
-   Never the live instance or its class-hash `toString` — both leak the object
-   into logs/serialized payloads and shift across reloads, where a keyword matches
-   the built-in case so consumers can always expect a keyword under `:codec`."
+  "A stable, keyword-shaped identifier for `codec` in error ex-data: a `Prepared`
+   default yields the `id` it captured at connect; a registry keyword passes
+   through; an `ICodec` instance becomes the sentinel `:custom`. Never the live
+   instance or its class-hash `toString` — both leak the object into
+   logs/serialized payloads and shift across reloads, where a keyword matches the
+   built-in case so consumers can always expect a keyword under `:codec`."
   [codec]
-  (if (keyword? codec) codec :custom))
+  (cond
+    (instance? Prepared codec) (:id codec)
+    (keyword? codec) codec
+    :else :custom))
+
+(defn ^:no-doc prepare
+  "Internal (called only by `nats-cljc.core/connect`; not codec extension API).
+   Resolve a connection's default codec reference `ref` (a keyword or `ICodec`)
+   once, into a `Prepared` the facade stores on the connection so steady-state
+   encode and decode skip the registry deref (ADR 0011). Captures the stable id
+   alongside the resolved record, so a failure on the default path still names
+   `:edn` (or `:custom`), never the record. An unresolvable `ref` throws here — at
+   connect — rather than lazily on first use."
+  [ref]
+  (->Prepared (resolve-codec ref) (codec-id ref)))
 
 (defn- ->codec-error
   "Normalize an encode/decode failure to an `ex-info` `:type :codec-error` carrying
