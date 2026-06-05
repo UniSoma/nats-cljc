@@ -17,6 +17,16 @@ nats-server -c ci/nats-jwt.conf   &   # jwt + creds          — TCP :4225 / ws 
 
 The nkey / JWT / creds fixtures (server configs in `ci/`, matching seeds/JWTs/creds in the test) were generated once with [`nsc`](https://github.com/nats-io/nsc) — it's in the dev image (`.aishell/Dockerfile`). CI does not need `nsc`; it only starts `nats-server` against the checked-in configs. To regenerate: `nsc generate nkey --user` for the standalone nkey, and an operator → account → user chain (`nsc add operator/account/user`, then `nsc generate config --mem-resolver` and `nsc generate creds`) for the JWT/creds leg.
 
+### Restarting a server from a sandboxed agent shell
+
+`pre_start` runs at session start, so the four servers are normally already up. If one is missing mid-session, restart it from the Bash tool with `dangerouslyDisableSandbox: true` — the sandbox both blocks the localhost connection and tears down listening daemons (seccomp blocks `listen()`, and the per-command process group is killed on return, so even `... &` jobs die with **signal 16 / exit 144**). Detach each server into its own session, **one per Bash call**:
+
+```bash
+setsid nats-server -c ci/nats.conf </dev/null >/tmp/nats-4222.log 2>&1 &
+```
+
+Avoid `pkill -f nats-server` — it also kills the `pre_start`-started servers, taking down every leg.
+
 ## JVM (TCP)
 
 ```bash
