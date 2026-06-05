@@ -1,0 +1,28 @@
+;; cljdoc article tree (https://cljdoc.org/d/io.github.unisoma/nats-cljc).
+;; README and CHANGELOG would auto-discover; everything else is published only
+;; because it is listed here. ADR titles are prefixed with their number so the
+;; "(ADR 00NN)" references throughout the docstrings are findable in the sidebar.
+;; Internal ADRs 0005 (namespace layout) and 0010 (browser-tests-CI-only) are
+;; intentionally omitted — GitHub-only.
+{:cljdoc.doc/tree
+ [["Readme"    {:file "README.md"}]
+  ["Changelog" {:file "CHANGELOG.md"}]
+  ["Glossary"  {:file "CONTEXT.md"}]
+  ["Design decisions"
+   ["0001 · Portable non-blocking core with per-platform transports"        {:file "docs/adr/0001-portable-nonblocking-core.md"}]
+   ["0002 · Native promises for one-shots, callback handlers for subscriptions" {:file "docs/adr/0002-async-primitive.md"}]
+   ["0003 · Wrapped clients and supported ClojureScript toolchain"          {:file "docs/adr/0003-wrapped-clients-and-toolchain.md"}]
+   ["0004 · Codec-centric payload with an EDN default; Transit/JSON opt-in"  {:file "docs/adr/0004-codec-centric-edn-default.md"}]
+   ["0006 · Normalized error model"                                         {:file "docs/adr/0006-normalized-error-model.md"}]
+   ["0007 · Handler delivery semantics"                                     {:file "docs/adr/0007-handler-delivery-semantics.md"}]
+   ["0008 · JVM-only blocking convenience layer"                            {:file "docs/adr/0008-blocking-convenience-layer.md"}]
+   ["0009 · Project foundations and versioning contract"                    {:file "docs/adr/0009-project-foundations-and-versioning.md"}]
+   ["0011 · Codec extension & resolution contract"                          {:file "docs/adr/0011-codec-extension-and-resolution.md"}]
+   ["0012 · Unsubscribe is idempotent"                                      {:file "docs/adr/0012-unsubscribe-is-idempotent.md"}]
+   ["0013 · Graceful auto-unsubscribe evicts the oldest message on a full buffer" {:file "docs/adr/0013-auto-unsubscribe-evicts-on-a-full-buffer.md"}]
+   ["0014 · Publish during drain is best-effort"                            {:file "docs/adr/0014-publish-during-drain-is-best-effort.md"}]
+   ["0015 · Caller-misuse validation errors are a separate category"        {:file "docs/adr/0015-validation-errors-are-a-separate-category.md"}]]]
+
+ ;; .cljc library — auto-detect runs both the clj and cljs analysis passes and
+ ;; shows per-platform badges. Do not pin to one platform.
+ :cljdoc/languages :auto-detect}

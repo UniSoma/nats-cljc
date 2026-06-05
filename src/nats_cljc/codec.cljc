@@ -54,19 +54,19 @@
   (-encode [codec value] "Encode a Clojure value to wire bytes.")
   (-decode [codec bytes] "Decode wire bytes to a Clojure value."))
 
-(defrecord EdnCodec []
+(defrecord ^:no-doc EdnCodec []
   ICodec
   (-encode [_ value] (str->bytes (pr-str value)))
   (-decode [_ bytes] (edn/read-string (bytes->str bytes))))
 
-(defrecord StringCodec []
+(defrecord ^:no-doc StringCodec []
   ICodec
   ;; Lenient: any value is coerced with `str` on encode; decode yields the UTF-8
   ;; string. No type guard (unlike `:bytes`).
   (-encode [_ value] (str->bytes (str value)))
   (-decode [_ bytes] (bytes->str bytes)))
 
-(defrecord BytesCodec []
+(defrecord ^:no-doc BytesCodec []
   ICodec
   ;; Strict passthrough: the delivered `:data` is platform-native bytes — the
   ;; ADR-0004-sanctioned exception to Data being a portable Clojure value.
@@ -80,7 +80,7 @@
                       {:type :codec-error :codec :bytes}))))
   (-decode [_ bytes] bytes))
 
-(defonce ^{:doc "Keyword -> ICodec. Both the built-ins (registered just below)
+(defonce ^{:no-doc true :doc "Keyword -> ICodec. Both the built-ins (registered just below)
    and opt-in/custom codecs enter through `register!`; `defonce` keeps the atom
    across a reload, so opt-in/custom registrations survive it."}
   registry

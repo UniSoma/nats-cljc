@@ -47,9 +47,15 @@
   :silence-unsafe
   {:jvm-opts ["--sun-misc-unsafe-memory-access=allow"]}
 
-  ;; Build/jar: clj -T:build jar
+  ;; Build/jar + deploy: clj -T:build jar, then clj -T:build deploy.
+  ;; deps-deploy lives here too: 0.2.5 dropped its maven-core-only class
+  ;; reference (DefaultMavenSettingsBuilder), so it co-exists with tools.build
+  ;; 0.10.14's MIMA runtime on one classpath — no isolated alias needed, and the
+  ;; jar path single-sources from build.clj's `version` (see build.clj and
+  ;; docs/agents/cutting-a-release.md).
   :build
-  {:deps       {io.github.clojure/tools.build {:mvn/version "0.10.14"}}
+  {:deps       {io.github.clojure/tools.build {:mvn/version "0.10.14"}
+                slipset/deps-deploy           {:mvn/version "0.2.5"}}
    :ns-default build}
 
   ;; Dev nREPL: clojure -M:test:nrepl — a JVM Clojure nREPL on :7888 with jnats

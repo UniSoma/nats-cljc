@@ -1,4 +1,4 @@
-(ns nats-cljc.protocol
+(ns ^:no-doc nats-cljc.protocol
   "Internal protocols (ADR 0005) the platform records implement; the public facade
    in `nats-cljc.core` sits on top and owns codec encode/decode, so everything
    here deals in raw wire bytes.

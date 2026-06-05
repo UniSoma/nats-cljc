@@ -1,4 +1,4 @@
-(ns nats-cljc.impl.jvm
+(ns ^:no-doc nats-cljc.impl.jvm
   "JVM platform implementation: a Connection record wrapping io.nats:jnats over
    TCP (ADR 0001/0003). All jnats interop is quarantined here (ADR 0005)."
   (:require [nats-cljc.auth :as auth]

@@ -1,4 +1,4 @@
-(ns nats-cljc.impl.js
+(ns ^:no-doc nats-cljc.impl.js
   "ClojureScript platform implementation: a Connection record wrapping
    @nats-io/nats-core over WebSocket (ADR 0001/0003), serving browser and Node
    from one package. All JS interop is quarantined here (ADR 0005)."

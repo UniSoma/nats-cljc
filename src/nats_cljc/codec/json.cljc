@@ -13,7 +13,7 @@
 
 ;; data.json and js/JSON both deal in strings; the wire is bytes, so codec's
 ;; shared UTF-8 bridge converts between the two on each platform.
-(defrecord JsonCodec []
+(defrecord ^:no-doc JsonCodec []
   codec/ICodec
   (-encode [_ value]
     (codec/str->bytes #?(:clj  (json/write-str value)

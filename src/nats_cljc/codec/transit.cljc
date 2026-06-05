@@ -12,7 +12,7 @@
 ;; transit-cljs reads/writes JSON strings; the wire is bytes, so codec's shared
 ;; UTF-8 bridge converts between the two. The JVM writer/reader stream straight
 ;; to/from bytes, so no bridge there.
-(defrecord TransitCodec []
+(defrecord ^:no-doc TransitCodec []
   codec/ICodec
   (-encode [_ value]
     #?(:clj  (let [out (ByteArrayOutputStream.)]
