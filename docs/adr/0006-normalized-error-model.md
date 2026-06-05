@@ -22,6 +22,8 @@ Failures surface as an **`ex-info`** carrying a canonical **`:type`** keyword pl
 
 Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`, `:slow-consumer`, `:auth-invalid`.
 
+This set is the **normalized NATS error model** — operational failures, each normalized from a native exception. **Caller-misuse validation errors** (`:invalid-header`, `:invalid-max`, `:invalid-max-pending`, `:no-reply-subject`, `:invalid-capacity`) are deliberately **not** here: they are a separate **Validation error** category — programmer errors raised on the operation's own channel before any native call and never to a sink — documented in ADR 0015. `:auth-invalid` stays here, not there, because it is operational (bad credentials are a runtime condition) and validates against the NATS security model rather than API argument well-formedness.
+
 `:drained` is yielded by one-shot operations (`request`, `flush`, `drain`, `close`) on a draining/drained connection; **`publish` never yields it** — a publish during drain is best-effort (`nil`) and a publish once closed is `:connection-closed` (ADR 0014).
 
 `:auth-invalid` names **client-side credential validation** failing before any dial — an nkey/seed mismatch today, and the home for future creds/jwt pre-flight checks — as opposed to `:connect-failed`, which is the server-side connect attempt failing. Validation runs while building connect options, so it surfaces by **rejecting the `connect` promise** (the one-shot channel), not via an async sink.

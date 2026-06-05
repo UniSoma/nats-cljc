@@ -181,7 +181,9 @@ Lifecycle events and async errors arrive at `:on-status`. One-shot failures **re
                  (throw e)))))
 ```
 
-Canonical error `:type`s: `:timeout` · `:no-responders` · `:connect-failed` · `:connection-closed` · `:permissions-violation` · `:codec-error` · `:max-payload-exceeded` · `:protocol-error` · `:drained`.
+Canonical error `:type`s: `:timeout` · `:no-responders` · `:connect-failed` · `:connection-closed` · `:permissions-violation` · `:codec-error` · `:max-payload-exceeded` · `:protocol-error` · `:drained` · `:slow-consumer` · `:auth-invalid`.
+
+**Caller-misuse validation errors** are a separate category ([ADR 0015](docs/adr/0015-validation-errors-are-a-separate-category.md)). A malformed argument — a non-token header name, an out-of-range `max`, a `reply` to a message with no reply subject — is caught *before* any native call and surfaced on the operation's own channel: synchronous operations **throw** it (`publish`, `subscribe`, `reply`, `unsubscribe`), while `connect` **rejects its promise**. They never reach an `:on-status`/`:on-error` sink. Their `:type`s — `:invalid-header` · `:invalid-max` · `:invalid-max-pending` · `:no-reply-subject` · `:invalid-capacity` — are diagnostic (fix the call, don't branch on them in production), and the set is open: new guards may add more.
 
 ## Backpressure without core.async
 

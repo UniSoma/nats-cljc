@@ -1455,6 +1455,30 @@
                             (catch :default e (:type (ex-data e)))))
                     "max-pending 0 is rejected as :invalid-max-pending, not armed as a zero cap"))))))
 
+;; Replying to a plain pub/sub message — one with no :reply subject — is caller
+;; misuse: there is nowhere to send the answer. reply rejects it synchronously with
+;; a portable `:type :no-reply-subject` (parallel to :invalid-header), before any
+;; native publish, rather than publishing to a nil subject (CONTEXT: Validation
+;; error; ADR 0015).
+(deftest reply-without-reply-subject-rejected
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (is (= :no-reply-subject
+                (try (nats/reply conn {:subject "noreply.msg" :data payload} payload)
+                     :no-throw
+                     (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+             "reply to a message with no :reply subject is rejected as :no-reply-subject, never published to a nil subject")))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (is (= :no-reply-subject
+                       (try (nats/reply conn {:subject "noreply.msg" :data payload} payload)
+                            :no-throw
+                            (catch :default e (:type (ex-data e)))))
+                    "reply to a message with no :reply subject is rejected as :no-reply-subject, never published to a nil subject"))))))
+
 ;; ===========================================================================
 ;; Error model (ADR 0006): every canonical Error :type reproduced and asserted
 ;; with identical shape on both legs. One-shot ops reject their promise; async
