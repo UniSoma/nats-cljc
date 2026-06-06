@@ -24,6 +24,8 @@ Operational (ADR 0006), rejecting the relevant operation's promise:
 | Wrong last sequence (optimistic-concurrency / dedup `:expect` rejection) | 10071 / 10164 | `:wrong-last-sequence` |
 | Any other JetStream API error (incl. server-rejected configs) | — | `:jetstream-api-error` (carries `{:code :description}`) |
 
+**The entry verify reinterprets only a no-responder.** `(jetstream conn)` forces a `$JS.API.INFO` request (ADR 0017); like any request it can also `:timeout` or hit a `:connection-closed` / `:drained` connection. Only the **no-responder** outcome means JetStream is absent and becomes `:jetstream-not-enabled`; the others pass through as their core `:type`s (ADR 0006), identically on both legs — relabelling a transient `:timeout` as the permanent `:jetstream-not-enabled` would tell a caller to give up on a blip. nats.js separates the modes natively by error name; the JVM cannot (jnats collapses timeout and no-responder into one `IOException`), so it disambiguates with the round-trip-free `ServerInfo.isJetStreamAvailable()` flag — see ADR 0017. Account-level disablement still arrives as err_code 10039 through the table above, not this path.
+
 Operational, side-band, routed to a consume's `:on-error` only: `:heartbeats-missed`, `:consumer-deleted`, `:exceeded-limits`.
 
 Validation (ADR 0015), raised pre-flight on the operation's own channel: `:invalid-name`, `:unknown-config-key`, `:reserved-header`, and the normalized nats.js `InvalidArgument` / `InvalidOperation` family (e.g. binding an ordered consumer).

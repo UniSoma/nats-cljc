@@ -7,13 +7,15 @@ One portable `.cljc` suite (`test/nats_cljc/`) runs on every platform. **Locally
 Every leg talks to a real server — no mocks. NATS forces anonymous, token, and operator/JWT auth onto separate servers, but static users combine, so four servers cover every leg:
 
 ```bash
-nats-server -c ci/nats.conf       &   # anonymous            — TCP :4222 / ws :8080 / http :8222 (monitoring)
-nats-server -c ci/nats-token.conf &   # token                — TCP :4223 / ws :8081
-nats-server -c ci/nats-users.conf &   # user/pass + nkey     — TCP :4224 / ws :8082
-nats-server -c ci/nats-jwt.conf   &   # jwt + creds          — TCP :4225 / ws :8083
+nats-server -c ci/nats.conf       &   # anonymous + JetStream — TCP :4222 / ws :8080 / http :8222 (monitoring)
+nats-server -c ci/nats-token.conf &   # token                 — TCP :4223 / ws :8081
+nats-server -c ci/nats-users.conf &   # user/pass + nkey      — TCP :4224 / ws :8082
+nats-server -c ci/nats-jwt.conf   &   # jwt + creds           — TCP :4225 / ws :8083
 ```
 
 `ci/nats-users.conf` holds both a password user and an nkey user in one `users` array; `ci/nats-jwt.conf` is operator mode and serves both the jwt and creds legs. `bb pre_start` starts all of these idempotently. `nats-server` ships in the dev image. The JVM leg uses TCP; Node uses `ws://` (ADR 0001).
+
+**JetStream** is enabled on the anonymous `:4222` server only (a `jetstream {}` block with a gitignored `store_dir`): the Phase-2 suite obtains its context there, while the token `:4223` server stays JS-disabled so `(jetstream conn)` against it exercises `:jetstream-not-enabled` (ADR 0017). This requires **`nats-server` >= 2.12** (local 2.14.1 satisfies it); JetStream tests default to `:storage :memory`, so streams vanish on restart even if a crashed test skips teardown.
 
 The nkey / JWT / creds fixtures (server configs in `ci/`, matching seeds/JWTs/creds in the test) were generated once with [`nsc`](https://github.com/nats-io/nsc) — it's in the dev image (`.aishell/Dockerfile`). CI does not need `nsc`; it only starts `nats-server` against the checked-in configs. To regenerate: `nsc generate nkey --user` for the standalone nkey, and an operator → account → user chain (`nsc add operator/account/user`, then `nsc generate config --mem-resolver` and `nsc generate creds`) for the JWT/creds leg.
 

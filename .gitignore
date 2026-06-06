@@ -6,6 +6,10 @@
 /.nrepl-port
 *.log
 
+# JetStream store for the JS-enabled CI server (ci/nats.conf); tests use
+# :storage :memory, so nothing here is meant to persist.
+/ci/.jsstore/
+
 # tool caches
 /.clj-kondo/.cache
 /.clj-kondo/imports

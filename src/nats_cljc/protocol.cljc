@@ -7,6 +7,10 @@
    - `Drainable` — draining, supported by a connection AND a single subscription,
      so the facade's `drain` dispatches uniformly over either.
    - `Sub` — a subscription's own lifecycle predicate.
+   - `JetStream` — vends the JetStream context (ADR 0017). Unlike the others, the
+     platform Connection records do NOT implement it inline; the JetStream impl
+     namespaces `extend` it onto them, so the `@nats-io/jetstream` import stays out
+     of a core-only CLJS bundle (ADR 0016).
 
    The lifecycle slice added -flush/-close/-drain; request/reply added -request;
    the queue-groups slice gave `-subscribe` a queue arg, returned a Subscription
@@ -73,3 +77,20 @@
      (counted from subscription start). Idempotent: unsubscribing an
      already-ended subscription is a silent no-op (ADR 0012). The facade owns the
      arities and validates `max`."))
+
+(defprotocol JetStream
+  "Vends the JetStream context (ADR 0017), the single async handle every JetStream
+   operation flows through. Defined here so the pure protocol lives in the
+   core-reachable namespace, but EXTENDED onto each platform's Connection record
+   from the JetStream impl namespaces (`nats-cljc.jetstream.impl.*`), never
+   implemented inline on the record — so the `@nats-io/jetstream` import stays out
+   of a core-only CLJS bundle (ADR 0016)."
+  (-jetstream [conn]
+    "Return a native promise of a JetStream context — a platform record holding
+     both the data plane (publish, pull) and the management plane (stream/consumer
+     admin), which the native clients split but the portable surface collapses into
+     one. Obtaining it verifies JetStream is enabled by forcing a JS-info
+     round-trip on both legs (native on CLJS, added inside the off-thread wrap on
+     the JVM), so the promise rejects with `:type :jetstream-not-enabled` (err
+     10039) at the handle when it is not — never deferred to the first operation
+     (ADR 0017/0020)."))
