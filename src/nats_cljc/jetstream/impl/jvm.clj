@@ -15,11 +15,14 @@
   ;; the `:import` also reaches into it for the `JvmConnection` class to extend.
   (:require [nats-cljc.protocol :as proto]
             [nats-cljc.impl.jvm :as core]
-            [nats-cljc.jetstream.error :as jet-err])
+            [nats-cljc.jetstream.error :as jet-err]
+            [nats-cljc.jetstream.stream :as stream])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException]
-           [io.nats.client.api ServerInfo]
+           [io.nats.client.api ServerInfo StreamConfiguration StorageType RetentionPolicy StreamInfo StreamState]
            [java.io IOException]
+           [java.time Duration]
+           [java.time.format DateTimeFormatter]
            [java.util.concurrent CompletableFuture]
            [java.util.function Supplier]))
 
@@ -110,3 +113,82 @@
                 (throw (ex-info (.getMessage e)
                                 {:type (closing-type (.getStatus client))} e))))))))
      identity)))
+
+(defn- api-ex->ex-info
+  "Normalize a jnats JetStreamApiException — what `addStream`/`getStreamInfo`/
+   `deleteStream` raise for a server-issued rejection — to the portable operational
+   ex-info (ADR 0020): the err_code routes to its `:type` and carries
+   `{:code :description}`. A not-found is err_code 10059 ⇒ `:stream-not-found`; any
+   other (e.g. a subject-overlap 10065) defaults to `:jetstream-api-error`."
+  [^JetStreamApiException e]
+  (ex-info (.getMessage e)
+           (jet-err/api-error-data (.getApiErrorCode e) (.getErrorDescription e))
+           e))
+
+(defn- off-thread
+  "Run the blocking management thunk `f` off the caller's thread (ADR 0002),
+   normalizing a server-issued JetStreamApiException to its portable operational
+   `:type` and delivering the BARE ex-info on rejection (ADR 0006/0020) — the
+   `then identity` re-wrap the entry point uses, shared by the three verbs."
+  [f]
+  (core/then
+   (CompletableFuture/supplyAsync
+    (reify Supplier
+      (get [_]
+        (try (f)
+             (catch JetStreamApiException e (throw (api-ex->ex-info e)))))))
+   identity))
+
+(defn ->stream-config
+  "Build a jnats StreamConfiguration from the portable closed kebab `config`
+   (ADR 0020). Only the keys present are set, so an absent key takes the server
+   default; the enum keywords route through the shared wire tables and
+   `:max-age-ms` becomes a Duration (the CLJS leg uses Nanos)."
+  ^StreamConfiguration [config]
+  (let [b (StreamConfiguration/builder)]
+    (.name b ^String (:name config))
+    (when-let [subjects (:subjects config)]
+      (.subjects b ^"[Ljava.lang.String;" (into-array String subjects)))
+    (when-let [storage (:storage config)]
+      (.storageType b (StorageType/get (stream/storage->wire storage))))
+    (when-let [retention (:retention config)]
+      (.retentionPolicy b (RetentionPolicy/get (stream/retention->wire retention))))
+    (when-let [max-age-ms (:max-age-ms config)]
+      (.maxAge b (Duration/ofMillis max-age-ms)))
+    (.build b)))
+
+(defn stream-config->map
+  "Read a jnats StreamConfiguration back into the normalized portable kebab map —
+   the active config the server applied, always the full curated set (defaults
+   included), so a round-tripped info is predictable (ADR 0020). The wire enum
+   strings route back through the shared tables; the Duration becomes integer ms."
+  [^StreamConfiguration c]
+  {:name (.getName c)
+   :subjects (vec (.getSubjects c))
+   :storage (stream/wire->storage (str (.getStorageType c)))
+   :retention (stream/wire->retention (str (.getRetentionPolicy c)))
+   :max-age-ms (.toMillis (.getMaxAge c))})
+
+(defn stream-info->map
+  "Curate a jnats StreamInfo into the normalized portable map (ADR 0020): the active
+   `:config`, the `:created` timestamp as ISO-8601 (jnats hands back a
+   ZonedDateTime, whose `toString` carries a `[GMT]` zone-region suffix that
+   ISO_OFFSET_DATE_TIME drops), and a curated `:state`."
+  [^StreamInfo si]
+  (let [^StreamState st (.getStreamState si)]
+    {:config (stream-config->map (.getConfiguration si))
+     :created (.format (.getCreateTime si) DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+     :state {:messages (.getMsgCount st)
+             :bytes (.getByteCount st)
+             :first-seq (.getFirstSequence st)
+             :last-seq (.getLastSequence st)
+             :consumer-count (.getConsumerCount st)}}))
+
+(extend-type JvmJetStreamContext
+  proto/StreamManager
+  (-create-stream [ctx config]
+    (off-thread #(stream-info->map (.addStream ^JetStreamManagement (:jsm ctx) (->stream-config config)))))
+  (-stream-info [ctx name]
+    (off-thread #(stream-info->map (.getStreamInfo ^JetStreamManagement (:jsm ctx) ^String name))))
+  (-delete-stream [ctx name]
+    (off-thread #(do (.deleteStream ^JetStreamManagement (:jsm ctx) ^String name) nil))))

@@ -8,6 +8,7 @@
             [nats-cljc.core :as nats]
             [nats-cljc.jetstream :as jet]
             [nats-cljc.jetstream.error :as jet-err]
+            [nats-cljc.jetstream.stream :as stream]
             #?(:clj  [nats-cljc.jetstream.impl.jvm :as jet-jvm]
                :cljs [nats-cljc.jetstream.impl.js :as jet-js])
             #?(:cljs [promesa.core :as p]))
@@ -158,3 +159,128 @@
                     (p/catch (fn [e]
                                (is (= :jetstream-not-enabled (:type (ex-data e)))
                                    "(jetstream conn) rejects with :jetstream-not-enabled on a JS-disabled server")))))))))
+
+;; A canonical, fully-specified portable config — every supported key set — so the
+;; kebab->native->kebab round-trip is exact and the create/info round-trip below has
+;; something to compare against. :memory so a skipped teardown vanishes on restart.
+(def ^:private a-config
+  {:name "TRACER" :subjects ["tracer.>"] :storage :memory :retention :work-queue :max-age-ms 60000})
+
+;; A loose ISO-8601 matcher: a date, a `T`, and a time. The JVM formats its
+;; ZonedDateTime to this; nats.js hands back the server's RFC3339 string already in
+;; it — the cross-leg point is that `:created` is a normalized timestamp string,
+;; never a native ZonedDateTime/Date (ADR 0020).
+(def ^:private iso-re #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.*")
+
+;; Capture the validation `:type` a synchronous deep-module guard throws, portably.
+(defn- thrown-type [thunk]
+  (try (thunk) nil
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e (:type (ex-data e)))))
+
+;; AC5, deep-module unit (ADR 0015/0020), no server: building the native config is a
+;; pure local construction, so the kebab<->native round-trip needs no JetStream — a
+;; fully-specified config round-trips to itself, proving the enum keywords and the
+;; ms-duration survive each leg's translation. The closed-key + name guards are the
+;; portable pre-flight half, raising their validation `:type`s before any native call.
+(deftest deep-module-config-round-trip-and-validation
+  (is (= a-config #?(:clj  (jet-jvm/stream-config->map (jet-jvm/->stream-config a-config))
+                     :cljs (jet-js/stream-config->map (jet-js/->stream-config a-config))))
+      "a fully-specified config round-trips kebab->native->kebab on this leg")
+  (is (= a-config (stream/validate-config a-config))
+      "a recognized config passes validation unchanged")
+  (is (= :unknown-config-key (thrown-type #(stream/validate-config {:name "OK" :bogus 1})))
+      "an unrecognized key (the map is closed) is :unknown-config-key")
+  (is (= :invalid-name (thrown-type #(stream/validate-name "bad.name")))
+      "a name carrying a subject delimiter is :invalid-name")
+  (is (= "OK" (stream/validate-name "OK"))
+      "a well-formed name passes validation unchanged"))
+
+;; AC3 (ADR 0015), no server: a validation failure surfaces through create-stream's
+;; OWN channel — the returned promise REJECTS, it does not throw synchronously — and
+;; pre-flight, before any native call. A nil ctx proves the pre-flight: validation
+;; rejects first, so the native -create-stream never dereferences it.
+(deftest create-stream-rejects-validation-on-its-promise
+  #?(:clj
+     (do
+       (is (= :unknown-config-key
+              (:type (ex-data (reject-reason (jet/create-stream nil {:name "OK" :bogus 1})))))
+           "an unknown key rejects the create-stream promise pre-flight")
+       (is (= :invalid-name
+              (:type (ex-data (reject-reason (jet/create-stream nil {:name "bad.name" :subjects ["x.>"]})))))
+           "a malformed name rejects the create-stream promise pre-flight"))
+     :cljs
+     (async done
+            (-> (jet/create-stream nil {:name "OK" :bogus 1})
+                (p/then (fn [_] (is false "expected an :unknown-config-key rejection")))
+                (p/catch (fn [e] (is (= :unknown-config-key (:type (ex-data e)))
+                                     "an unknown key rejects the create-stream promise pre-flight")))
+                (p/then (fn [_] (jet/create-stream nil {:name "bad.name" :subjects ["x.>"]})))
+                (p/then (fn [_] (is false "expected an :invalid-name rejection")))
+                (p/catch (fn [e] (is (= :invalid-name (:type (ex-data e)))
+                                     "a malformed name rejects the create-stream promise pre-flight")))
+                (p/finally (fn [_ _] (done)))))))
+
+;; AC1 + AC2 (ADR 0017/0020), integration on the JetStream-enabled :4222 server:
+;; create a Stream from the portable config and read its normalized info back (config
+;; round-trips, :created is an ISO-8601 string, a fresh stream has no messages), then
+;; delete it and confirm a subsequent info surfaces the operational :stream-not-found.
+(deftest stream-create-info-delete
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx     (deref (jet/jetstream conn) 5000 ::timeout)
+               created (deref (jet/create-stream ctx a-config) 5000 ::timeout)
+               info    (deref (jet/stream-info ctx "TRACER") 5000 ::timeout)]
+           (is (= a-config (:config created)) "create-stream returns the normalized config")
+           (is (= a-config (:config info)) "stream-info round-trips the normalized config")
+           (is (re-matches iso-re (:created info)) "stream-info :created is an ISO-8601 string")
+           (is (= 0 (get-in info [:state :messages])) "a freshly created stream has no messages")
+           (is (nil? (deref (jet/delete-stream ctx "TRACER") 5000 ::timeout)) "delete-stream resolves nil")
+           (is (= :stream-not-found (:type (ex-data (reject-reason (jet/stream-info ctx "TRACER")))))
+               "stream-info after delete surfaces :stream-not-found"))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx     (jet/jetstream conn)
+                        created (jet/create-stream ctx a-config)
+                        info    (jet/stream-info ctx "TRACER")]
+                  (is (= a-config (:config created)) "create-stream returns the normalized config")
+                  (is (= a-config (:config info)) "stream-info round-trips the normalized config")
+                  (is (re-matches iso-re (:created info)) "stream-info :created is an ISO-8601 string")
+                  (is (= 0 (get-in info [:state :messages])) "a freshly created stream has no messages")
+                  (p/let [del (jet/delete-stream ctx "TRACER")]
+                    (is (nil? del) "delete-stream resolves nil")
+                    (-> (jet/stream-info ctx "TRACER")
+                        (p/then (fn [_] (is false "expected :stream-not-found after delete")))
+                        (p/catch (fn [e] (is (= :stream-not-found (:type (ex-data e)))
+                                             "stream-info after delete surfaces :stream-not-found")))))))))))
+
+;; AC4 (ADR 0020), integration: a config the SERVER rejects (a subject overlap with an
+;; existing stream — valid name, valid keys, so not pre-flight validation) is
+;; detected AFTER the native call and so is operational :jetstream-api-error, carrying
+;; the {:code :description} the server returned. Cleans up the first stream after.
+(deftest server-rejected-config-is-jetstream-api-error
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "OVL_A" :subjects ["shared.>"] :storage :memory}) 5000 ::timeout)
+           (let [e (reject-reason (jet/create-stream ctx {:name "OVL_B" :subjects ["shared.>"] :storage :memory}))]
+             (is (= :jetstream-api-error (:type (ex-data e))) "a server-rejected config is operational :jetstream-api-error")
+             (is (number? (:code (ex-data e))) ":jetstream-api-error carries the server's :code")
+             (is (string? (:description (ex-data e))) ":jetstream-api-error carries the server's :description"))
+           (deref (jet/delete-stream ctx "OVL_A") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "OVL_A" :subjects ["shared.>"] :storage :memory})]
+                  (-> (jet/create-stream ctx {:name "OVL_B" :subjects ["shared.>"] :storage :memory})
+                      (p/then (fn [_] (is false "expected a :jetstream-api-error rejection")))
+                      (p/catch (fn [e]
+                                 (is (= :jetstream-api-error (:type (ex-data e))) "a server-rejected config is operational :jetstream-api-error")
+                                 (is (number? (:code (ex-data e))) ":jetstream-api-error carries the server's :code")
+                                 (is (string? (:description (ex-data e))) ":jetstream-api-error carries the server's :description")))
+                      (p/then (fn [_] (jet/delete-stream ctx "OVL_A"))))))))))

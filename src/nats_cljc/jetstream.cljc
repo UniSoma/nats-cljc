@@ -10,6 +10,9 @@
    side-effect only (it `extend`s the JetStream protocol onto the platform
    Connection record); this facade calls the record through the protocol."
   (:require [nats-cljc.protocol :as proto]
+            [nats-cljc.jetstream.stream :as stream]
+            #?(:clj  [nats-cljc.impl.jvm :as impl]
+               :cljs [nats-cljc.impl.js :as impl])
             #?(:clj  [nats-cljc.jetstream.impl.jvm]
                :cljs [nats-cljc.jetstream.impl.js])))
 
@@ -25,3 +28,42 @@
    never deferred to the first operation (ADR 0017/0020)."
   [conn]
   (proto/-jetstream conn))
+
+(defn create-stream
+  "Create a Stream on the JetStream context `ctx` from the portable, CLOSED kebab
+   `config` map, returning a platform-native promise that resolves to the
+   normalized StreamInfo map (`{:config :created :state}`, `:created` an ISO-8601
+   string). Config keys: `:name` (required), `:subjects`, `:storage` (`:file` |
+   `:memory`), `:retention` (`:limits` | `:interest` | `:work-queue`), and
+   `:max-age-ms` (integer milliseconds). The map is closed: an unrecognized key
+   rejects the promise with a validation `:type :unknown-config-key`, and a
+   malformed `:name` with `:invalid-name`, both pre-flight before any native call
+   (ADR 0015). A config the SERVER rejects (e.g. a subject overlap) rejects with an
+   operational `:type :jetstream-api-error` carrying `{:code :description}` — it is
+   detected after the native call, so it is operational, not validation (ADR 0020)."
+  [ctx config]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-config config)))
+      (impl/bind (fn [_] (proto/-create-stream ctx config)))))
+
+(defn stream-info
+  "Look up the Stream named `name` on the JetStream context `ctx`, returning a
+   platform-native promise that resolves to the normalized StreamInfo map (see
+   `create-stream`). The promise rejects with an operational `:type
+   :stream-not-found` when no such Stream exists, and pre-flight with a validation
+   `:type :invalid-name` when `name` is malformed (ADR 0015/0020)."
+  [ctx name]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-name name)))
+      (impl/bind (fn [_] (proto/-stream-info ctx name)))))
+
+(defn delete-stream
+  "Delete the Stream named `name` on the JetStream context `ctx`, returning a
+   platform-native promise that resolves to nil once it is gone. The promise
+   rejects with an operational `:type :stream-not-found` when no such Stream
+   exists, and pre-flight with a validation `:type :invalid-name` when `name` is
+   malformed (ADR 0015/0020)."
+  [ctx name]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-name name)))
+      (impl/bind (fn [_] (proto/-delete-stream ctx name)))))

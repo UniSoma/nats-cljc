@@ -94,3 +94,22 @@
      the JVM), so the promise rejects with `:type :jetstream-not-enabled` (err
      10039) at the handle when it is not — never deferred to the first operation
      (ADR 0017/0020)."))
+
+(defprotocol StreamManager
+  "JetStream stream management (ADR 0017), the management-plane verbs — EXTENDED
+   onto each platform's JetStream context record from the impl namespaces, never
+   implemented inline, so the `@nats-io/jetstream` import stays confined (ADR 0016).
+   The facade owns the public arglists and the pre-flight validation; these deal in
+   the portable closed kebab config map and the normalized info map, translating
+   to/from each leg's native config inside the impl (ADR 0020)."
+  (-create-stream [ctx config]
+    "Create a Stream from the portable closed kebab `config` (already validated by
+     the facade), returning a native promise of the normalized StreamInfo map. The
+     promise rejects with an operational `:jetstream-api-error` (carrying
+     `{:code :description}`) when the server rejects the config (ADR 0020).")
+  (-stream-info [ctx name]
+    "Return a native promise of the normalized StreamInfo map for the Stream
+     `name`, rejecting with `:type :stream-not-found` when it does not exist.")
+  (-delete-stream [ctx name]
+    "Delete the Stream `name`, returning a native promise that resolves to nil once
+     it is gone and rejects with `:type :stream-not-found` when it does not exist."))
