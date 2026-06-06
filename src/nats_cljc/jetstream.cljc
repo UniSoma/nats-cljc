@@ -9,8 +9,11 @@
    requires it does not pay for (ADR 0016). The impl require is for that load
    side-effect only (it `extend`s the JetStream protocol onto the platform
    Connection record); this facade calls the record through the protocol."
-  (:require [nats-cljc.protocol :as proto]
+  (:require [nats-cljc.core :as core]
+            [nats-cljc.codec :as codec]
+            [nats-cljc.protocol :as proto]
             [nats-cljc.jetstream.stream :as stream]
+            [nats-cljc.jetstream.pub :as pub]
             #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])
             #?(:clj  [nats-cljc.jetstream.impl.jvm]
@@ -67,3 +70,28 @@
   (-> (impl/resolved nil)
       (impl/then (fn [_] (stream/validate-name name)))
       (impl/bind (fn [_] (proto/-delete-stream ctx name)))))
+
+(defn publish
+  "Acked publish of `data` to `subject` through the JetStream context `ctx`, encoding
+   `data` with the context's default codec, returning a platform-native promise that
+   resolves to the normalized PubAck map `{:stream :seq :duplicate :domain}`. `opts`:
+   `:headers` (a map of case-sensitive string names to one or more string values, a
+   scalar normalized to a one-element vector); `:msg-id` (server-side dedup within the
+   stream's dedup window — the PubAck `:duplicate` is true on a retry); `:expect`
+   (`{:last-seq :last-msg-id :stream :last-subject-seq}`, optimistic-concurrency
+   assertions whose mismatch rejects with an operational `:type :wrong-last-sequence`);
+   `:timeout-ms` (a missing PubAck rejects rather than hangs); and `:codec` (a per-call
+   codec override — only `:data` is codec'd). `:msg-id`/`:expect` are the sanctioned
+   way to set reserved `Nats-*` headers, so a reserved key set directly in `:headers`
+   rejects pre-flight with a validation `:type :reserved-header`, and a malformed
+   header with `:invalid-header` — both before any native call (ADR 0015/0020)."
+  ([ctx subject data] (publish ctx subject data {}))
+  ([ctx subject data {:keys [headers] :as opts}]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (pub/validate-headers headers)))
+       (impl/then (fn [hs]
+                    {:headers (core/normalize-headers hs)
+                     :bytes   (codec/encode (or (:codec opts) (:codec ctx)) data)}))
+       (impl/bind (fn [{:keys [headers bytes]}]
+                    (proto/-js-publish ctx subject headers bytes
+                                       (select-keys opts [:msg-id :expect :timeout-ms])))))))

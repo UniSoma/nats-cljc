@@ -17,10 +17,11 @@
 ;; error-model slice's job.
 (def ^:private ^Duration op-timeout (Duration/ofSeconds 10))
 
-(defn- ->headers
+(defn ->headers
   "Build a jnats Headers from the canonical portable map `{name -> [str ...]}`, or
    nil for none. Names are added verbatim (the Collection overload), so the
-   case-sensitive names survive to the wire."
+   case-sensitive names survive to the wire. Public (within this `^:no-doc` ns) so
+   the JetStream impl reuses it for acked publish rather than rebuilding it."
   [headers]
   (when headers
     (reduce-kv (fn [^Headers h ^String k vs] (.add h k ^java.util.Collection vs))

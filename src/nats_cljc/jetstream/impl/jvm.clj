@@ -18,19 +18,21 @@
             [nats-cljc.jetstream.error :as jet-err]
             [nats-cljc.jetstream.stream :as stream])
   (:import [nats_cljc.impl.jvm JvmConnection]
-           [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException]
-           [io.nats.client.api ServerInfo StreamConfiguration StorageType RetentionPolicy StreamInfo StreamState]
+           [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions]
+           [io.nats.client.api ServerInfo StreamConfiguration StorageType RetentionPolicy StreamInfo StreamState PublishAck]
            [java.io IOException]
            [java.time Duration]
            [java.time.format DateTimeFormatter]
            [java.util.concurrent CompletableFuture]
-           [java.util.function Supplier]))
+           [java.util.function BiFunction Supplier]))
 
 ;; The JetStream context (ADR 0017): one handle holding both jnats' data-plane
 ;; (`JetStream`) and management-plane (`JetStreamManagement`) objects. The native
 ;; client hands you the two separately; the portable surface collapses them into a
-;; single value every JetStream operation flows through.
-(defrecord JvmJetStreamContext [^JetStream js ^JetStreamManagement jsm])
+;; single value every JetStream operation flows through. `codec` is the connection's
+;; default (the resolved `Prepared`), captured at entry so acked publish encodes
+;; `:data` with it unless a per-call `:codec` overrides (ADR 0011).
+(defrecord JvmJetStreamContext [^JetStream js ^JetStreamManagement jsm codec])
 
 (defn verify-io-type
   "Classify the `IOException` jnats raises when the forced `$JS.API.INFO` round-trip
@@ -104,7 +106,7 @@
                                         "JetStream INFO request timed out"
                                         "JetStream is not enabled on the server or account")
                                       {:type (verify-io-type available?)} e)))))
-                (->JvmJetStreamContext js jsm))
+                (->JvmJetStreamContext js jsm (:codec conn)))
               (catch IOException e
                 ;; Reached ONLY from the construction above (ensureNotClosing on a
                 ;; non-open connection): the round-trip IOException is already
@@ -124,6 +126,20 @@
   (ex-info (.getMessage e)
            (jet-err/api-error-data (.getApiErrorCode e) (.getErrorDescription e))
            e))
+
+(defn- publish-ex->ex-info
+  "Normalize the exception a failed `publishAsync` surfaces. A server rejection (e.g. a
+   wrong `:expect` → JetStreamApiException 10071) arrives buried: jnats completes the
+   future exceptionally with a RuntimeException whose cause is the JetStreamApiException,
+   and the `.handle` stage wraps that once more in a CompletionException. The cause
+   chain is walked to the JetStreamApiException and normalized via the shared table
+   (ADR 0020); an exception with none in its chain passes through unwrapped."
+  [^Throwable e]
+  (loop [t e]
+    (cond
+      (instance? JetStreamApiException t) (api-ex->ex-info t)
+      (.getCause t)                       (recur (.getCause t))
+      :else                               e)))
 
 (defn- off-thread
   "Run the blocking management thunk `f` off the caller's thread (ADR 0002),
@@ -184,6 +200,34 @@
              :last-seq (.getLastSequence st)
              :consumer-count (.getConsumerCount st)}}))
 
+(defn ->publish-options
+  "Build a jnats PublishOptions from the portable publish `opts` (ADR 0020). Only the
+   keys present are set, so an absent key takes the server default; `:msg-id` becomes
+   the dedup messageId, `:timeout-ms` a streamTimeout Duration (the CLJS leg uses a
+   plain ms number), and each `:expect` field its expected-* optimistic-concurrency
+   assertion. The reserved Nats-* headers these map to are set by the native client,
+   which is why setting them directly in user `:headers` is rejected pre-flight."
+  ^PublishOptions [{:keys [msg-id expect timeout-ms]}]
+  (let [b (PublishOptions/builder)]
+    (when msg-id (.messageId b ^String msg-id))
+    (when timeout-ms (.streamTimeout b (Duration/ofMillis timeout-ms)))
+    (when-let [{:keys [last-seq last-msg-id stream last-subject-seq]} expect]
+      (when last-seq (.expectedLastSequence b (long last-seq)))
+      (when last-msg-id (.expectedLastMsgId b ^String last-msg-id))
+      (when stream (.expectedStream b ^String stream))
+      (when last-subject-seq (.expectedLastSubjectSequence b (long last-subject-seq))))
+    (.build b)))
+
+(defn- ->pub-ack
+  "Normalize a jnats PublishAck into the portable PubAck map (ADR 0020):
+   `{:stream :seq :duplicate :domain}`, `:domain` nil when none is configured. One
+   shared shape so both legs surface an ack identically."
+  [^PublishAck a]
+  {:stream    (.getStream a)
+   :seq       (.getSeqno a)
+   :duplicate (.isDuplicate a)
+   :domain    (.getDomain a)})
+
 (extend-type JvmJetStreamContext
   proto/StreamManager
   (-create-stream [ctx config]
@@ -192,3 +236,21 @@
     (off-thread #(stream-info->map (.getStreamInfo ^JetStreamManagement (:jsm ctx) ^String name))))
   (-delete-stream [ctx name]
     (off-thread #(do (.deleteStream ^JetStreamManagement (:jsm ctx) ^String name) nil))))
+
+(extend-type JvmJetStreamContext
+  proto/JetStreamData
+  (-js-publish [ctx subject headers bytes opts]
+    ;; `.handle` runs on both outcomes so a server rejection is normalized to its
+    ;; operational ex-info in the same stage that maps a success to the PubAck; the
+    ;; thrown ex-info then surfaces BARE through `core/then ... identity`'s
+    ;; deliver-bare (ADR 0006), like the management verbs' `off-thread`.
+    (core/then
+     (.handle ^CompletableFuture (.publishAsync ^JetStream (:js ctx) ^String subject
+                                                (core/->headers headers) ^bytes bytes
+                                                (->publish-options opts))
+              (reify BiFunction
+                (apply [_ ack e]
+                  (if e
+                    (throw (publish-ex->ex-info e))
+                    (->pub-ack ack)))))
+     identity)))

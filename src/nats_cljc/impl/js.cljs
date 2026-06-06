@@ -21,10 +21,11 @@
   (or (instance? nats-core/TimeoutError e)
       (instance? nats-core/TimeoutError (.-cause ^js e))))
 
-(defn- ->headers
+(defn ->headers
   "Build a nats.js MsgHdrs from the canonical portable map `{name -> [str ...]}`,
    or nil for none. append's default Exact match stores names verbatim, so the
-   case-sensitive names survive to the wire."
+   case-sensitive names survive to the wire. Public (within this `^:no-doc` ns) so
+   the JetStream impl reuses it for acked publish rather than rebuilding it."
   [headers]
   (when headers
     (let [h (nats-core/headers)]

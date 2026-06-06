@@ -19,8 +19,10 @@
 ;; The JetStream context (ADR 0017): one handle holding both nats.js' data-plane
 ;; (`jetstream`) and management-plane (`jetstreamManager`) objects. The native
 ;; client hands you the two separately; the portable surface collapses them into a
-;; single value every JetStream operation flows through.
-(defrecord JsJetStreamContext [js jsm])
+;; single value every JetStream operation flows through. `codec` is the connection's
+;; default (the resolved `Prepared`), captured at entry so acked publish encodes
+;; `:data` with it unless a per-call `:codec` overrides (ADR 0011).
+(defrecord JsJetStreamContext [js jsm codec])
 
 (defn verify-error
   "Normalize a verify-at-entry rejection to a portable ex-info (ADR 0017/0020). The
@@ -51,7 +53,7 @@
     (let [client (:client conn)
           js (jetstream/jetstream client)]
       (-> (jetstream/jetstreamManager client)
-          (.then (fn [jsm] (->JsJetStreamContext js jsm)))
+          (.then (fn [jsm] (->JsJetStreamContext js jsm (:codec conn))))
           (.catch (fn [e] (throw (verify-error e))))))))
 
 (defn ->stream-config
@@ -110,6 +112,36 @@
                e))
     e))
 
+(defn ->publish-options
+  "Build a nats.js JetStreamPublishOptions object from the portable publish `opts`
+   (ADR 0020). Only the keys present are set, so an absent key takes the server
+   default; `:msg-id` becomes `msgID`, `:timeout-ms` a plain `timeout` ms number (the
+   JVM leg uses a Duration), and each `:expect` field its camelCased optimistic-
+   concurrency assertion under `expect`. `clj->js` produces the string-keyed object
+   nats.js reads, surviving advanced compilation. The reserved Nats-* headers these
+   map to are set by the native client, which is why setting them directly in user
+   `:headers` is rejected pre-flight."
+  [{:keys [msg-id expect timeout-ms]}]
+  (clj->js
+   (cond-> {}
+     msg-id     (assoc :msgID msg-id)
+     timeout-ms (assoc :timeout timeout-ms)
+     expect     (assoc :expect (cond-> {}
+                                 (:last-seq expect)         (assoc :lastSequence (:last-seq expect))
+                                 (:last-msg-id expect)      (assoc :lastMsgID (:last-msg-id expect))
+                                 (:stream expect)           (assoc :streamName (:stream expect))
+                                 (:last-subject-seq expect) (assoc :lastSubjectSequence (:last-subject-seq expect)))))))
+
+(defn- ->pub-ack
+  "Normalize a nats.js PubAck into the portable PubAck map (ADR 0020):
+   `{:stream :seq :duplicate :domain}`, `:domain` coerced from a missing `domain`
+   property (undefined) to nil so it matches the JVM leg's shape exactly."
+  [^js a]
+  {:stream    (.-stream a)
+   :seq       (.-seq a)
+   :duplicate (.-duplicate a)
+   :domain    (or (.-domain a) nil)})
+
 (extend-type JsJetStreamContext
   proto/StreamManager
   (-create-stream [ctx config]
@@ -126,4 +158,16 @@
     (let [streams ^js (.-streams ^js (:jsm ctx))]
       (-> (.delete streams name)
           (.then (fn [_] nil))
+          (.catch (fn [e] (throw (api-error e))))))))
+
+(extend-type JsJetStreamContext
+  proto/JetStreamData
+  (-js-publish [ctx subject headers bytes opts]
+    ;; nats.js carries the publish headers INSIDE the options object (a `headers`
+    ;; key holding a MsgHdrs), not as a separate argument the way jnats' publishAsync
+    ;; does — so the canonical headers are built and attached to the native options.
+    (let [o ^js (->publish-options opts)]
+      (when headers (set! (.-headers o) (core/->headers headers)))
+      (-> (.publish ^js (:js ctx) subject bytes o)
+          (.then ->pub-ack)
           (.catch (fn [e] (throw (api-error e))))))))

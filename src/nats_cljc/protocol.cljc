@@ -113,3 +113,21 @@
   (-delete-stream [ctx name]
     "Delete the Stream `name`, returning a native promise that resolves to nil once
      it is gone and rejects with `:type :stream-not-found` when it does not exist."))
+
+(defprotocol JetStreamData
+  "JetStream data-plane operations (ADR 0017) — the publish/pull verbs, the sibling
+   of the management-plane `StreamManager` — EXTENDED onto each platform's JetStream
+   context record from the impl namespaces, never implemented inline, so the
+   `@nats-io/jetstream` import stays confined (ADR 0016). The facade owns the public
+   arglists, the pre-flight validation, and codec encode/decode; these deal in raw
+   wire bytes, the canonical portable header map, and the normalized PubAck."
+  (-js-publish [ctx subject headers bytes opts]
+    "Acked publish of raw `bytes` to `subject` through the JetStream context `ctx`,
+     returning a native promise of the normalized PubAck map
+     `{:stream :seq :duplicate :domain}`. `headers` is the canonical portable header
+     map `{name -> vector-of-strings}` (already guarded + normalized by the facade) or
+     nil; `opts` is `{:msg-id :expect :timeout-ms}`, which the impl translates to the
+     native publish options (`:msg-id`/`:expect` become the sanctioned reserved
+     headers). The promise rejects with an operational `:type :wrong-last-sequence`
+     when an `:expect` assertion fails, and the catch-all `:jetstream-api-error`
+     for any other server rejection (ADR 0020)."))

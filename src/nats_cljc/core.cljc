@@ -44,7 +44,7 @@
 ;; native clients otherwise diverge (jnats rejects non-ASCII, nats.js publishes it).
 (def ^:private header-value-re #"[\x20-\x7E]*")
 
-(defn- normalize-headers
+(defn ^:no-doc normalize-headers
   "Normalize a user `:headers` map to the canonical portable form the protocol
    carries: `{name -> vector-of-strings}` with case-sensitive string names. A
    scalar value is wrapped in a one-element vector; a vector is kept as-is

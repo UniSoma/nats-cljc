@@ -6,9 +6,12 @@
   (:require #?(:clj  [clojure.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is async]])
             [nats-cljc.core :as nats]
+            [nats-cljc.codec :as codec]
+            [nats-cljc.codec.json]
             [nats-cljc.jetstream :as jet]
             [nats-cljc.jetstream.error :as jet-err]
             [nats-cljc.jetstream.stream :as stream]
+            [nats-cljc.jetstream.pub :as pub]
             #?(:clj  [nats-cljc.jetstream.impl.jvm :as jet-jvm]
                :cljs [nats-cljc.jetstream.impl.js :as jet-js])
             #?(:cljs [promesa.core :as p]))
@@ -38,6 +41,8 @@
 (deftest api-error-code-normalizes
   (is (= :jetstream-not-enabled (jet-err/api-error-type 10039))
       "err_code 10039 normalizes to :jetstream-not-enabled")
+  (is (= :wrong-last-sequence (jet-err/api-error-type 10071))
+      "err_code 10071 (wrong last sequence) normalizes to :wrong-last-sequence")
   (is (= :jetstream-api-error (jet-err/api-error-type 99999))
       "an unseeded code defaults to the operational catch-all :jetstream-api-error"))
 
@@ -195,6 +200,53 @@
   (is (= "OK" (stream/validate-name "OK"))
       "a well-formed name passes validation unchanged"))
 
+;; AC4, deep-module unit (ADR 0015/0020), no server: the reserved-header guard is the
+;; portable pre-flight that keeps the Nats-* namespace sanctioned-only — :msg-id and
+;; :expect are the way to set those, so a reserved key set directly in user :headers
+;; is caller misuse, raised as :reserved-header before any native call. The check is
+;; case-insensitive (the wire names are Title-Case but the namespace is what's
+;; reserved), and a map free of reserved keys passes through unchanged.
+(deftest deep-module-reserved-header-guard
+  (is (= :reserved-header (thrown-type #(pub/validate-headers {"Nats-Msg-Id" "x"})))
+      "a reserved Nats-* header is :reserved-header")
+  (is (= :reserved-header (thrown-type #(pub/validate-headers {"nats-expected-last-sequence" "1"})))
+      "the reserved-prefix check is case-insensitive")
+  (is (= ["Nats-Msg-Id"]
+         (:keys (ex-data (try (pub/validate-headers {"Nats-Msg-Id" "x" "ok" "y"})
+                              (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))))
+      ":reserved-header carries the offending :keys")
+  (let [clean {"My-Header" ["a" "b"] "X-Trace" "1"}]
+    (is (= clean (pub/validate-headers clean))
+        "a header map free of reserved keys passes validation unchanged"))
+  (is (nil? (pub/validate-headers nil))
+      "nil headers pass through — there are none to guard"))
+
+;; AC1/AC3/AC4, deep-module unit (ADR 0020), no server: building the native publish
+;; options is a pure local construction, so the portable opts -> native round-trip
+;; needs no JetStream. :msg-id, :timeout-ms, and all four :expect fields survive each
+;; leg's translation (a Duration on the JVM, a plain ms number on CLJS), proving the
+;; per-leg option builder the impl hands the native publish.
+(deftest deep-module-publish-options-round-trip
+  (let [opts {:msg-id "id-1" :timeout-ms 3500
+              :expect {:last-seq 7 :last-msg-id "m-9" :stream "S" :last-subject-seq 3}}]
+    #?(:clj
+       (let [o (jet-jvm/->publish-options opts)]
+         (is (= "id-1" (.getMessageId o)) ":msg-id -> messageId")
+         (is (= (java.time.Duration/ofMillis 3500) (.getStreamTimeout o)) ":timeout-ms -> streamTimeout Duration")
+         (is (= 7 (.getExpectedLastSequence o)) ":last-seq -> expectedLastSequence")
+         (is (= "m-9" (.getExpectedLastMsgId o)) ":last-msg-id -> expectedLastMsgId")
+         (is (= "S" (.getExpectedStream o)) ":stream -> expectedStream")
+         (is (= 3 (.getExpectedLastSubjectSequence o)) ":last-subject-seq -> expectedLastSubjectSequence"))
+       :cljs
+       (let [o ^js (jet-js/->publish-options opts)
+             e ^js (.-expect o)]
+         (is (= "id-1" (.-msgID o)) ":msg-id -> msgID")
+         (is (= 3500 (.-timeout o)) ":timeout-ms -> timeout ms")
+         (is (= 7 (.-lastSequence e)) ":last-seq -> lastSequence")
+         (is (= "m-9" (.-lastMsgID e)) ":last-msg-id -> lastMsgID")
+         (is (= "S" (.-streamName e)) ":stream -> streamName")
+         (is (= 3 (.-lastSubjectSequence e)) ":last-subject-seq -> lastSubjectSequence")))))
+
 ;; AC3 (ADR 0015), no server: a validation failure surfaces through create-stream's
 ;; OWN channel — the returned promise REJECTS, it does not throw synchronously — and
 ;; pre-flight, before any native call. A nil ctx proves the pre-flight: validation
@@ -218,6 +270,23 @@
                 (p/then (fn [_] (is false "expected an :invalid-name rejection")))
                 (p/catch (fn [e] (is (= :invalid-name (:type (ex-data e)))
                                      "a malformed name rejects the create-stream promise pre-flight")))
+                (p/finally (fn [_ _] (done)))))))
+
+;; AC4 (ADR 0015), no server: the reserved-header guard surfaces through publish's OWN
+;; channel — the returned promise REJECTS, it does not throw synchronously — and
+;; pre-flight, before any native call. A nil ctx proves the pre-flight: the guard
+;; rejects first, so the native -js-publish never dereferences it.
+(deftest publish-rejects-reserved-header-on-its-promise
+  #?(:clj
+     (is (= :reserved-header
+            (:type (ex-data (reject-reason (jet/publish nil "tracer.1" {:a 1} {:headers {"Nats-Msg-Id" "x"}})))))
+         "a reserved Nats-* user header rejects the publish promise pre-flight")
+     :cljs
+     (async done
+            (-> (jet/publish nil "tracer.1" {:a 1} {:headers {"Nats-Msg-Id" "x"}})
+                (p/then (fn [_] (is false "expected a :reserved-header rejection")))
+                (p/catch (fn [e] (is (= :reserved-header (:type (ex-data e)))
+                                     "a reserved Nats-* user header rejects the publish promise pre-flight")))
                 (p/finally (fn [_ _] (done)))))))
 
 ;; AC1 + AC2 (ADR 0017/0020), integration on the JetStream-enabled :4222 server:
@@ -284,3 +353,140 @@
                                  (is (number? (:code (ex-data e))) ":jetstream-api-error carries the server's :code")
                                  (is (string? (:description (ex-data e))) ":jetstream-api-error carries the server's :description")))
                       (p/then (fn [_] (jet/delete-stream ctx "OVL_A"))))))))))
+
+;; AC1 (ADR 0017/0020), integration on the JetStream-enabled :4222 server: an acked
+;; publish into a Stream resolves to the normalized PubAck {:stream :seq :duplicate
+;; :domain}, identically on both legs. A fresh memory stream so the first publish is
+;; deterministically sequence 1, not a duplicate, with no domain configured. Cleans up.
+(deftest publish-resolves-to-puback
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "PUBACK" :subjects ["puback.>"] :storage :memory}) 5000 ::timeout)
+           (let [ack (deref (jet/publish ctx "puback.a" {:n 1}) 5000 ::timeout)]
+             (is (= "PUBACK" (:stream ack)) "PubAck :stream is the stream that stored it")
+             (is (= 1 (:seq ack)) "the first publish lands at stream sequence 1")
+             (is (false? (:duplicate ack)) "a first publish is not a duplicate")
+             (is (nil? (:domain ack)) "no JetStream domain configured ⇒ :domain nil"))
+           (deref (jet/delete-stream ctx "PUBACK") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "PUBACK" :subjects ["puback.>"] :storage :memory})
+                        ack (jet/publish ctx "puback.a" {:n 1})]
+                  (is (= "PUBACK" (:stream ack)) "PubAck :stream is the stream that stored it")
+                  (is (= 1 (:seq ack)) "the first publish lands at stream sequence 1")
+                  (is (false? (:duplicate ack)) "a first publish is not a duplicate")
+                  (is (nil? (:domain ack)) "no JetStream domain configured ⇒ :domain nil")
+                  (jet/delete-stream ctx "PUBACK")))))))
+
+;; AC2 (ADR 0020), integration: re-publishing with the same :msg-id within the
+;; stream's dedup window is recognized server-side as a duplicate — the second PubAck
+;; carries :duplicate true and the SAME sequence as the first, so a publish retry is
+;; idempotent rather than double-storing. Same on both legs; cleans up.
+(deftest publish-msg-id-dedup
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "DEDUP" :subjects ["dedup.>"] :storage :memory}) 5000 ::timeout)
+           (let [a1 (deref (jet/publish ctx "dedup.a" {:n 1} {:msg-id "id-1"}) 5000 ::timeout)
+                 a2 (deref (jet/publish ctx "dedup.a" {:n 1} {:msg-id "id-1"}) 5000 ::timeout)]
+             (is (false? (:duplicate a1)) "the first publish with a :msg-id is not a duplicate")
+             (is (true? (:duplicate a2)) "re-publishing the same :msg-id within the window is a duplicate")
+             (is (= (:seq a1) (:seq a2)) "the duplicate ack carries the original sequence"))
+           (deref (jet/delete-stream ctx "DEDUP") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "DEDUP" :subjects ["dedup.>"] :storage :memory})
+                        a1  (jet/publish ctx "dedup.a" {:n 1} {:msg-id "id-1"})
+                        a2  (jet/publish ctx "dedup.a" {:n 1} {:msg-id "id-1"})]
+                  (is (false? (:duplicate a1)) "the first publish with a :msg-id is not a duplicate")
+                  (is (true? (:duplicate a2)) "re-publishing the same :msg-id within the window is a duplicate")
+                  (is (= (:seq a1) (:seq a2)) "the duplicate ack carries the original sequence")
+                  (jet/delete-stream ctx "DEDUP")))))))
+
+;; AC3 (ADR 0020), integration: an :expect optimistic-concurrency assertion the server
+;; rejects (a :last-seq that does not match the stream's actual last sequence) surfaces
+;; through publish's promise as the operational :type :wrong-last-sequence (err_code
+;; 10071, normalized via the shared table) — not a raw native exception. On the JVM the
+;; failure arrives wrapped (CompletionException > RuntimeException > JetStreamApiException)
+;; and must be unwrapped; on CLJS nats.js rejects with a JetStreamApiError directly.
+(deftest publish-expect-wrong-last-seq
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "EXPECT" :subjects ["expect.>"] :storage :memory}) 5000 ::timeout)
+           (deref (jet/publish ctx "expect.a" {:n 1}) 5000 ::timeout)
+           (let [e (reject-reason (jet/publish ctx "expect.a" {:n 2} {:expect {:last-seq 999}}))]
+             (is (= :wrong-last-sequence (:type (ex-data e)))
+                 "a wrong :last-seq expectation rejects with operational :wrong-last-sequence"))
+           (deref (jet/delete-stream ctx "EXPECT") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "EXPECT" :subjects ["expect.>"] :storage :memory})
+                        _   (jet/publish ctx "expect.a" {:n 1})]
+                  (-> (jet/publish ctx "expect.a" {:n 2} {:expect {:last-seq 999}})
+                      (p/then (fn [_] (is false "expected a :wrong-last-sequence rejection")))
+                      (p/catch (fn [e] (is (= :wrong-last-sequence (:type (ex-data e)))
+                                           "a wrong :last-seq expectation rejects with operational :wrong-last-sequence")))
+                      (p/then (fn [_] (jet/delete-stream ctx "EXPECT"))))))))))
+
+;; A `:bytes` subscriber observes the exact wire bytes a publisher produced; UTF-8
+;; decode them (codec's public bridge) so the codec-override assertion reads as text.
+(def ^:private raw->str codec/bytes->str)
+
+;; AC4 (ADR 0011/0020), integration: a per-call :codec override and non-reserved user
+;; :headers both take effect on the published message, observed by a plain core
+;; subscriber on the stream subject (a JS-published message is an ordinary publish the
+;; stream also captures). The :json override is proven by the wire being JSON text —
+;; never the connection's default EDN — and :headers by the user header riding through
+;; alongside the sanctioned Nats-Msg-Id that :msg-id set. Same on both legs; cleans up.
+(deftest publish-codec-override-and-header-passthrough
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx      (deref (jet/jetstream conn) 5000 ::timeout)
+               received (promise)]
+           (deref (jet/create-stream ctx {:name "CODEC" :subjects ["codec.>"] :storage :memory}) 5000 ::timeout)
+           (nats/subscribe conn "codec.a" #(deliver received %) {:codec :bytes})
+           (deref (jet/publish ctx "codec.a" {:n 1}
+                               {:codec :json :headers {"My-Header" "trace-1"} :msg-id "mid-1"})
+                  5000 ::timeout)
+           (let [msg (deref received 5000 ::timeout)]
+             (is (not= ::timeout msg) "a core subscriber observes the JS-published message")
+             (is (= "{\"n\":1}" (raw->str (:data msg)))
+                 "the :codec :json override encodes the wire as JSON, not the default EDN")
+             (is (= ["trace-1"] (get (:headers msg) "My-Header"))
+                 "a non-reserved user header rides through onto the published message")
+             (is (= ["mid-1"] (get (:headers msg) "Nats-Msg-Id"))
+                 ":msg-id is delivered as the sanctioned reserved Nats-Msg-Id header"))
+           (deref (jet/delete-stream ctx "CODEC") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "CODEC" :subjects ["codec.>"] :storage :memory})]
+                  (let [received (p/deferred)]
+                    (nats/subscribe conn "codec.a" #(p/resolve! received %) {:codec :bytes})
+                    (p/let [_ (jet/publish ctx "codec.a" {:n 1}
+                                           {:codec :json :headers {"My-Header" "trace-1"} :msg-id "mid-1"})
+                            msg (p/timeout received 5000)]
+                      (is (= "{\"n\":1}" (raw->str (:data msg)))
+                          "the :codec :json override encodes the wire as JSON, not the default EDN")
+                      (is (= ["trace-1"] (get (:headers msg) "My-Header"))
+                          "a non-reserved user header rides through onto the published message")
+                      (is (= ["mid-1"] (get (:headers msg) "Nats-Msg-Id"))
+                          ":msg-id is delivered as the sanctioned reserved Nats-Msg-Id header")
+                      (jet/delete-stream ctx "CODEC")))))))))
