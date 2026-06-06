@@ -229,7 +229,7 @@ When you want synchronous ergonomics on the JVM, require the parallel blocking t
 
 - **Phase 1** ✅ *(0.1.0)* — Core NATS: pub/sub, queue groups, request/reply, headers, codecs, lifecycle/status, errors.
 - **Phase 1.5** ✅ *(0.1.0)* — `nats-cljc.blocking.core`.
-- **Phase 2** — JetStream (`nats-cljc.jetstream`): streams, consumers, acked publish, ack/nak/term; pull consumers delivered through a channel/missionary adapter for backpressure.
+- **Phase 2** — JetStream (`nats-cljc.jetstream`): streams, consumers, acked publish, ack/nak/term; pull consumers delivered through the same promise-return handler as core subscriptions for backpressure (core.async/missionary adapters land in Phase 3).
 - **Phase 3** — KV (`nats-cljc.kv`) and Object Store (`nats-cljc.object`); core.async + missionary subscription adapters; `request-many` scatter-gather.
 
 ## Design docs

@@ -40,11 +40,11 @@ The client's automatic re-establishment of a dropped connection, configured with
 _Avoid_: retry, redial
 
 **Error**:
-A failure surfaced as an `ex-info` carrying a canonical `:type` and structured data, identical in shape on every platform (so portable code reads `(:type (ex-data e))` rather than branching on host exception types). Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`, `:slow-consumer`, `:auth-invalid`. `:auth-invalid` is client-side credential validation failing *before* any dial (e.g. an nkey that does not match its seed), distinct from `:connect-failed` (the server-side connect attempt failed); it rejects the `connect` promise. One-shot operations reject their promise with it. Async failures reach a sink instead: a throwing handler or a decode failure reaches the subscription's `:on-error` if one is set, else the connection's `:on-status` as an `:error` event; `:slow-consumer` — being per-subscription — reaches the subscription's `:on-error` only (and is silently dropped when none is set); while connection-level `:permissions-violation` and `:protocol-error` reach `:on-status` as an `:error` event only, never a per-subscription override. The override is strict: when a subscription sets `:on-error`, only it fires — never both it and `:on-status`. `:on-error` receives the bare ex-info, so portable code reads `(:type (ex-data e))` exactly as on the one-shot reject path; the connection-level `:error` event wraps that ex-info under `:error` (see Status event). A thrown handler value is passed through unchanged and carries no canonical `:type` — it is the consumer's own exception, not a normalized NATS failure.
+A failure surfaced as an `ex-info` carrying a canonical `:type` and structured data, identical in shape on every platform (so portable code reads `(:type (ex-data e))` rather than branching on host exception types). Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`, `:slow-consumer`, `:auth-invalid`. JetStream extends this set with operational `:type`s — `:jetstream-not-enabled`, `:stream-not-found`, `:consumer-not-found`, `:wrong-last-sequence`, `:jetstream-api-error` (one-shot rejections), plus the inherently-per-consume `:heartbeats-missed`, `:consumer-deleted`, `:exceeded-limits` (delivered to a consume's `:on-error` only, dropped if unset, exactly like `:slow-consumer`) — see ADR 0020. `:auth-invalid` is client-side credential validation failing *before* any dial (e.g. an nkey that does not match its seed), distinct from `:connect-failed` (the server-side connect attempt failed); it rejects the `connect` promise. One-shot operations reject their promise with it. Async failures reach a sink instead: a throwing handler or a decode failure reaches the subscription's `:on-error` if one is set, else the connection's `:on-status` as an `:error` event; `:slow-consumer` — being per-subscription — reaches the subscription's `:on-error` only (and is silently dropped when none is set); while connection-level `:permissions-violation` and `:protocol-error` reach `:on-status` as an `:error` event only, never a per-subscription override. The override is strict: when a subscription sets `:on-error`, only it fires — never both it and `:on-status`. `:on-error` receives the bare ex-info, so portable code reads `(:type (ex-data e))` exactly as on the one-shot reject path; the connection-level `:error` event wraps that ex-info under `:error` (see Status event). A thrown handler value is passed through unchanged and carries no canonical `:type` — it is the consumer's own exception, not a normalized NATS failure.
 _Avoid_: failure, fault (a bare host *exception* is what we normalize *into* an Error)
 
 **Validation error**:
-A caller-misuse failure — a malformed argument caught *before* any native NATS call — surfaced as an `ex-info` carrying a `:type` from a separate set, distinct from the canonical *Error* set and sharing only its shape. Current `:type`s: `:invalid-header` (a header name or value that is not a printable-ASCII token), `:invalid-max` (a `max` argument outside the integer range its operation accepts — the `2147483647` JVM `int` cap on both legs for `unsubscribe`/blocking `subscribe`, with `:reconnect` additionally allowing the `0`/`-1` sentinels), `:invalid-max-pending` (a non-positive `subscribe` `:max-pending`), `:no-reply-subject` (`reply` to a message that has no `:reply`), and `:invalid-capacity` (a non-positive blocking-`subscribe` capacity). Raised through the operation's *own* channel — a synchronous operation **throws** it, the one promise-returning operation that validates (`connect`) **rejects its promise** — and it **never** reaches an async sink (`:on-error`/`:on-status`), which is exclusively the *Error* model's channel (ADR 0006, ADR 0015). Where the canonical *Error* `:type`s are operational conditions a consumer dispatches on in production, a validation `:type` is a programmer error to *fix*: the set is diagnostic-first and **open** — new guards add new `:type`s — so consumers should not assume it exhaustive.
+A caller-misuse failure — a malformed argument caught *before* any native NATS call — surfaced as an `ex-info` carrying a `:type` from a separate set, distinct from the canonical *Error* set and sharing only its shape. Current `:type`s: `:invalid-header` (a header name or value that is not a printable-ASCII token), `:invalid-max` (a `max` argument outside the integer range its operation accepts — the `2147483647` JVM `int` cap on both legs for `unsubscribe`/blocking `subscribe`, with `:reconnect` additionally allowing the `0`/`-1` sentinels), `:invalid-max-pending` (a non-positive `subscribe` `:max-pending`), `:no-reply-subject` (`reply` to a message that has no `:reply`), and `:invalid-capacity` (a non-positive blocking-`subscribe` capacity). JetStream adds `:invalid-name` (a malformed stream/consumer name), `:unknown-config-key` (an unrecognized stream/consumer config key), and `:reserved-header` (a reserved `Nats-*` header set directly in a publish's `:headers` rather than via `:msg-id`/`:expect`). Raised through the operation's *own* channel — a synchronous operation **throws** it, the one promise-returning operation that validates (`connect`) **rejects its promise** — and it **never** reaches an async sink (`:on-error`/`:on-status`), which is exclusively the *Error* model's channel (ADR 0006, ADR 0015). Where the canonical *Error* `:type`s are operational conditions a consumer dispatches on in production, a validation `:type` is a programmer error to *fix*: the set is diagnostic-first and **open** — new guards add new `:type`s — so consumers should not assume it exhaustive.
 _Avoid_: error (reserve *Error* for a normalized NATS failure); argument exception, bad-input fault
 
 ### Messaging
@@ -84,3 +84,41 @@ _Avoid_: cancel, stop, remove (a *Subscription* is unsubscribed; a *Connection* 
 **Queue group**:
 A named set of subscriptions to the same subject among which the server load-balances, so each message reaches exactly one member. Selected with the `:queue` option on `subscribe`.
 _Avoid_: consumer group, worker pool
+
+### JetStream
+
+**JetStream**:
+NATS's durable persistence layer over core pub/sub: messages are retained in server-side storage and replayed to clients on demand, rather than delivered once and forgotten. The portable surface lives in the `nats-cljc.jetstream` namespace.
+_Avoid_: JS (collides with JavaScript), durable messaging, stream store
+
+**Stream**:
+A server-side, durable store of messages captured from one or more Subjects — the unit JetStream retains and replays.
+_Avoid_: log, topic, queue, channel
+
+**Consumer**:
+A server-side delivery cursor over a Stream that tracks position and outstanding acknowledgements, and the thing a client pulls messages from — the JetStream counterpart to a core Subscription. The library exposes only *pull* Consumers: the client pulls, the server never pushes, so the client's read rate bounds delivery.
+_Avoid_: subscriber, reader, subscription (a *Subscription* is the core pub/sub term; a *Pull subscription* is the JVM blocking-core handle, unrelated)
+
+**Ordered consumer**:
+A Consumer specialized for single-client, gap-free replay: ephemeral, server-managed, automatically recreated if a sequence gap appears, and taking no acknowledgements.
+_Avoid_: replay consumer, ephemeral consumer
+
+**JetStream context**:
+The handle `(jetstream conn)` returns — a single value holding both the data-plane (publish, pull) and management (stream/consumer admin) surfaces, through which every JetStream operation flows. The JetStream counterpart to a Connection.
+_Avoid_: JS context (collides with JavaScript), JetStream client, handle
+
+**Acked publish**:
+A publish into a Stream that waits for the server to acknowledge durable storage and returns a PubAck — in contrast to core's fire-and-forget publish, which returns nothing.
+_Avoid_: durable publish, confirmed publish
+
+**PubAck**:
+The server's receipt for an Acked publish: `{:stream :seq :duplicate :domain}` — the Stream, the assigned stream sequence, whether the message was a dedup duplicate, and the JetStream domain.
+_Avoid_: ack (a consumer's *Ack* acknowledges a delivered message; a *PubAck* is the publisher's receipt)
+
+**Ack**:
+A consumer's acknowledgement of a delivered JetStream Message, sent by publishing a tiny control message to the Message's ack subject. The family: `ack` (processed — stop redelivery), `nak` (redeliver, optionally after a delay), `term` (give up — never redeliver), `working` (still processing — postpone redelivery). All are fire-and-forget (return nil) and idempotent; `working` is exempt from terminality.
+_Avoid_: PubAck (the publisher's receipt), acknowledgement, nack (spell it *nak*)
+
+**Double-ack**:
+An Ack that waits for the server to confirm receipt, returning a Promise — for when losing an ack to a network blip is unacceptable. The one acknowledgement that is awaitable; the rest are fire-and-forget.
+_Avoid_: ack-sync (ours is asynchronous), confirmed ack, ackAck

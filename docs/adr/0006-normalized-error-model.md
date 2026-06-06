@@ -20,7 +20,7 @@ Failures surface as an **`ex-info`** carrying a canonical **`:type`** keyword pl
 
 `request` distinguishes **`:timeout`** (responders exist, none answered in time) from **`:no-responders`** (NATS 503 — nobody subscribed); both reject rather than resolving to `nil`.
 
-Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`, `:slow-consumer`, `:auth-invalid`.
+Canonical `:type`s: `:timeout`, `:no-responders`, `:connect-failed`, `:connection-closed`, `:permissions-violation`, `:codec-error`, `:max-payload-exceeded`, `:protocol-error`, `:drained`, `:slow-consumer`, `:auth-invalid`. JetStream extends this set with its own operational `:type`s (`:jetstream-not-enabled`, `:stream-not-found`, `:consumer-not-found`, `:wrong-last-sequence`, `:jetstream-api-error`, and the inherently-per-consume side-band `:heartbeats-missed` / `:consumer-deleted` / `:exceeded-limits`, which route like `:slow-consumer`) — see ADR 0020.
 
 This set is the **normalized NATS error model** — operational failures, each normalized from a native exception. **Caller-misuse validation errors** (`:invalid-header`, `:invalid-max`, `:invalid-max-pending`, `:no-reply-subject`, `:invalid-capacity`) are deliberately **not** here: they are a separate **Validation error** category — programmer errors raised on the operation's own channel before any native call and never to a sink — documented in ADR 0015. `:auth-invalid` stays here, not there, because it is operational (bad credentials are a runtime condition) and validates against the NATS security model rather than API argument well-formedness.
 
