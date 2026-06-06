@@ -95,6 +95,22 @@ jobs:
           npx shadow-cljs compile node
           node target/node-tests.js
 
+      # Externs gate: the repo's only :advanced compile. nats-cljc
+      # ships as source, so the optimizing compile happens in consumers' builds,
+      # never in the :none test compiles above — an un-inferable (^js-less) JS
+      # property access renames silently under advanced, invisibly to CI. shadow
+      # prints "Cannot infer target type" but still exits 0, so grep and fail. No
+      # :silence-unsafe alias: CI is JDK 21, where that flag does not exist (deps.edn).
+      - name: Externs gate (advanced compile)
+        if: matrix.platform == 'node'
+        run: |
+          set -o pipefail
+          npx shadow-cljs release externs-check 2>&1 | tee externs-check.log
+          if grep -q "Cannot infer target type" externs-check.log; then
+            echo "::error::Externs gate: a JS-interop property access is missing a ^js hint (see 'Cannot infer' above)."
+            exit 1
+          fi
+
       # CI is the single source of browser truth (ADR 0010), so provision Chrome
       # explicitly and version-pinned instead of leaning on whatever Chrome the
       # ubuntu-latest image happens to ship. Pin the major version (latest patch

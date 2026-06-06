@@ -8,6 +8,7 @@ Agent configuration for the `nats-cljc` repo, a [NATS](https://nats.io) for Cloj
 - **Lint before commit.** Run `clj-kondo --lint src test`. See [docs/agents/linting-and-formatting.md](docs/agents/linting-and-formatting.md).
 - **Test on JVM + Node before commit.** Run the suite on both local legs against a ws-enabled `nats-server`; the browser leg is CI-only (ADR 0010). See [docs/agents/running-tests.md](docs/agents/running-tests.md) to run it, and [docs/agents/writing-tests.md](docs/agents/writing-tests.md) for the conventions when authoring one.
 - **Prefer nREPL for evaluation.** `clj-nrepl-eval -p 7888 '<form>'` over `bb -cp src -e '<form>'` for sanity checks and exploration — a warm JVM Clojure REPL with `src` + jnats + `:test` deps loaded, so it runs real JVM interop (which babashka's SCI can't) with no per-call cold-start; persistent session (state survives between calls), `:reload`-aware. See [docs/agents/clojure-repl-evaluation.md](docs/agents/clojure-repl-evaluation.md).
+- **Verify toolchain behavior; don't infer it.** Compiler/runtime effects (`:advanced` externs/DCE, interop return shapes, macroexpansion) are hypotheses until a build/REPL/test confirms them — a nearby convention is not proof. Before trusting a green, watch the check go red on a known-bad input.
 
 ## Agent skills
 

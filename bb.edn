@@ -27,6 +27,21 @@
   {:doc "Lint src + test with clj-kondo."
    :task (shell "clj-kondo --lint src test")}
 
+  externs:check
+  {:doc "Externs gate — advanced compile of the whole cljs surface; fails on any infer-externs 'Cannot infer target type' warning. shadow exits 0 on that warning, so we grep. Local needs JDK 23+ (uses :silence-unsafe)."
+   :requires ([babashka.process :as p]
+              [clojure.string :as str])
+   :task (let [{:keys [out err exit]}
+               (p/shell {:out :string :err :string :continue true}
+                        "npx shadow-cljs -A:silence-unsafe release externs-check")]
+           (print out) (print err) (flush)
+           (cond
+             (str/includes? (str out err) "Cannot infer target type")
+             (do (println "\nexterns:check FAILED — a JS-interop property access shadow can't type. Add a `^js` hint to the binding flagged above.")
+                 (System/exit 1))
+             (not (zero? exit))
+             (System/exit exit)))}
+
   pre_start
   {:doc "Start dev daemons (idempotent) — nREPL :7888 + the anon/token/users/jwt nats-servers. Backs `bb pre_start` in .aishell/config.yaml."
    :requires ([babashka.process :as p]

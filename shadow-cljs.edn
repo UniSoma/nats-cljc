@@ -13,4 +13,28 @@
   :browser
   {:target    :karma
    :output-to "target/karma-test.js"
-   :ns-regexp "-test$"}}}
+   :ns-regexp "-test$"}
+
+  ;; Externs gate: the ONLY :advanced compile in the repo. nats-cljc
+  ;; ships as source, so the optimizing compile happens in each CONSUMER's build —
+  ;; this repo's :none test compiles (node/browser) never run externs inference.
+  ;; shadow infers most JS-interop accesses (it propagates `^js` through method/
+  ;; property chains), but an access it CAN'T type — a `^js`-less binding with no
+  ;; inferable source — has its property renamed silently under advanced, breaking
+  ;; only in a consumer's release build, invisibly to this repo's CI. This build
+  ;; compiles the whole public cljs surface under advanced purely to surface
+  ;; shadow's infer-externs "Cannot infer target type" warning; the output bundle
+  ;; is discarded. shadow exits 0 on that warning, so `bb externs:check` (and CI)
+  ;; grep for it and fail. :entries IS the coverage manifest — the two facades pull
+  ;; their impl/protocol/error/stream deps transitively (the jetstream facade
+  ;; side-effect-requires nats-cljc.jetstream.impl.js), and the opt-in codecs are
+  ;; listed explicitly since nothing on the core path reaches them (ADR 0004).
+  :externs-check
+  {:target     :browser
+   :output-dir "target/externs-check"
+   :compiler-options {:infer-externs :auto}
+   :modules {:main {:entries [nats-cljc.core
+                              nats-cljc.jetstream
+                              nats-cljc.codec
+                              nats-cljc.codec.json
+                              nats-cljc.codec.transit]}}}}}
