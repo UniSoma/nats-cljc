@@ -112,6 +112,21 @@
                e))
     e))
 
+(defn publish-error
+  "Normalize a nats.js publish rejection to a bare typed ex-info (ADR 0006), the
+   publish leg's analog of the JVM `publish-ex->ex-info`. A server-issued
+   JetStreamApiError (e.g. a wrong `:expect` → 10071) routes through `api-error` to
+   its operational `:type`; anything else — a `TimeoutError`, a no-responders error,
+   which nats.js rejects with as a raw object whose `(ex-data e)` is nil — is wrapped
+   in the operational catch-all `:publish-failed`, the same keyword the JVM leg uses,
+   so a non-API failure carries a `:type` on both legs. The management verbs keep
+   `api-error` (a non-API error there passes through raw, matching the JVM
+   `off-thread`), so this catch-all stays confined to the publish path."
+  [^js e]
+  (if (instance? jetstream/JetStreamApiError e)
+    (api-error e)
+    (ex-info (.-message e) {:type :publish-failed} e)))
+
 (defn ->publish-options
   "Build a nats.js JetStreamPublishOptions object from the portable publish `opts`
    (ADR 0020). Only the keys present are set, so an absent key takes the server
@@ -120,17 +135,19 @@
    concurrency assertion under `expect`. `clj->js` produces the string-keyed object
    nats.js reads, surviving advanced compilation. The reserved Nats-* headers these
    map to are set by the native client, which is why setting them directly in user
-   `:headers` is rejected pre-flight."
-  [{:keys [msg-id expect timeout-ms]}]
-  (clj->js
-   (cond-> {}
-     msg-id     (assoc :msgID msg-id)
-     timeout-ms (assoc :timeout timeout-ms)
-     expect     (assoc :expect (cond-> {}
-                                 (:last-seq expect)         (assoc :lastSequence (:last-seq expect))
-                                 (:last-msg-id expect)      (assoc :lastMsgID (:last-msg-id expect))
-                                 (:stream expect)           (assoc :streamName (:stream expect))
-                                 (:last-subject-seq expect) (assoc :lastSubjectSequence (:last-subject-seq expect)))))))
+   `:headers` is rejected pre-flight. Returns nil (undefined) for empty `opts` so a bare
+   publish skips the `clj->js {}` allocation and passes no options object."
+  [{:keys [msg-id expect timeout-ms] :as opts}]
+  (when (seq opts)
+    (clj->js
+     (cond-> {}
+       msg-id     (assoc :msgID msg-id)
+       timeout-ms (assoc :timeout timeout-ms)
+       expect     (assoc :expect (cond-> {}
+                                   (:last-seq expect)         (assoc :lastSequence (:last-seq expect))
+                                   (:last-msg-id expect)      (assoc :lastMsgID (:last-msg-id expect))
+                                   (:stream expect)           (assoc :streamName (:stream expect))
+                                   (:last-subject-seq expect) (assoc :lastSubjectSequence (:last-subject-seq expect))))))))
 
 (defn- ->pub-ack
   "Normalize a nats.js PubAck into the portable PubAck map (ADR 0020):
@@ -166,8 +183,10 @@
     ;; nats.js carries the publish headers INSIDE the options object (a `headers`
     ;; key holding a MsgHdrs), not as a separate argument the way jnats' publishAsync
     ;; does — so the canonical headers are built and attached to the native options.
-    (let [o ^js (->publish-options opts)]
+    ;; ->publish-options is nil for empty opts; headers still need an object to ride in,
+    ;; so a headers-only publish gets a bare #js {} while a bare publish passes undefined.
+    (let [o ^js (or (->publish-options opts) (when headers #js {}))]
       (when headers (set! (.-headers o) (core/->headers headers)))
       (-> (.publish ^js (:js ctx) subject bytes o)
           (.then ->pub-ack)
-          (.catch (fn [e] (throw (api-error e))))))))
+          (.catch (fn [e] (throw (publish-error e))))))))

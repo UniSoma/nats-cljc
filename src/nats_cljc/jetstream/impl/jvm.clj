@@ -23,7 +23,7 @@
            [java.io IOException]
            [java.time Duration]
            [java.time.format DateTimeFormatter]
-           [java.util.concurrent CompletableFuture]
+           [java.util.concurrent CompletableFuture TimeUnit TimeoutException]
            [java.util.function BiFunction Supplier]))
 
 ;; The JetStream context (ADR 0017): one handle holding both jnats' data-plane
@@ -133,13 +133,21 @@
    future exceptionally with a RuntimeException whose cause is the JetStreamApiException,
    and the `.handle` stage wraps that once more in a CompletionException. The cause
    chain is walked to the JetStreamApiException and normalized via the shared table
-   (ADR 0020); an exception with none in its chain passes through unwrapped."
+   (ADR 0020); an exception with none in its chain passes through unwrapped. A bounded
+   ack deadline firing surfaces as a `TimeoutException` (see `bound-ack`) ⇒ `:timeout`,
+   built as a real ex-info because the deliver-bare seam peels exactly one wrapper, so a
+   raw TimeoutException would reach the caller with nil ex-data. A failure with no
+   JetStreamApiException in its chain (a 503/no-stream or connection-drop IOException,
+   say) is wrapped at its deepest cause in the operational catch-all `:publish-failed`
+   ex-info — for the same deliver-bare reason — so a non-API failure still carries a
+   `:type`, not the raw IOException whose `(ex-data e)` is nil."
   [^Throwable e]
   (loop [t e]
     (cond
+      (instance? TimeoutException t)      (ex-info (.getMessage t) {:type :timeout} t)
       (instance? JetStreamApiException t) (api-ex->ex-info t)
       (.getCause t)                       (recur (.getCause t))
-      :else                               e)))
+      :else                               (ex-info (.getMessage t) {:type :publish-failed} t))))
 
 (defn- off-thread
   "Run the blocking management thunk `f` off the caller's thread (ADR 0002),
@@ -203,20 +211,22 @@
 (defn ->publish-options
   "Build a jnats PublishOptions from the portable publish `opts` (ADR 0020). Only the
    keys present are set, so an absent key takes the server default; `:msg-id` becomes
-   the dedup messageId, `:timeout-ms` a streamTimeout Duration (the CLJS leg uses a
-   plain ms number), and each `:expect` field its expected-* optimistic-concurrency
+   the dedup messageId, and each `:expect` field its expected-* optimistic-concurrency
    assertion. The reserved Nats-* headers these map to are set by the native client,
-   which is why setting them directly in user `:headers` is rejected pre-flight."
-  ^PublishOptions [{:keys [msg-id expect timeout-ms]}]
-  (let [b (PublishOptions/builder)]
-    (when msg-id (.messageId b ^String msg-id))
-    (when timeout-ms (.streamTimeout b (Duration/ofMillis timeout-ms)))
-    (when-let [{:keys [last-seq last-msg-id stream last-subject-seq]} expect]
-      (when last-seq (.expectedLastSequence b (long last-seq)))
-      (when last-msg-id (.expectedLastMsgId b ^String last-msg-id))
-      (when stream (.expectedStream b ^String stream))
-      (when last-subject-seq (.expectedLastSubjectSequence b (long last-subject-seq))))
-    (.build b)))
+   which is why setting them directly in user `:headers` is rejected pre-flight. The
+   ack deadline (`:timeout-ms`) is NOT set here — jnats ignores PublishOptions.streamTimeout
+   on the publish path, so it is enforced separately in `bound-ack`. Returns nil for empty
+   `opts` so the publish path passes a null PublishOptions (the native default) with no allocation."
+  ^PublishOptions [{:keys [msg-id expect] :as opts}]
+  (when (seq opts)
+    (let [b (PublishOptions/builder)]
+      (when msg-id (.messageId b ^String msg-id))
+      (when-let [{:keys [last-seq last-msg-id stream last-subject-seq]} expect]
+        (when last-seq (.expectedLastSequence b (long last-seq)))
+        (when last-msg-id (.expectedLastMsgId b ^String last-msg-id))
+        (when stream (.expectedStream b ^String stream))
+        (when last-subject-seq (.expectedLastSubjectSequence b (long last-subject-seq))))
+      (.build b))))
 
 (defn- ->pub-ack
   "Normalize a jnats PublishAck into the portable PubAck map (ADR 0020):
@@ -237,20 +247,36 @@
   (-delete-stream [ctx name]
     (off-thread #(do (.deleteStream ^JetStreamManagement (:jsm ctx) ^String name) nil))))
 
+(defn- bound-ack
+  "Resolve the publishAsync `fut` to a portable PubAck, enforcing the `:timeout-ms`
+   ack deadline ourselves. jnats 2.25.3 never reads PublishOptions.streamTimeout on the
+   publish path — it pushes a null Duration into the request, which falls back to the
+   connection's request-cleanup interval — so the deadline a caller asks for has to be
+   imposed on the returned future. `.orTimeout` (applied only when `:timeout-ms` is
+   present) completes `fut` with a TimeoutException at the deadline; placing it BEFORE
+   `.handle` lets the BiFunction observe that exception and normalize it to `:timeout`.
+   This deadline-ownership asymmetry is intentional: on Node the client library owns the
+   deadline (CLJS sets opts.timeout), on the JVM the future-holder does.
+
+   `.handle` runs on both outcomes so a server rejection (or the timeout) is normalized
+   to its operational ex-info in the same stage that maps a success to the PubAck; the
+   thrown ex-info then surfaces BARE through `core/then ... identity`'s deliver-bare
+   (ADR 0006), like the management verbs' `off-thread`."
+  [^CompletableFuture fut timeout-ms]
+  (core/then
+   (.handle ^CompletableFuture (cond-> fut
+                                 timeout-ms (.orTimeout timeout-ms TimeUnit/MILLISECONDS))
+            (reify BiFunction
+              (apply [_ ack e]
+                (if e
+                  (throw (publish-ex->ex-info e))
+                  (->pub-ack ack)))))
+   identity))
+
 (extend-type JvmJetStreamContext
   proto/JetStreamData
   (-js-publish [ctx subject headers bytes opts]
-    ;; `.handle` runs on both outcomes so a server rejection is normalized to its
-    ;; operational ex-info in the same stage that maps a success to the PubAck; the
-    ;; thrown ex-info then surfaces BARE through `core/then ... identity`'s
-    ;; deliver-bare (ADR 0006), like the management verbs' `off-thread`.
-    (core/then
-     (.handle ^CompletableFuture (.publishAsync ^JetStream (:js ctx) ^String subject
-                                                (core/->headers headers) ^bytes bytes
-                                                (->publish-options opts))
-              (reify BiFunction
-                (apply [_ ack e]
-                  (if e
-                    (throw (publish-ex->ex-info e))
-                    (->pub-ack ack)))))
-     identity)))
+    (bound-ack (.publishAsync ^JetStream (:js ctx) ^String subject
+                              (core/->headers headers) ^bytes bytes
+                              (->publish-options opts))
+               (:timeout-ms opts))))

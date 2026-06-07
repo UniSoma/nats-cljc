@@ -63,7 +63,13 @@
    mislabels as :max-payload-exceeded, and a non-ASCII value is where jnats and
    nats.js silently diverge (jnats rejects, nats.js publishes); validating both
    here keeps the caller-misuse a portable `:type :invalid-header` on every leg
-   (CONTEXT: Headers)."
+   (CONTEXT: Headers).
+
+   Public (within this `^:no-doc` ns) so the JetStream facade reuses it, but it
+   only enforces the `:invalid-header` shape rules above — NOT the reserved
+   `Nats-*` pre-flight, which lives separately in `nats-cljc.jetstream.pub`. A
+   JetStream-style caller must run `validate-headers` first (as the facade does);
+   reaching this directly would let a reserved header through."
   [headers]
   (when (seq headers)
     (reduce-kv (fn [m k v]
@@ -83,12 +89,15 @@
                    (assoc m k vs)))
                {} headers)))
 
-(defn- effective-codec
+(defn ^:no-doc effective-codec
   "The codec for a single call: a per-call `:codec` in `opts` overrides the
    connection default, else the connection's `:codec` — the `Prepared` resolved
    once at connect, so the default path skips the registry deref (ADR 0011). The
    one place the precedence rule lives, so publish/subscribe/request/reply can't
-   drift. A raw override resolves through the registry in `codec/encode`/`decode`."
+   drift. A raw override resolves through the registry in `codec/encode`/`decode`.
+
+   Public (within this `^:no-doc` ns) so the JetStream facade reuses it rather
+   than re-implementing the precedence inline."
   [conn opts]
   (or (:codec opts) (:codec conn)))
 

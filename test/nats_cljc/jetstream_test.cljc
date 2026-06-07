@@ -219,7 +219,9 @@
     (is (= clean (pub/validate-headers clean))
         "a header map free of reserved keys passes validation unchanged"))
   (is (nil? (pub/validate-headers nil))
-      "nil headers pass through — there are none to guard"))
+      "nil headers pass through — there are none to guard")
+  (is (= :invalid-header (thrown-type #(pub/validate-headers ["Nats-Msg-Id" "x"])))
+      "a non-map :headers (e.g. a vector) is :invalid-header, not a raw ClassCastException"))
 
 ;; AC1/AC3/AC4, deep-module unit (ADR 0020), no server: building the native publish
 ;; options is a pure local construction, so the portable opts -> native round-trip
@@ -232,7 +234,6 @@
     #?(:clj
        (let [o (jet-jvm/->publish-options opts)]
          (is (= "id-1" (.getMessageId o)) ":msg-id -> messageId")
-         (is (= (java.time.Duration/ofMillis 3500) (.getStreamTimeout o)) ":timeout-ms -> streamTimeout Duration")
          (is (= 7 (.getExpectedLastSequence o)) ":last-seq -> expectedLastSequence")
          (is (= "m-9" (.getExpectedLastMsgId o)) ":last-msg-id -> expectedLastMsgId")
          (is (= "S" (.getExpectedStream o)) ":stream -> expectedStream")
@@ -246,6 +247,61 @@
          (is (= "m-9" (.-lastMsgID e)) ":last-msg-id -> lastMsgID")
          (is (= "S" (.-streamName e)) ":stream -> streamName")
          (is (= 3 (.-lastSubjectSequence e)) ":last-subject-seq -> lastSubjectSequence")))))
+
+;; Deep-module unit (ADR 0020), no server: empty opts must build no native options
+;; object at all — the builder/`clj->js {}` allocation is skipped on the hot path and the
+;; native client takes its own default. Both legs return nil so the publish call passes a
+;; null/undefined options argument. Drop the `(seq opts)` short-circuit and this goes red.
+(deftest deep-module-publish-options-empty-skips-allocation
+  (let [->opts #?(:clj jet-jvm/->publish-options :cljs jet-js/->publish-options)]
+    (is (nil? (->opts {})) "empty opts -> nil (no native options object)")
+    (is (nil? (->opts nil)) "nil opts -> nil (no native options object)")))
+
+;; JVM only: the ack deadline is enforced by `bound-ack` bounding the returned
+;; future, NOT by jnats reading PublishOptions.streamTimeout (the publish path ignores it,
+;; falling back to the ~5s request-cleanup interval). A never-completing future stands in
+;; for "no ack arrives"; `bound-ack` must reject NEAR the requested deadline — well under
+;; that 5s fallback that would mask a no-op — with a bare `:timeout` ex-info. The lower
+;; bound proves it actually waited for the deadline rather than rejecting instantly; drop
+;; the `.orTimeout` from `bound-ack` and this goes red (never rejects / rejects at 5s).
+#?(:clj
+   (deftest jvm-publish-ack-deadline-honored
+     (let [fut   (java.util.concurrent.CompletableFuture.)
+           start (System/nanoTime)
+           e     (reject-reason (#'jet-jvm/bound-ack fut 100))
+           ms    (/ (- (System/nanoTime) start) 1e6)]
+       (is (= :timeout (:type (ex-data e))) "bounded ack deadline rejects with a bare :timeout ex-info")
+       (is (< 50 ms 2000) (str "rejected near the 100ms deadline, not instantly nor at the 5s fallback; was " ms "ms")))))
+
+;; JVM only: a non-API, non-timeout publish failure — a 503/no-stream or a
+;; connection drop, jnats' IOException — must reach the caller as a BARE ex-info
+;; carrying a `:type`, like the JetStreamApiException path (ADR 0006). A future
+;; completed exceptionally with that IOException stands in for the failed publishAsync;
+;; pushed through the real `bound-ack` + deliver-bare seam, the leaf must surface typed,
+;; not as the raw IOException whose `(ex-data e)` is nil. Leave `publish-ex->ex-info`'s
+;; `:else` returning the raw exception and this goes red (`:type` nil).
+#?(:clj
+   (deftest jvm-publish-non-api-failure-is-typed
+     (let [fut (doto (java.util.concurrent.CompletableFuture.)
+                 (.completeExceptionally (java.io.IOException. "503 no responders available for request")))
+           e   (reject-reason (#'jet-jvm/bound-ack fut nil))]
+       (is (= :publish-failed (:type (ex-data e)))
+           "a non-API publish failure rejects with a bare :publish-failed ex-info")
+       (is (instance? java.io.IOException (.getCause ^Throwable e))
+           "the typed ex-info carries the unwrapped IOException leaf as its cause"))))
+
+;; CLJS only, no server: a non-JetStreamApiError publish rejection — a nats.js
+;; `TimeoutError` / no-responders, a raw object whose `(ex-data e)` is nil — must
+;; normalize to a bare ex-info carrying a `:type`, like the JetStreamApiError path
+;; (ADR 0006). `publish-error` is the publish leg's normalizer (`-js-publish`'s
+;; `.catch`); a non-API error routes to the operational catch-all `:publish-failed`,
+;; the same keyword the JVM leg's `publish-ex->ex-info` uses. Leave it passing the raw
+;; object through and this goes red (`:type` nil).
+#?(:cljs
+   (deftest cljs-publish-non-api-failure-is-typed
+     (let [e (jet-js/publish-error #js {:name "TimeoutError" :message "timeout"})]
+       (is (= :publish-failed (:type (ex-data e)))
+           "a non-API publish failure normalizes to a bare :publish-failed ex-info"))))
 
 ;; AC3 (ADR 0015), no server: a validation failure surfaces through create-stream's
 ;; OWN channel — the returned promise REJECTS, it does not throw synchronously — and
@@ -287,6 +343,33 @@
                 (p/then (fn [_] (is false "expected a :reserved-header rejection")))
                 (p/catch (fn [e] (is (= :reserved-header (:type (ex-data e)))
                                      "a reserved Nats-* user header rejects the publish promise pre-flight")))
+                (p/finally (fn [_ _] (done)))))))
+
+;; ADR 0015, no server: publish's :invalid-header surface, through its OWN
+;; channel — the returned promise REJECTS, it does not throw synchronously — and pre-flight,
+;; before any native call (nil ctx). Two sources, both typed :invalid-header: a non-map
+;; :headers (e.g. a vector) caught by validate-headers' type guard instead of leaking a raw
+;; ClassCastException from `keys`, and a malformed header (non-ASCII value here) caught by
+;; core/normalize-headers in the then stage.
+(deftest publish-rejects-invalid-header-on-its-promise
+  #?(:clj
+     (do
+       (is (= :invalid-header
+              (:type (ex-data (reject-reason (jet/publish nil "tracer.1" {:a 1} {:headers ["x" "y"]})))))
+           "a non-map :headers rejects the publish promise pre-flight")
+       (is (= :invalid-header
+              (:type (ex-data (reject-reason (jet/publish nil "tracer.1" {:a 1} {:headers {"X-Trace" "café"}})))))
+           "a non-ASCII header value rejects the publish promise pre-flight"))
+     :cljs
+     (async done
+            (-> (jet/publish nil "tracer.1" {:a 1} {:headers ["x" "y"]})
+                (p/then (fn [_] (is false "expected an :invalid-header rejection")))
+                (p/catch (fn [e] (is (= :invalid-header (:type (ex-data e)))
+                                     "a non-map :headers rejects the publish promise pre-flight")))
+                (p/then (fn [_] (jet/publish nil "tracer.1" {:a 1} {:headers {"X-Trace" "café"}})))
+                (p/then (fn [_] (is false "expected an :invalid-header rejection")))
+                (p/catch (fn [e] (is (= :invalid-header (:type (ex-data e)))
+                                     "a non-ASCII header value rejects the publish promise pre-flight")))
                 (p/finally (fn [_ _] (done)))))))
 
 ;; AC1 + AC2 (ADR 0017/0020), integration on the JetStream-enabled :4222 server:
@@ -482,7 +565,8 @@
                     (nats/subscribe conn "codec.a" #(p/resolve! received %) {:codec :bytes})
                     (p/let [_ (jet/publish ctx "codec.a" {:n 1}
                                            {:codec :json :headers {"My-Header" "trace-1"} :msg-id "mid-1"})
-                            msg (p/timeout received 5000)]
+                            msg (p/timeout received 5000 ::timeout)]
+                      (is (not= ::timeout msg) "a core subscriber observes the JS-published message")
                       (is (= "{\"n\":1}" (raw->str (:data msg)))
                           "the :codec :json override encodes the wire as JSON, not the default EDN")
                       (is (= ["trace-1"] (get (:headers msg) "My-Header"))

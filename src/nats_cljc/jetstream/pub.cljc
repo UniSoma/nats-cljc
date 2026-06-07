@@ -24,8 +24,13 @@
   "Guard a user `:headers` map pre-flight (ADR 0015), before any native call: a key
    in the reserved `Nats-*` namespace throws `:type :reserved-header` carrying the
    offending `:keys`, since `:msg-id`/`:expect` are the sanctioned way to set those.
+   A non-nil non-map `:headers` (e.g. a vector) throws `:type :invalid-header` rather
+   than a raw ClassCastException from `keys`, keeping the misuse portable and typed.
    Returns `headers` unchanged (nil included) so it can sit in a promise chain stage."
   [headers]
+  (when (and (some? headers) (not (map? headers)))
+    (throw (ex-info "Headers must be a map of name -> value(s)"
+                    {:type :invalid-header :headers headers})))
   (let [reserved (filter reserved-header? (keys headers))]
     (when (seq reserved)
       (throw (ex-info "Reserved Nats-* header(s) must be set via :msg-id/:expect"

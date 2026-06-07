@@ -91,7 +91,7 @@
        (impl/then (fn [_] (pub/validate-headers headers)))
        (impl/then (fn [hs]
                     {:headers (core/normalize-headers hs)
-                     :bytes   (codec/encode (or (:codec opts) (:codec ctx)) data)}))
+                     :bytes   (codec/encode (core/effective-codec ctx opts) data)}))
        (impl/bind (fn [{:keys [headers bytes]}]
                     (proto/-js-publish ctx subject headers bytes
                                        (select-keys opts [:msg-id :expect :timeout-ms])))))))
