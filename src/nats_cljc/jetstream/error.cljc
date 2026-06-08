@@ -3,12 +3,13 @@
    are identical numbers on jnats and nats.js, so mapping an `err_code` to its
    canonical operational `:type` is a single portable lookup — the JetStream
    sibling of `nats-cljc.error`'s server-error classifier. Seeded with the Phase-2
-   entry point's code, the Stream tracer's not-found, and acked publish's
-   wrong-last-sequence; later slices add rows (`:consumer-not-found`).")
+   entry point's code, the Stream/Consumer tracers' not-found codes, and acked
+   publish's wrong-last-sequence; later slices add rows.")
 
 (def ^:private err-code->type
   "JetStream API `err_code` → canonical operational `:type` (ADR 0020)."
   {10039 :jetstream-not-enabled
+   10014 :consumer-not-found
    10059 :stream-not-found
    10071 :wrong-last-sequence})
 

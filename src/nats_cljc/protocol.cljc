@@ -114,6 +114,33 @@
     "Delete the Stream `name`, returning a native promise that resolves to nil once
      it is gone and rejects with `:type :stream-not-found` when it does not exist."))
 
+(defprotocol ConsumerManager
+  "JetStream consumer management (ADR 0017), the management-plane verbs for durable
+   Consumers — EXTENDED onto each platform's JetStream context record from the impl
+   namespaces, never implemented inline, so the `@nats-io/jetstream` import stays
+   confined (ADR 0016). The facade owns the public arglists and the pre-flight
+   validation; these deal in the portable closed kebab config map and the normalized
+   info map, translating to/from each leg's native config inside the impl (ADR 0020).
+   `consumer-names` has no method here — the facade derives it from `-list-consumers`,
+   since nats.js exposes no names endpoint."
+  (-create-consumer [ctx stream config]
+    "Create a durable Consumer on the Stream `stream` from the portable closed kebab
+     `config` (already validated by the facade), returning a native promise of the
+     normalized ConsumerInfo map. The promise rejects with an operational
+     `:jetstream-api-error` (carrying `{:code :description}`) when the server rejects
+     the config (ADR 0020).")
+  (-consumer-info [ctx stream name]
+    "Return a native promise of the normalized ConsumerInfo map for the Consumer
+     `name` on Stream `stream`, rejecting with `:type :consumer-not-found` when it
+     does not exist.")
+  (-delete-consumer [ctx stream name]
+    "Delete the Consumer `name` on Stream `stream`, returning a native promise that
+     resolves to nil once it is gone and rejects with `:type :consumer-not-found`
+     when it does not exist.")
+  (-list-consumers [ctx stream]
+    "Return a native promise of a vector of the normalized ConsumerInfo maps for
+     every Consumer on Stream `stream`."))
+
 (defprotocol JetStreamData
   "JetStream data-plane operations (ADR 0017) — the publish/pull verbs, the sibling
    of the management-plane `StreamManager` — EXTENDED onto each platform's JetStream

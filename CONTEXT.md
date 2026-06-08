@@ -44,7 +44,7 @@ A failure surfaced as an `ex-info` carrying a canonical `:type` and structured d
 _Avoid_: failure, fault (a bare host *exception* is what we normalize *into* an Error)
 
 **Validation error**:
-A caller-misuse failure — a malformed argument caught *before* any native NATS call — surfaced as an `ex-info` carrying a `:type` from a separate set, distinct from the canonical *Error* set and sharing only its shape. Current `:type`s: `:invalid-header` (a header name or value that is not a printable-ASCII token), `:invalid-max` (a `max` argument outside the integer range its operation accepts — the `2147483647` JVM `int` cap on both legs for `unsubscribe`/blocking `subscribe`, with `:reconnect` additionally allowing the `0`/`-1` sentinels), `:invalid-max-pending` (a non-positive `subscribe` `:max-pending`), `:no-reply-subject` (`reply` to a message that has no `:reply`), and `:invalid-capacity` (a non-positive blocking-`subscribe` capacity). JetStream adds `:invalid-name` (a malformed stream/consumer name), `:unknown-config-key` (an unrecognized stream/consumer config key), and `:reserved-header` (a reserved `Nats-*` header set directly in a publish's `:headers` rather than via `:msg-id`/`:expect`). Raised through the operation's *own* channel — a synchronous operation **throws** it, the one promise-returning operation that validates (`connect`) **rejects its promise** — and it **never** reaches an async sink (`:on-error`/`:on-status`), which is exclusively the *Error* model's channel (ADR 0006, ADR 0015). Where the canonical *Error* `:type`s are operational conditions a consumer dispatches on in production, a validation `:type` is a programmer error to *fix*: the set is diagnostic-first and **open** — new guards add new `:type`s — so consumers should not assume it exhaustive.
+A caller-misuse failure — a malformed argument caught *before* any native NATS call — surfaced as an `ex-info` carrying a `:type` from a separate set, distinct from the canonical *Error* set and sharing only its shape. Current `:type`s: `:invalid-header` (a header name or value that is not a printable-ASCII token), `:invalid-max` (a `max` argument outside the integer range its operation accepts — the `2147483647` JVM `int` cap on both legs for `unsubscribe`/blocking `subscribe`, with `:reconnect` additionally allowing the `0`/`-1` sentinels), `:invalid-max-pending` (a non-positive `subscribe` `:max-pending`), `:no-reply-subject` (`reply` to a message that has no `:reply`), and `:invalid-capacity` (a non-positive blocking-`subscribe` capacity). JetStream adds `:invalid-name` (a malformed stream/consumer name), `:unknown-config-key` (an unrecognized stream/consumer config key), `:missing-required-key` (a required config key omitted — e.g. a durable consumer's `:name`, carrying the offending `:key`), and `:reserved-header` (a reserved `Nats-*` header set directly in a publish's `:headers` rather than via `:msg-id`/`:expect`). Raised through the operation's *own* channel — a synchronous operation **throws** it, the one promise-returning operation that validates (`connect`) **rejects its promise** — and it **never** reaches an async sink (`:on-error`/`:on-status`), which is exclusively the *Error* model's channel (ADR 0006, ADR 0015). Where the canonical *Error* `:type`s are operational conditions a consumer dispatches on in production, a validation `:type` is a programmer error to *fix*: the set is diagnostic-first and **open** — new guards add new `:type`s — so consumers should not assume it exhaustive.
 _Avoid_: error (reserve *Error* for a normalized NATS failure); argument exception, bad-input fault
 
 ### Messaging
@@ -96,12 +96,20 @@ A server-side, durable store of messages captured from one or more Subjects — 
 _Avoid_: log, topic, queue, channel
 
 **Consumer**:
-A server-side delivery cursor over a Stream that tracks position and outstanding acknowledgements, and the thing a client pulls messages from — the JetStream counterpart to a core Subscription. The library exposes only *pull* Consumers: the client pulls, the server never pushes, so the client's read rate bounds delivery.
+A server-side delivery cursor over a Stream that tracks position and outstanding acknowledgements, and the thing a client pulls messages from — the JetStream counterpart to a core Subscription. The library exposes only *pull* Consumers: the client pulls, the server never pushes, so the client's read rate bounds delivery. Every Consumer is either Durable or Ephemeral.
 _Avoid_: subscriber, reader, subscription (a *Subscription* is the core pub/sub term; a *Pull subscription* is the JVM blocking-core handle, unrelated)
 
+**Durable consumer**:
+A Consumer the server persists by name, retaining its position and ack state across client disconnects and restarts until explicitly deleted. The default kind `create-consumer` builds (`:durable? true`); its `:name` is required.
+_Avoid_: named consumer, persistent consumer
+
+**Ephemeral consumer**:
+A Consumer the server does not persist: it carries no durable name and the server reclaims it after a window of client inactivity. Requested with `:durable? false`; its `:name` is optional (the server assigns one when omitted). The Ordered consumer is a specialized Ephemeral consumer.
+_Avoid_: transient consumer
+
 **Ordered consumer**:
-A Consumer specialized for single-client, gap-free replay: ephemeral, server-managed, automatically recreated if a sequence gap appears, and taking no acknowledgements.
-_Avoid_: replay consumer, ephemeral consumer
+A specialized Ephemeral consumer for single-client, gap-free replay: server-managed, automatically recreated if a sequence gap appears, and taking no acknowledgements.
+_Avoid_: replay consumer
 
 **JetStream context**:
 The handle `(jetstream conn)` returns — a single value holding both the data-plane (publish, pull) and management (stream/consumer admin) surfaces, through which every JetStream operation flows. The JetStream counterpart to a Connection.

@@ -13,6 +13,7 @@
             [nats-cljc.codec :as codec]
             [nats-cljc.protocol :as proto]
             [nats-cljc.jetstream.stream :as stream]
+            [nats-cljc.jetstream.consumer :as consumer]
             [nats-cljc.jetstream.pub :as pub]
             #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])
@@ -70,6 +71,68 @@
   (-> (impl/resolved nil)
       (impl/then (fn [_] (stream/validate-name name)))
       (impl/bind (fn [_] (proto/-delete-stream ctx name)))))
+
+(defn create-consumer
+  "Create a durable Consumer on the Stream named `stream` through the JetStream context
+   `ctx`, from the portable, CLOSED kebab `config` map, returning a platform-native
+   promise that resolves to the normalized ConsumerInfo map (`{:stream :name :config
+   :created :delivered :ack-floor :pending}`, `:created` an ISO-8601 string). Config
+   keys: `:name` (required — the durable), `:ack-policy` (`:none` | `:all` | `:explicit`),
+   `:deliver-policy` (`:all` | `:last` | `:new` | `:last-per-subject`), `:ack-wait-ms`
+   (integer milliseconds), `:max-deliver` (integer), and `:filter-subjects` (a vector of
+   subject strings). The map is closed: an unrecognized key rejects the promise with a
+   validation `:type :unknown-config-key`, and a malformed `:name` or `stream` with
+   `:invalid-name`, both pre-flight before any native call (ADR 0015). A config the
+   SERVER rejects rejects with an operational `:type :jetstream-api-error` carrying
+   `{:code :description}` (ADR 0020)."
+  [ctx stream config]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-name stream)))
+      (impl/then (fn [_] (consumer/validate-config config)))
+      (impl/bind (fn [_] (proto/-create-consumer ctx stream config)))))
+
+(defn consumer-info
+  "Look up the Consumer named `name` on the Stream `stream` through the JetStream
+   context `ctx`, returning a platform-native promise that resolves to the normalized
+   ConsumerInfo map (see `create-consumer`). The promise rejects with an operational
+   `:type :consumer-not-found` when no such Consumer exists, and pre-flight with a
+   validation `:type :invalid-name` when `stream` or `name` is malformed (ADR 0015/0020)."
+  [ctx stream name]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-name stream)))
+      (impl/then (fn [_] (consumer/validate-name name)))
+      (impl/bind (fn [_] (proto/-consumer-info ctx stream name)))))
+
+(defn delete-consumer
+  "Delete the Consumer named `name` on the Stream `stream` through the JetStream
+   context `ctx`, returning a platform-native promise that resolves to nil once it is
+   gone. The promise rejects with an operational `:type :consumer-not-found` when no
+   such Consumer exists, and pre-flight with a validation `:type :invalid-name` when
+   `stream` or `name` is malformed (ADR 0015/0020)."
+  [ctx stream name]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-name stream)))
+      (impl/then (fn [_] (consumer/validate-name name)))
+      (impl/bind (fn [_] (proto/-delete-consumer ctx stream name)))))
+
+(defn list-consumers
+  "Enumerate the Consumers on the Stream `stream` through the JetStream context `ctx`,
+   returning a platform-native promise that resolves to a vector of normalized
+   ConsumerInfo maps (see `create-consumer`), one per durable. The promise rejects
+   pre-flight with a validation `:type :invalid-name` when `stream` is malformed
+   (ADR 0015/0020)."
+  [ctx stream]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-name stream)))
+      (impl/bind (fn [_] (proto/-list-consumers ctx stream)))))
+
+(defn consumer-names
+  "Enumerate the durable names of the Consumers on the Stream `stream` through the
+   JetStream context `ctx`, returning a platform-native promise that resolves to a
+   vector of name strings — the name projection of `list-consumers`, from which it is
+   derived (nats.js exposes no names endpoint)."
+  [ctx stream]
+  (impl/then (list-consumers ctx stream) (fn [infos] (mapv :name infos))))
 
 (defn publish
   "Acked publish of `data` to `subject` through the JetStream context `ctx`, encoding

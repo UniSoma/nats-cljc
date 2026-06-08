@@ -14,6 +14,7 @@
             [nats-cljc.impl.js :as core]
             [nats-cljc.jetstream.error :as jet-err]
             [nats-cljc.jetstream.stream :as stream]
+            [nats-cljc.jetstream.consumer :as consumer]
             ["@nats-io/jetstream" :as jetstream]))
 
 ;; The JetStream context (ADR 0017): one handle holding both nats.js' data-plane
@@ -81,6 +82,58 @@
    :storage    (stream/wire->storage (.-storage c))
    :retention  (stream/wire->retention (.-retention c))
    :max-age-ms (quot (.-max_age c) 1000000)})
+
+(defn ->consumer-config
+  "Build a nats.js ConsumerConfig object from the portable closed kebab `config`
+   (ADR 0020). Only the keys present are set, so an absent key takes the server
+   default; the policy keywords route through the shared wire tables, `:ack-wait-ms`
+   becomes `ack_wait` Nanos (the JVM leg uses a Duration), and `clj->js` produces the
+   string-keyed object nats.js reads — surviving advanced compilation. `:name` sets the
+   consumer `name`; for a durable (`:durable?` absent or true) it ALSO sets `durable_name`
+   — the field whose absence makes the consumer ephemeral (ADR 0021), mirroring the JVM
+   leg's durable/name split. An ephemeral (`:durable? false`) sets only `name`, or with no
+   `:name` neither (the server assigns one)."
+  [config]
+  (clj->js
+   (cond-> {}
+     (:name config)                                         (assoc :name (:name config))
+     (and (:name config) (not (false? (:durable? config)))) (assoc :durable_name (:name config))
+     (:ack-policy config)      (assoc :ack_policy (consumer/ack-policy->wire (:ack-policy config)))
+     (:deliver-policy config)  (assoc :deliver_policy (consumer/deliver-policy->wire (:deliver-policy config)))
+     (:ack-wait-ms config)     (assoc :ack_wait (* (:ack-wait-ms config) 1000000))
+     (:max-deliver config)     (assoc :max_deliver (:max-deliver config))
+     (:filter-subjects config) (assoc :filter_subjects (:filter-subjects config)))))
+
+(defn consumer-config->map
+  "Read a nats.js ConsumerConfig back into the normalized portable kebab map — the
+   active config the server applied, always the full curated set (defaults included),
+   so a round-tripped info is predictable (ADR 0020). The wire policy strings route
+   back through the shared tables; `ack_wait` Nanos becomes integer ms."
+  [^js c]
+  {:name            (.-name c)
+   :durable?        (some? (.-durable_name c))
+   :ack-policy      (consumer/wire->ack-policy (.-ack_policy c))
+   :deliver-policy  (consumer/wire->deliver-policy (.-deliver_policy c))
+   :ack-wait-ms     (quot (.-ack_wait c) 1000000)
+   :max-deliver     (.-max_deliver c)
+   :filter-subjects (vec (.-filter_subjects c))})
+
+(defn consumer-info->map
+  "Curate a nats.js ConsumerInfo into the normalized portable map (ADR 0020): the
+   active `:config`, the `:created` timestamp (nats.js already hands back an ISO-8601
+   string, matching the JVM leg's formatted ZonedDateTime), and the delivery cursors —
+   `:delivered` and `:ack-floor` each a `{:consumer-seq :stream-seq}` pair, plus the
+   `:pending` count."
+  [^js ci]
+  (let [d  ^js (.-delivered ci)
+        af ^js (.-ack_floor ci)]
+    {:stream    (.-stream_name ci)
+     :name      (.-name ci)
+     :config    (consumer-config->map (.-config ci))
+     :created   (.-created ci)
+     :delivered {:consumer-seq (.-consumer_seq d) :stream-seq (.-stream_seq d)}
+     :ack-floor {:consumer-seq (.-consumer_seq af) :stream-seq (.-stream_seq af)}
+     :pending   (.-num_pending ci)}))
 
 (defn stream-info->map
   "Curate a nats.js StreamInfo into the normalized portable map (ADR 0020): the
@@ -176,6 +229,47 @@
       (-> (.delete streams name)
           (.then (fn [_] nil))
           (.catch (fn [e] (throw (api-error e))))))))
+
+(defn- drain-lister
+  "Drain a nats.js Lister — the async-paged iterator `consumers.list` returns — into a
+   vector of normalized maps, calling `.next` for successive pages and accumulating
+   until one comes back empty (the Lister's end-of-pages signal). The JVM leg's
+   `getConsumers` hands back the full list in one call; this loop is the CLJS analog."
+  [^js lister acc]
+  (-> (.next lister)
+      (.then (fn [page]
+               (if (zero? (alength page))
+                 acc
+                 (drain-lister lister (into acc (map consumer-info->map (array-seq page)))))))))
+
+(defn- with-api-error
+  "Attach the shared ConsumerManager rejection tail: normalize a nats.js error through
+   `api-error` (ADR 0020) before it propagates. Folds the catch-and-normalize tail
+   repeated across the consumer verbs into one place."
+  [p]
+  (.catch p (fn [e] (throw (api-error e)))))
+
+(extend-type JsJetStreamContext
+  proto/ConsumerManager
+  (-create-consumer [ctx stream config]
+    (let [consumers ^js (.-consumers ^js (:jsm ctx))]
+      (-> (.add consumers stream (->consumer-config config))
+          (.then (fn [ci] (consumer-info->map ci)))
+          with-api-error)))
+  (-consumer-info [ctx stream name]
+    (let [consumers ^js (.-consumers ^js (:jsm ctx))]
+      (-> (.info consumers stream name)
+          (.then (fn [ci] (consumer-info->map ci)))
+          with-api-error)))
+  (-delete-consumer [ctx stream name]
+    (let [consumers ^js (.-consumers ^js (:jsm ctx))]
+      (-> (.delete consumers stream name)
+          (.then (fn [_] nil))
+          with-api-error)))
+  (-list-consumers [ctx stream]
+    (let [consumers ^js (.-consumers ^js (:jsm ctx))]
+      (-> (drain-lister (.list consumers stream) [])
+          with-api-error))))
 
 (extend-type JsJetStreamContext
   proto/JetStreamData

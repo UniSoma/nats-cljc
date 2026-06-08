@@ -11,6 +11,7 @@
             [nats-cljc.jetstream :as jet]
             [nats-cljc.jetstream.error :as jet-err]
             [nats-cljc.jetstream.stream :as stream]
+            [nats-cljc.jetstream.consumer :as consumer]
             [nats-cljc.jetstream.pub :as pub]
             #?(:clj  [nats-cljc.jetstream.impl.jvm :as jet-jvm]
                :cljs [nats-cljc.jetstream.impl.js :as jet-js])
@@ -200,6 +201,40 @@
   (is (= "OK" (stream/validate-name "OK"))
       "a well-formed name passes validation unchanged"))
 
+;; A canonical, fully-specified portable consumer config — every supported key set —
+;; so the kebab->native->kebab round-trip is exact. `:durable? true` is the explicit
+;; durable selector (ADR 0021).
+(def ^:private a-consumer-config
+  {:name "TRACER_C" :durable? true :ack-policy :explicit :deliver-policy :all
+   :ack-wait-ms 30000 :max-deliver 5 :filter-subjects ["tracer.a" "tracer.b"]})
+
+;; AC4, deep-module unit (ADR 0015/0020), no server: building the native consumer
+;; config is a pure local construction, so the kebab<->native round-trip needs no
+;; JetStream — a fully-specified config round-trips to itself, proving the ack/deliver
+;; policy keywords and the ms-duration survive each leg's translation (a Duration on
+;; the JVM, Nanos on CLJS). The closed-key + name guards are the portable pre-flight
+;; half, raising their validation `:type`s before any native call.
+(deftest deep-module-consumer-config-round-trip-and-validation
+  (is (= a-consumer-config #?(:clj  (jet-jvm/consumer-config->map (jet-jvm/->consumer-config a-consumer-config))
+                              :cljs (jet-js/consumer-config->map (jet-js/->consumer-config a-consumer-config))))
+      "a fully-specified durable consumer config round-trips kebab->native->kebab on this leg")
+  (let [ephemeral (assoc a-consumer-config :durable? false)]
+    (is (= ephemeral #?(:clj  (jet-jvm/consumer-config->map (jet-jvm/->consumer-config ephemeral))
+                        :cljs (jet-js/consumer-config->map (jet-js/->consumer-config ephemeral))))
+        "a named ephemeral (:durable? false) round-trips, setting name but no durable field"))
+  (is (= a-consumer-config (consumer/validate-config a-consumer-config))
+      "a recognized consumer config passes validation unchanged")
+  (is (= :unknown-config-key (thrown-type #(consumer/validate-config {:name "OK" :bogus 1})))
+      "an unrecognized key (the map is closed) is :unknown-config-key")
+  (is (= :missing-required-key (thrown-type #(consumer/validate-config {:ack-policy :explicit})))
+      "a durable config omitting :name is :missing-required-key, not :invalid-name {:name nil}")
+  (is (= {:durable? false :ack-policy :explicit} (consumer/validate-config {:durable? false :ack-policy :explicit}))
+      "an ephemeral (:durable? false) may omit :name — the server assigns one")
+  (is (= :invalid-name (thrown-type #(consumer/validate-name "bad.name")))
+      "a name carrying a subject delimiter is :invalid-name")
+  (is (= "OK" (consumer/validate-name "OK"))
+      "a well-formed consumer name passes validation unchanged"))
+
 ;; AC4, deep-module unit (ADR 0015/0020), no server: the reserved-header guard is the
 ;; portable pre-flight that keeps the Nats-* namespace sanctioned-only — :msg-id and
 ;; :expect are the way to set those, so a reserved key set directly in user :headers
@@ -328,6 +363,47 @@
                                      "a malformed name rejects the create-stream promise pre-flight")))
                 (p/finally (fn [_ _] (done)))))))
 
+;; AC4 (ADR 0015), no server: a validation failure surfaces through create-consumer's
+;; OWN channel — the returned promise REJECTS, it does not throw synchronously — and
+;; pre-flight, before any native call. A nil ctx proves the pre-flight: validation
+;; rejects first, so the native -create-consumer never dereferences it. Both the closed
+;; config map and BOTH name positions (the stream arg and the config's durable :name)
+;; are guarded.
+(deftest create-consumer-rejects-validation-on-its-promise
+  #?(:clj
+     (do
+       (is (= :unknown-config-key
+              (:type (ex-data (reject-reason (jet/create-consumer nil "OK" {:name "C" :bogus 1})))))
+           "an unknown key rejects the create-consumer promise pre-flight")
+       (is (= :missing-required-key
+              (:type (ex-data (reject-reason (jet/create-consumer nil "OK" {:ack-policy :explicit})))))
+           "a durable config omitting :name rejects the create-consumer promise pre-flight")
+       (is (= :invalid-name
+              (:type (ex-data (reject-reason (jet/create-consumer nil "OK" {:name "bad.name"})))))
+           "a malformed durable name rejects the create-consumer promise pre-flight")
+       (is (= :invalid-name
+              (:type (ex-data (reject-reason (jet/create-consumer nil "bad.stream" {:name "C"})))))
+           "a malformed stream name rejects the create-consumer promise pre-flight"))
+     :cljs
+     (async done
+            (-> (jet/create-consumer nil "OK" {:name "C" :bogus 1})
+                (p/then (fn [_] (is false "expected an :unknown-config-key rejection")))
+                (p/catch (fn [e] (is (= :unknown-config-key (:type (ex-data e)))
+                                     "an unknown key rejects the create-consumer promise pre-flight")))
+                (p/then (fn [_] (jet/create-consumer nil "OK" {:ack-policy :explicit})))
+                (p/then (fn [_] (is false "expected a :missing-required-key rejection")))
+                (p/catch (fn [e] (is (= :missing-required-key (:type (ex-data e)))
+                                     "a durable config omitting :name rejects the create-consumer promise pre-flight")))
+                (p/then (fn [_] (jet/create-consumer nil "OK" {:name "bad.name"})))
+                (p/then (fn [_] (is false "expected an :invalid-name rejection")))
+                (p/catch (fn [e] (is (= :invalid-name (:type (ex-data e)))
+                                     "a malformed durable name rejects the create-consumer promise pre-flight")))
+                (p/then (fn [_] (jet/create-consumer nil "bad.stream" {:name "C"})))
+                (p/then (fn [_] (is false "expected an :invalid-name rejection")))
+                (p/catch (fn [e] (is (= :invalid-name (:type (ex-data e)))
+                                     "a malformed stream name rejects the create-consumer promise pre-flight")))
+                (p/finally (fn [_ _] (done)))))))
+
 ;; AC4 (ADR 0015), no server: the reserved-header guard surfaces through publish's OWN
 ;; channel — the returned promise REJECTS, it does not throw synchronously — and
 ;; pre-flight, before any native call. A nil ctx proves the pre-flight: the guard
@@ -407,6 +483,198 @@
                         (p/then (fn [_] (is false "expected :stream-not-found after delete")))
                         (p/catch (fn [e] (is (= :stream-not-found (:type (ex-data e)))
                                              "stream-info after delete surfaces :stream-not-found")))))))))))
+
+;; A stream the consumer integration tests hang their durable consumers off. Its
+;; subjects cover the consumer config's two filter subjects. :memory so a skipped
+;; teardown vanishes on restart.
+(def ^:private a-stream-for-consumers
+  {:name "CTRACER" :subjects ["tracer.>"] :storage :memory})
+
+;; AC1 + AC2 (ADR 0020), integration on the JetStream-enabled :4222 server: create a
+;; durable Consumer on a Stream from the portable config and read its normalized info
+;; back — the config round-trips, :created is an ISO-8601 string, and a fresh consumer
+;; has delivered/ack-floor cursors at zero with nothing pending. Same on both legs;
+;; creates its own stream fixture and cleans up.
+(deftest consumer-create-info
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx     (deref (jet/jetstream conn) 5000 ::timeout)
+               _       (deref (jet/create-stream ctx a-stream-for-consumers) 5000 ::timeout)
+               created (deref (jet/create-consumer ctx "CTRACER" a-consumer-config) 5000 ::timeout)
+               info    (deref (jet/consumer-info ctx "CTRACER" "TRACER_C") 5000 ::timeout)]
+           (is (= "CTRACER" (:stream created)) "create-consumer returns the owning stream")
+           (is (= "TRACER_C" (:name created)) "create-consumer returns the durable name")
+           (is (= a-consumer-config (:config created)) "create-consumer returns the normalized config")
+           (is (= a-consumer-config (:config info)) "consumer-info round-trips the normalized config")
+           (is (re-matches iso-re (:created info)) "consumer-info :created is an ISO-8601 string")
+           (is (= 0 (get-in info [:delivered :stream-seq])) "a fresh consumer has delivered nothing")
+           (is (= 0 (get-in info [:ack-floor :stream-seq])) "a fresh consumer's ack floor is zero")
+           (is (= 0 (:pending info)) "a fresh consumer has nothing pending")
+           (deref (jet/delete-stream ctx "CTRACER") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx     (jet/jetstream conn)
+                        _       (jet/create-stream ctx a-stream-for-consumers)
+                        created (jet/create-consumer ctx "CTRACER" a-consumer-config)
+                        info    (jet/consumer-info ctx "CTRACER" "TRACER_C")]
+                  (is (= "CTRACER" (:stream created)) "create-consumer returns the owning stream")
+                  (is (= "TRACER_C" (:name created)) "create-consumer returns the durable name")
+                  (is (= a-consumer-config (:config created)) "create-consumer returns the normalized config")
+                  (is (= a-consumer-config (:config info)) "consumer-info round-trips the normalized config")
+                  (is (re-matches iso-re (:created info)) "consumer-info :created is an ISO-8601 string")
+                  (is (= 0 (get-in info [:delivered :stream-seq])) "a fresh consumer has delivered nothing")
+                  (is (= 0 (get-in info [:ack-floor :stream-seq])) "a fresh consumer's ack floor is zero")
+                  (is (= 0 (:pending info)) "a fresh consumer has nothing pending")
+                  (jet/delete-stream ctx "CTRACER")))))))
+
+;; AC3 (ADR 0020), integration: delete-consumer resolves nil once the durable is gone,
+;; and a subsequent consumer-info surfaces the operational :consumer-not-found (err_code
+;; 10014, normalized via the shared table) — the consumer analog of :stream-not-found.
+;; Same on both legs; creates its own stream + consumer fixture and cleans up the stream.
+(deftest consumer-delete-then-not-found
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx a-stream-for-consumers) 5000 ::timeout)
+           (deref (jet/create-consumer ctx "CTRACER" a-consumer-config) 5000 ::timeout)
+           (is (nil? (deref (jet/delete-consumer ctx "CTRACER" "TRACER_C") 5000 ::timeout)) "delete-consumer resolves nil")
+           (is (= :consumer-not-found (:type (ex-data (reject-reason (jet/consumer-info ctx "CTRACER" "TRACER_C")))))
+               "consumer-info after delete surfaces :consumer-not-found")
+           (deref (jet/delete-stream ctx "CTRACER") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx a-stream-for-consumers)
+                        _   (jet/create-consumer ctx "CTRACER" a-consumer-config)
+                        del (jet/delete-consumer ctx "CTRACER" "TRACER_C")]
+                  (is (nil? del) "delete-consumer resolves nil")
+                  (-> (jet/consumer-info ctx "CTRACER" "TRACER_C")
+                      (p/then (fn [_] (is false "expected :consumer-not-found after delete")))
+                      (p/catch (fn [e] (is (= :consumer-not-found (:type (ex-data e)))
+                                           "consumer-info after delete surfaces :consumer-not-found")))
+                      (p/then (fn [_] (jet/delete-stream ctx "CTRACER"))))))))))
+
+;; AC2 (ADR 0020), integration: list-consumers enumerates a Stream's durables as
+;; normalized info maps, and consumer-names is its name projection (the facade derives
+;; it, since nats.js has no names endpoint). Two durables off one stream prove the
+;; enumeration; both legs return the same set of names. Creates its own fixture, cleans up.
+(deftest consumer-list-and-names
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx a-stream-for-consumers) 5000 ::timeout)
+           (deref (jet/create-consumer ctx "CTRACER" (assoc a-consumer-config :name "C_ONE")) 5000 ::timeout)
+           (deref (jet/create-consumer ctx "CTRACER" (assoc a-consumer-config :name "C_TWO")) 5000 ::timeout)
+           (let [infos (deref (jet/list-consumers ctx "CTRACER") 5000 ::timeout)
+                 names (deref (jet/consumer-names ctx "CTRACER") 5000 ::timeout)]
+             (is (= 2 (count infos)) "list-consumers enumerates both durables")
+             (is (= #{"C_ONE" "C_TWO"} (set (map :name infos))) "each enumerated info carries its durable name")
+             (is (= #{"C_ONE" "C_TWO"} (set names)) "consumer-names projects the durable names"))
+           (deref (jet/delete-stream ctx "CTRACER") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx   (jet/jetstream conn)
+                        _     (jet/create-stream ctx a-stream-for-consumers)
+                        _     (jet/create-consumer ctx "CTRACER" (assoc a-consumer-config :name "C_ONE"))
+                        _     (jet/create-consumer ctx "CTRACER" (assoc a-consumer-config :name "C_TWO"))
+                        infos (jet/list-consumers ctx "CTRACER")
+                        names (jet/consumer-names ctx "CTRACER")]
+                  (is (= 2 (count infos)) "list-consumers enumerates both durables")
+                  (is (= #{"C_ONE" "C_TWO"} (set (map :name infos))) "each enumerated info carries its durable name")
+                  (is (= #{"C_ONE" "C_TWO"} (set names)) "consumer-names projects the durable names")
+                  (jet/delete-stream ctx "CTRACER")))))))
+
+;; AC (ADR 0021), integration: a single-element :filter-subjects round-trips — the case the
+;; two-subject configs elsewhere dodge. On every server version this project supports
+;; (nats-server >= 2.12, where the plural `filter_subjects` field exists), both jnats and
+;; nats.js return a single filter under the plural field, so the plural read round-trips it
+;; natively. (Verified: probing the raw native config shows the plural populated on both
+;; legs; pre-2.12 singular-only storage is out of scope, so no coalesce is carried.)
+(deftest consumer-single-filter-round-trip
+  (let [solo (assoc a-consumer-config :name "C_SOLO" :filter-subjects ["tracer.a"])]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx     (deref (jet/jetstream conn) 5000 ::timeout)
+                 _       (deref (jet/create-stream ctx a-stream-for-consumers) 5000 ::timeout)
+                 created (deref (jet/create-consumer ctx "CTRACER" solo) 5000 ::timeout)]
+             (is (= ["tracer.a"] (:filter-subjects (:config created)))
+                 "a single :filter-subjects round-trips (singular/plural coalesced)")
+             (deref (jet/delete-stream ctx "CTRACER") 5000 ::timeout))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx     (jet/jetstream conn)
+                          _       (jet/create-stream ctx a-stream-for-consumers)
+                          created (jet/create-consumer ctx "CTRACER" solo)]
+                    (is (= ["tracer.a"] (:filter-subjects (:config created)))
+                        "a single :filter-subjects round-trips (singular/plural coalesced)")
+                    (jet/delete-stream ctx "CTRACER"))))))))
+
+;; AC (ADR 0021), integration: create-consumer builds an EPHEMERAL with :durable? false.
+;; The create response is the server-applied config; a named ephemeral reads its name back
+;; and reports :durable? false (no durable_name field), distinguishing it from a durable.
+;; Asserting on the create return is race-free against the ephemeral's inactivity reaping.
+(deftest consumer-ephemeral-create
+  (let [eph (assoc a-consumer-config :name "C_EPH" :durable? false)]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx     (deref (jet/jetstream conn) 5000 ::timeout)
+                 _       (deref (jet/create-stream ctx a-stream-for-consumers) 5000 ::timeout)
+                 created (deref (jet/create-consumer ctx "CTRACER" eph) 5000 ::timeout)]
+             (is (= "C_EPH" (:name created)) "a named ephemeral reads its name back")
+             (is (false? (:durable? (:config created))) "an ephemeral reports :durable? false")
+             (deref (jet/delete-stream ctx "CTRACER") 5000 ::timeout))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx     (jet/jetstream conn)
+                          _       (jet/create-stream ctx a-stream-for-consumers)
+                          created (jet/create-consumer ctx "CTRACER" eph)]
+                    (is (= "C_EPH" (:name created)) "a named ephemeral reads its name back")
+                    (is (false? (:durable? (:config created))) "an ephemeral reports :durable? false")
+                    (jet/delete-stream ctx "CTRACER"))))))))
+
+;; AC (ADR 0021), integration: create-consumer is CREATE-ONLY on both legs — re-creating a
+;; durable with a CHANGED config is rejected by the server (action=create), identically on
+;; both legs, rather than silently upserting (the old JVM .addOrUpdateConsumer behavior).
+;; The unmapped "already exists" code defaults to the catch-all :jetstream-api-error. An
+;; identical re-create would be idempotent, so the config must differ (:max-deliver here).
+(deftest consumer-create-is-create-only
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx a-stream-for-consumers) 5000 ::timeout)
+           (deref (jet/create-consumer ctx "CTRACER" a-consumer-config) 5000 ::timeout)
+           (is (= :jetstream-api-error
+                  (:type (ex-data (reject-reason (jet/create-consumer ctx "CTRACER" (assoc a-consumer-config :max-deliver 9))))))
+               "a config-changing re-create rejects (create-only, not upsert)")
+           (deref (jet/delete-stream ctx "CTRACER") 5000 ::timeout))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx a-stream-for-consumers)
+                        _   (jet/create-consumer ctx "CTRACER" a-consumer-config)]
+                  (-> (jet/create-consumer ctx "CTRACER" (assoc a-consumer-config :max-deliver 9))
+                      (p/then (fn [_] (is false "expected a config-changing re-create to reject")))
+                      (p/catch (fn [e] (is (= :jetstream-api-error (:type (ex-data e)))
+                                           "a config-changing re-create rejects (create-only, not upsert)")))
+                      (p/then (fn [_] (jet/delete-stream ctx "CTRACER"))))))))))
 
 ;; AC4 (ADR 0020), integration: a config the SERVER rejects (a subject overlap with an
 ;; existing stream — valid name, valid keys, so not pre-flight validation) is

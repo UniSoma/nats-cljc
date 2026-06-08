@@ -16,10 +16,11 @@
   (:require [nats-cljc.protocol :as proto]
             [nats-cljc.impl.jvm :as core]
             [nats-cljc.jetstream.error :as jet-err]
-            [nats-cljc.jetstream.stream :as stream])
+            [nats-cljc.jetstream.stream :as stream]
+            [nats-cljc.jetstream.consumer :as consumer])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions]
-           [io.nats.client.api ServerInfo StreamConfiguration StorageType RetentionPolicy StreamInfo StreamState PublishAck]
+           [io.nats.client.api ServerInfo StreamConfiguration StorageType RetentionPolicy StreamInfo StreamState PublishAck ConsumerConfiguration AckPolicy DeliverPolicy ConsumerInfo SequenceInfo]
            [java.io IOException]
            [java.time Duration]
            [java.time.format DateTimeFormatter]
@@ -193,6 +194,62 @@
    :retention (stream/wire->retention (str (.getRetentionPolicy c)))
    :max-age-ms (.toMillis (.getMaxAge c))})
 
+(defn ->consumer-config
+  "Build a jnats ConsumerConfiguration from the portable closed kebab `config`
+   (ADR 0020). Only the keys present are set, so an absent key takes the server
+   default; the policy keywords route through the shared wire tables and `:ack-wait-ms`
+   becomes a Duration (the CLJS leg uses Nanos). `:name` sets the consumer `name`; for a
+   durable (`:durable?` absent or true) it ALSO sets `durable` — the field whose absence
+   makes the consumer ephemeral (ADR 0021). An ephemeral (`:durable? false`) sets only
+   `name` (a named ephemeral) or, with no `:name`, neither (the server assigns one)."
+  ^ConsumerConfiguration [config]
+  (let [b (ConsumerConfiguration/builder)]
+    (when-let [name (:name config)]
+      (.name b ^String name)
+      (when-not (false? (:durable? config))
+        (.durable b ^String name)))
+    (when-let [ack-policy (:ack-policy config)]
+      (.ackPolicy b (AckPolicy/get (consumer/ack-policy->wire ack-policy))))
+    (when-let [deliver-policy (:deliver-policy config)]
+      (.deliverPolicy b (DeliverPolicy/get (consumer/deliver-policy->wire deliver-policy))))
+    (when-let [ack-wait-ms (:ack-wait-ms config)]
+      (.ackWait b (Duration/ofMillis ack-wait-ms)))
+    (when-let [max-deliver (:max-deliver config)]
+      (.maxDeliver b (long max-deliver)))
+    (when-let [filter-subjects (:filter-subjects config)]
+      (.filterSubjects b (into-array String filter-subjects)))
+    (.build b)))
+
+(defn consumer-config->map
+  "Read a jnats ConsumerConfiguration back into the normalized portable kebab map —
+   the active config the server applied, always the full curated set (defaults
+   included), so a round-tripped info is predictable (ADR 0020). The wire policy
+   strings route back through the shared tables; the Duration becomes integer ms."
+  [^ConsumerConfiguration c]
+  {:name (.getName c)
+   :durable? (some? (.getDurable c))
+   :ack-policy (consumer/wire->ack-policy (str (.getAckPolicy c)))
+   :deliver-policy (consumer/wire->deliver-policy (str (.getDeliverPolicy c)))
+   :ack-wait-ms (.toMillis (.getAckWait c))
+   :max-deliver (.getMaxDeliver c)
+   :filter-subjects (vec (.getFilterSubjects c))})
+
+(defn consumer-info->map
+  "Curate a jnats ConsumerInfo into the normalized portable map (ADR 0020): the active
+   `:config`, the `:created` timestamp as ISO-8601 (the same ZonedDateTime formatting
+   as `stream-info->map`), and the delivery cursors — `:delivered` and `:ack-floor`
+   each a `{:consumer-seq :stream-seq}` pair, plus the `:pending` count."
+  [^ConsumerInfo ci]
+  (let [^SequenceInfo d  (.getDelivered ci)
+        ^SequenceInfo af (.getAckFloor ci)]
+    {:stream    (.getStreamName ci)
+     :name      (.getName ci)
+     :config    (consumer-config->map (.getConsumerConfiguration ci))
+     :created   (.format (.getCreationTime ci) DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+     :delivered {:consumer-seq (.getConsumerSequence d) :stream-seq (.getStreamSequence d)}
+     :ack-floor {:consumer-seq (.getConsumerSequence af) :stream-seq (.getStreamSequence af)}
+     :pending   (.getNumPending ci)}))
+
 (defn stream-info->map
   "Curate a jnats StreamInfo into the normalized portable map (ADR 0020): the active
    `:config`, the `:created` timestamp as ISO-8601 (jnats hands back a
@@ -246,6 +303,17 @@
     (off-thread #(stream-info->map (.getStreamInfo ^JetStreamManagement (:jsm ctx) ^String name))))
   (-delete-stream [ctx name]
     (off-thread #(do (.deleteStream ^JetStreamManagement (:jsm ctx) ^String name) nil))))
+
+(extend-type JvmJetStreamContext
+  proto/ConsumerManager
+  (-create-consumer [ctx stream config]
+    (off-thread #(consumer-info->map (.createConsumer ^JetStreamManagement (:jsm ctx) ^String stream (->consumer-config config)))))
+  (-consumer-info [ctx stream name]
+    (off-thread #(consumer-info->map (.getConsumerInfo ^JetStreamManagement (:jsm ctx) ^String stream ^String name))))
+  (-delete-consumer [ctx stream name]
+    (off-thread #(do (.deleteConsumer ^JetStreamManagement (:jsm ctx) ^String stream ^String name) nil)))
+  (-list-consumers [ctx stream]
+    (off-thread #(mapv consumer-info->map (.getConsumers ^JetStreamManagement (:jsm ctx) ^String stream)))))
 
 (defn- bound-ack
   "Resolve the publishAsync `fut` to a portable PubAck, enforcing the `:timeout-ms`
