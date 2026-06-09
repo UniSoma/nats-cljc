@@ -1,12 +1,12 @@
 ---
 id: nts-01ktde3036sg
 title: 'Ordered consumer: gap-free, no-ack stream replay'
-status: open
+status: in_progress
 type: feature
 priority: 2
 mode: afk
 created: '2026-06-06T03:02:10.273856573Z'
-updated: '2026-06-06T03:02:10.273856573Z'
+updated: '2026-06-09T23:15:50.818068692Z'
 parent: nts-01ktdcwwhd76
 tags:
 - jetstream

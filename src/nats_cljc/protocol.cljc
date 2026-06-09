@@ -220,4 +220,37 @@
      validated refill-knob map `{:batch :threshold :expires-ms :idle-heartbeat-ms
      :max-bytes}` the impl translates to native consume options (`:threshold`
      count->percent on the JVM). There is no `:slow-consumer` in pull: a slow
-     handler slows the pull, nothing overflows (ADR 0018)."))
+     handler slows the pull, nothing overflows (ADR 0018).")
+  (-js-ordered-consumer [ctx stream opts]
+    "Create an Ordered consumer over the Stream `stream` through `ctx`, returning a
+     native promise of the per-leg ordered pull handle (an `OrderedPull` record,
+     carrying the context codec) the facade's pull triad then dispatches over. The
+     opts map is the validated ordered config `{:filter-subjects :deliver-policy}`,
+     translated to each leg's native ordered-consumer options. Both legs round-trip
+     stream info at creation, so the promise rejects with `:type :stream-not-found`
+     when no such Stream exists (ADR 0020). The consumer is a server-managed
+     EPHEMERAL with ack policy none; the native client recreates it on a sequence
+     gap, which is what makes the replay gap-free."))
+
+(defprotocol OrderedPull
+  "The pull triad over an Ordered consumer handle (the value `-js-ordered-consumer`
+   resolves) — EXTENDED onto each platform's ordered record from the impl
+   namespaces, the ordered sibling of `JetStreamData`'s named-consumer pull verbs.
+   Same raw-map contract: each leg drives its native ordered consumer (jnats'
+   OrderedConsumerContext, nats.js' ordered pull Consumer), which tracks the
+   delivery sequence client-side and recreates the ephemeral on a gap, so the
+   lifted messages arrive in stream order with no acknowledgements taken."
+  (-oc-next [oc opts]
+    "Poll a single message from the ordered handle `oc`, returning a native promise
+     of ONE raw JetStream message map (the per-leg `js-msg->raw` lift, as
+     `-js-next`) or nil when no message arrives within the poll's `:expires-ms`
+     wait.")
+  (-oc-fetch [oc opts]
+    "Fetch a bounded batch from the ordered handle `oc`, returning a native promise
+     of a VECTOR of up to `:batch` raw JetStream message maps in stream order, as
+     `-js-fetch`.")
+  (-oc-consume [oc opts handler]
+    "Continuously deliver from the ordered handle `oc`, returning a native promise
+     of a drainable/unsubscribable consume handle, as `-js-consume` — same handler
+     contract (one raw map per call, a returned promise gates the next delivery)
+     and the same refill-knob `opts`."))

@@ -21,9 +21,9 @@
             [nats-cljc.jetstream.pull :as pull]
             [nats-cljc.jetstream.refill :as refill])
   (:import [nats_cljc.impl.jvm JvmConnection]
-           [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions ConsumerContext FetchConsumer FetchConsumeOptions ConsumeOptions ConsumeOptions$Builder MessageConsumer MessageHandler Message]
+           [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions BaseConsumerContext OrderedConsumerContext StreamContext FetchConsumer FetchConsumeOptions ConsumeOptions ConsumeOptions$Builder MessageConsumer MessageHandler Message]
            [io.nats.client.impl NatsJetStreamMetaData]
-           [io.nats.client.api ServerInfo StreamConfiguration StreamConfiguration$Builder StorageType RetentionPolicy StreamInfo StreamState PublishAck PurgeResponse ConsumerConfiguration ConsumerConfiguration$Builder AckPolicy DeliverPolicy ConsumerInfo SequenceInfo]
+           [io.nats.client.api ServerInfo StreamConfiguration StreamConfiguration$Builder StorageType RetentionPolicy StreamInfo StreamState PublishAck PurgeResponse ConsumerConfiguration ConsumerConfiguration$Builder AckPolicy DeliverPolicy ConsumerInfo SequenceInfo OrderedConsumerConfiguration]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
            [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
@@ -570,6 +570,78 @@
     (reset! closed? true)
     nil))
 
+(defn- next-msg
+  "Poll one message from a jnats consumer context — `BaseConsumerContext`, the
+   interface ConsumerContext (named) and OrderedConsumerContext (ordered) share, so
+   the named and ordered pull paths drive one body. next(long) waits :expires-ms and
+   returns null on an empty consumer; next() (no :expires-ms) uses jnats' default
+   expiry. This inlines the :expires-ms->window mapping that fetch routes through
+   ->fetch-options; a new pull option (e.g. :idle-heartbeat) must be wired into both
+   to keep next and fetch in step. Blocking — runs inside the callers' off-thread."
+  [^BaseConsumerContext cctx opts]
+  (let [msg (if-let [e (:expires-ms opts)] (.next cctx (long e)) (.next cctx))]
+    (when msg (js-msg->raw msg))))
+
+(defn- fetch-batch
+  "Drain one bounded fetch from a jnats consumer context (`BaseConsumerContext`, as
+   `next-msg`) into a vector of lifted pull maps. FetchConsumer.nextMessage returns
+   null once the bounded batch is exhausted (maxMessages reached or expiresIn
+   elapsed); close it either way to release the pull subscription. Blocking — runs
+   inside the callers' off-thread."
+  [^BaseConsumerContext cctx opts]
+  (let [^FetchConsumer fc (.fetch cctx (->fetch-options opts))]
+    (try
+      (loop [acc (transient [])]
+        (if-let [msg (.nextMessage fc)]
+          (recur (conj! acc (js-msg->raw msg)))
+          (persistent! acc)))
+      (finally (.close fc)))))
+
+(defn- start-consume
+  "Start a continuous consume on a jnats consumer context (`BaseConsumerContext`, as
+   `next-msg`) and wrap it in the JvmConsumeHandle. Road 2 (ADR 0007/0018):
+   onMessage BLOCKS the consume's dispatcher thread on the handler's
+   CompletionStage, exactly as core -subscribe does — serial delivery and
+   promise-return backpressure fall out, and the backlog gates jnats' OWN refill
+   (pendingUpdated never fires past a blocked handler), so the read rate bounds the
+   pull rate with nothing overflowing. Blocking — runs inside the callers'
+   off-thread."
+  [^BaseConsumerContext cctx opts handler ^ExecutorService io-executor ^Connection client]
+  (let [mh (reify MessageHandler
+             (onMessage [_ msg]
+               (try
+                 (let [r (handler (js-msg->raw msg))]
+                   (when (instance? CompletionStage r)
+                     (.join (.toCompletableFuture ^CompletionStage r))))
+                 ;; Catch Exception, not Throwable (the core -subscribe
+                 ;; precedent): a handler/decode failure must not re-raise
+                 ;; into jnats' dispatch loop. Routing it to a per-consume
+                 ;; :on-error is the consume error-model follow-up; until
+                 ;; that lands the failure is contained and delivery
+                 ;; continues.
+                 (catch Exception _ nil))))]
+    (->JvmConsumeHandle (.consume cctx (->consume-options opts) mh)
+                        io-executor
+                        (->drain-deadline-ms opts)
+                        (atom false)
+                        (fn [] (= Connection$Status/CLOSED (.getStatus client))))))
+
+;; The Ordered consumer pull handle: jnats' OrderedConsumerContext (server-managed
+;; ephemeral, ack policy none, recreated on a sequence gap) plus the context state
+;; the pull verbs need — the codec so the facade's decode precedence works on the
+;; handle exactly as on the context, the IO pool for off-thread, and the owning
+;; Connection so a consume's liveness supplier matches the named path (ADR 0022).
+(defrecord JvmOrderedConsumer [^OrderedConsumerContext occ codec ^ExecutorService io-executor ^Connection client])
+
+(defn- ->ordered-config
+  "Build a jnats OrderedConsumerConfiguration from the portable closed ordered opts
+   (ADR 0020). Only the keys present are set, so an absent key takes the client
+   default; the deliver-policy keyword routes through the shared wire table."
+  ^OrderedConsumerConfiguration [{:keys [filter-subjects deliver-policy]}]
+  (cond-> (OrderedConsumerConfiguration.)
+    filter-subjects (.filterSubjects ^"[Ljava.lang.String;" (into-array String filter-subjects))
+    deliver-policy  (.deliverPolicy (DeliverPolicy/get (consumer/deliver-policy->wire deliver-policy)))))
+
 (extend-type JvmJetStreamContext
   proto/JetStreamData
   (-js-publish [ctx subject headers bytes opts]
@@ -580,57 +652,41 @@
   (-js-next [ctx stream consumer opts]
     ;; getConsumerContext does a $JS.API round-trip (a missing consumer surfaces as a
     ;; JetStreamApiException → :consumer-not-found via off-thread), so the whole poll
-    ;; runs off-thread (ADR 0002). next(long) waits :expires-ms and returns null on an
-    ;; empty consumer; next() (no :expires-ms) uses jnats' default expiry. This inlines
-    ;; the :expires-ms->window mapping that fetch routes through ->fetch-options; a new
-    ;; pull option (e.g. :idle-heartbeat) must be wired into both to keep next and fetch
-    ;; in step.
+    ;; runs off-thread (ADR 0002).
     (off-thread
      (:io-executor ctx)
-     #(let [^ConsumerContext cctx (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
-            msg (if-let [e (:expires-ms opts)] (.next cctx (long e)) (.next cctx))]
-        (when msg (js-msg->raw msg)))))
+     #(next-msg (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer) opts)))
   (-js-fetch [ctx stream consumer opts]
     (off-thread
      (:io-executor ctx)
-     #(let [^ConsumerContext cctx (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
-            ^FetchConsumer fc     (.fetch cctx (->fetch-options opts))]
-        ;; FetchConsumer.nextMessage returns null once the bounded batch is exhausted
-        ;; (maxMessages reached or expiresIn elapsed); close it either way to release
-        ;; the pull subscription.
-        (try
-          (loop [acc (transient [])]
-            (if-let [msg (.nextMessage fc)]
-              (recur (conj! acc (js-msg->raw msg)))
-              (persistent! acc)))
-          (finally (.close fc))))))
+     #(fetch-batch (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer) opts)))
   (-js-consume [ctx stream consumer opts handler]
-    ;; Road 2 (ADR 0007/0018): onMessage BLOCKS the consume's dispatcher thread on
-    ;; the handler's CompletionStage, exactly as core -subscribe does — serial
-    ;; delivery and promise-return backpressure fall out, and the backlog gates
-    ;; jnats' OWN refill (pendingUpdated never fires past a blocked handler), so
-    ;; the read rate bounds the pull rate with nothing overflowing. The
-    ;; getConsumerContext round-trip surfaces a missing consumer as
+    ;; The getConsumerContext round-trip surfaces a missing consumer as
     ;; :consumer-not-found via off-thread, like next/fetch.
     (off-thread
      (:io-executor ctx)
-     #(let [^ConsumerContext cctx (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
-            mh (reify MessageHandler
-                 (onMessage [_ msg]
-                   (try
-                     (let [r (handler (js-msg->raw msg))]
-                       (when (instance? CompletionStage r)
-                         (.join (.toCompletableFuture ^CompletionStage r))))
-                     ;; Catch Exception, not Throwable (the core -subscribe
-                     ;; precedent): a handler/decode failure must not re-raise
-                     ;; into jnats' dispatch loop. Routing it to a per-consume
-                     ;; :on-error is the consume error-model follow-up; until
-                     ;; that lands the failure is contained and delivery
-                     ;; continues.
-                     (catch Exception _ nil))))]
-        (->JvmConsumeHandle (.consume cctx (->consume-options opts) mh)
-                            (:io-executor ctx)
-                            (->drain-deadline-ms opts)
-                            (atom false)
-                            (let [^Connection client (:client ctx)]
-                              (fn [] (= Connection$Status/CLOSED (.getStatus client)))))))))
+     #(start-consume (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
+                     opts handler (:io-executor ctx) (:client ctx))))
+  (-js-ordered-consumer [ctx stream opts]
+    ;; getStreamContext round-trips stream info (a missing stream surfaces as a
+    ;; JetStreamApiException → :stream-not-found via off-thread, matching the
+    ;; nats.js ordered() pre-create info); createOrderedConsumer is a local
+    ;; construction — the ephemeral itself is created lazily at the first pull.
+    (off-thread
+     (:io-executor ctx)
+     #(let [^StreamContext sctx (.getStreamContext ^JetStream (:js ctx) ^String stream)]
+        (->JvmOrderedConsumer (.createOrderedConsumer sctx (->ordered-config opts))
+                              (:codec ctx) (:io-executor ctx) (:client ctx))))))
+
+(extend-type JvmOrderedConsumer
+  proto/OrderedPull
+  ;; The named-pull bodies verbatim, minus the getConsumerContext resolution — the
+  ;; OrderedConsumerContext is already in hand, and jnats recreates the underlying
+  ;; ephemeral across these calls when a sequence gap appears.
+  (-oc-next [oc opts]
+    (off-thread (:io-executor oc) #(next-msg (:occ oc) opts)))
+  (-oc-fetch [oc opts]
+    (off-thread (:io-executor oc) #(fetch-batch (:occ oc) opts)))
+  (-oc-consume [oc opts handler]
+    (off-thread (:io-executor oc)
+                #(start-consume (:occ oc) opts handler (:io-executor oc) (:client oc)))))

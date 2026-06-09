@@ -246,6 +246,33 @@
            :js      js}
     (seq headers) (assoc :headers (core/trim-headers headers))))
 
+(defn ordered-consumer
+  "Create an Ordered consumer over the Stream `stream` through the JetStream context
+   `ctx` — a specialized Ephemeral consumer for single-client, gap-free replay:
+   server-managed, taking NO acknowledgements (ack policy none), and automatically
+   recreated by the client should a sequence gap appear — returning a platform-native
+   promise that resolves to an ordered pull handle. The handle plugs into the same
+   pull triad as a named Consumer, via the handle-first arities: `(next handle opts)`,
+   `(fetch handle opts)`, `(consume handle handler opts)` — same pure-data messages,
+   same opts, same drainable consume handle (ADR 0018/0019). It leaves no durable
+   Consumer behind: the underlying ephemeral is reclaimed by the server after its
+   inactivity window.
+
+   `opts` is the portable, CLOSED kebab map tuning what the handle replays:
+   `:filter-subjects` (a vector of subject strings) and `:deliver-policy` (`:all` |
+   `:last` | `:new` | `:last-per-subject`); everything else — name, ack policy,
+   recreation — is the library's business. The promise rejects pre-flight with a
+   validation `:type :invalid-name` when `stream` is malformed and
+   `:unknown-config-key` for an unrecognized opts key (ADR 0015), and operationally
+   with `:stream-not-found` when no such Stream exists — both legs round-trip stream
+   info at creation (ADR 0020)."
+  ([ctx stream] (ordered-consumer ctx stream {}))
+  ([ctx stream opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (stream/validate-name stream)))
+       (impl/then (fn [_] (consumer/validate-ordered-config opts)))
+       (impl/bind (fn [_] (proto/-js-ordered-consumer ctx stream opts))))))
+
 (defn fetch
   "Fetch a bounded batch from the durable Consumer `consumer` on Stream `stream` through
    the JetStream context `ctx`, returning a platform-native promise that resolves to a
@@ -262,7 +289,20 @@
    override). The
    promise rejects pre-flight with a validation `:type :invalid-name` when `stream` or
    `consumer` is malformed, and `:invalid-expires` when a supplied `:expires-ms` is below
-   the 1000ms floor both clients enforce or is not a whole number (ADR 0015)."
+   the 1000ms floor both clients enforce or is not a whole number (ADR 0015).
+
+   The handle-first arities fetch from an `ordered-consumer` handle instead — same
+   message shape, opts, and `:invalid-expires` guard; the handle already names its
+   Stream and the library manages the ephemeral, so there is nothing to validate
+   by name."
+  ([ordered] (fetch ordered {}))
+  ([ordered opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (pull/validate-expires opts)))
+       (impl/bind (fn [_] (proto/-oc-fetch ordered opts)))
+       (impl/then (fn [raws]
+                    (let [codec (core/effective-codec ordered opts)]
+                      (mapv #(decode-js-msg codec %) raws))))))
   ([ctx stream consumer] (fetch ctx stream consumer {}))
   ([ctx stream consumer opts]
    (-> (impl/resolved nil)
@@ -285,7 +325,17 @@
    (a per-call decode override). The promise
    rejects pre-flight with a validation `:type :invalid-name` when `stream` or `consumer`
    is malformed, and `:invalid-expires` when a supplied `:expires-ms` is below the 1000ms
-   floor both clients enforce or is not a whole number (ADR 0015)."
+   floor both clients enforce or is not a whole number (ADR 0015).
+
+   The handle-first arities poll an `ordered-consumer` handle instead — same message
+   shape, opts, and `:invalid-expires` guard; successive polls continue from the
+   handle's tracked position, in stream order."
+  ([ordered] (next ordered {}))
+  ([ordered opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (pull/validate-expires opts)))
+       (impl/bind (fn [_] (proto/-oc-next ordered opts)))
+       (impl/then (fn [raw] (when raw (decode-js-msg (core/effective-codec ordered opts) raw))))))
   ([ctx stream consumer] (next ctx stream consumer {}))
   ([ctx stream consumer opts]
    (-> (impl/resolved nil)
@@ -330,7 +380,20 @@
    down (on the JVM buffered messages deliver first; on CLJS the buffer is
    discarded — un-acked, so the server redelivers them); `core/unsubscribe` ends it
    abruptly and idempotently, and takes no `max` (a consume has no auto-unsubscribe
-   count — passing one throws `:type :invalid-max`)."
+   count — passing one throws `:type :invalid-max`).
+
+   The handle-first arities consume from an `ordered-consumer` handle instead — same
+   handler contract, refill knobs, and drainable handle; deliveries arrive in stream
+   order with no acknowledgements to take."
+  ([ordered handler] (consume ordered handler {}))
+  ([ordered handler opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (refill/validate-opts opts)))
+       (impl/bind (fn [_]
+                    (let [codec (core/effective-codec ordered opts)]
+                      (proto/-oc-consume ordered
+                                         (select-keys opts [:batch :threshold :expires-ms :idle-heartbeat-ms :max-bytes])
+                                         (fn [raw] (handler (decode-js-msg codec raw)))))))))
   ([ctx stream consumer handler] (consume ctx stream consumer handler {}))
   ([ctx stream consumer handler opts]
    (-> (impl/resolved nil)

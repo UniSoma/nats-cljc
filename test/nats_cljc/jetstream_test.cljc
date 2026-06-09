@@ -2178,3 +2178,165 @@
                              (is (identical? boom e) "drain-fetch rejects with the lift's error")
                              (is @closed? "drain-fetch closes the ConsumerMessages on the throw path")))
                   (p/finally (fn [_ _] (done))))))))
+
+;; (ADR 0015), no server: the ordered-consumer guards surface through the verbs' OWN
+;; channel — the returned promise REJECTS, pre-flight, before any native call. A nil
+;; ctx/handle proves the pre-flight: validation rejects first, so the native
+;; -js-ordered-consumer / -oc-next never dereferences it. The opts map is CLOSED
+;; (:filter-subjects/:deliver-policy only), and the handle-first next arity shares
+;; the named arity's :invalid-expires guard.
+(deftest ordered-consumer-rejects-validation-on-its-promise
+  #?(:clj
+     (do
+       (is (= :invalid-name
+              (:type (ex-data (reject-reason (jet/ordered-consumer nil "bad name")))))
+           "a malformed stream name rejects the ordered-consumer promise pre-flight")
+       (is (= :unknown-config-key
+              (:type (ex-data (reject-reason (jet/ordered-consumer nil "ORD" {:filter "x"})))))
+           "an unrecognized ordered opts key rejects pre-flight — the map is closed")
+       (is (= :invalid-expires
+              (:type (ex-data (reject-reason (jet/next nil {:expires-ms 500})))))
+           "the handle-first next arity shares the :invalid-expires pull guard"))
+     :cljs
+     (async done
+            (-> (jet/ordered-consumer nil "bad name")
+                (p/then (fn [_] (is false "expected an :invalid-name rejection")))
+                (p/catch (fn [e] (is (= :invalid-name (:type (ex-data e)))
+                                     "a malformed stream name rejects the ordered-consumer promise pre-flight")))
+                (p/then (fn [_] (jet/ordered-consumer nil "ORD" {:filter "x"})))
+                (p/then (fn [_] (is false "expected an :unknown-config-key rejection")))
+                (p/catch (fn [e] (is (= :unknown-config-key (:type (ex-data e)))
+                                     "an unrecognized ordered opts key rejects pre-flight — the map is closed")))
+                (p/then (fn [_] (jet/next nil {:expires-ms 500})))
+                (p/then (fn [_] (is false "expected an :invalid-expires rejection")))
+                (p/catch (fn [e] (is (= :invalid-expires (:type (ex-data e)))
+                                     "the handle-first next arity shares the :invalid-expires pull guard")))
+                (p/finally (fn [_ _] (done)))))))
+
+;; CONTEXT "Ordered consumer" (ADR 0018/0019), integration on the :4222 JetStream
+;; server: an ordered consumer replays every stored message in stream order, gap-free
+;; (consecutive :js :stream-seq, nothing skipped or repeated), with NO acks taken, via
+;; the same pull surface a named Consumer uses — `fetch` on the handle resolves the
+;; same PURE-DATA messages, and a later `next` continues from the handle's tracked
+;; position. It is ephemeral: the underlying server-side consumer(s) are never durable
+;; and ack policy is none, so nothing durable is left behind on the Stream. Same on
+;; both legs; memory stream, cleans up.
+(deftest ordered-consumer-replays-gap-free
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "ORD" :subjects ["ord.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "ORD"
+             (fn []
+               (doseq [n [1 2 3 4 5]] (deref (jet/publish ctx "ord.a" {:n n}) 5000 ::timeout))
+               (let [oc   (deref (jet/ordered-consumer ctx "ORD") 5000 ::timeout)
+                     msgs (deref (jet/fetch oc {:batch 5 :expires-ms 2000}) 5000 ::timeout)]
+                 (is (= [{:n 1} {:n 2} {:n 3} {:n 4} {:n 5}] (mapv :data msgs))
+                     "fetch on the ordered handle replays every stored message, :data decoded, in publish order")
+                 (is (= [1 2 3 4 5] (mapv #(get-in % [:js :stream-seq]) msgs))
+                     "the replay is gap-free: consecutive stream sequences, nothing skipped or repeated")
+                 (is (= #{:subject :data :js} (set (keys (first msgs))))
+                     "ordered deliveries are the same pure-data shape as a named Consumer's")
+                 (deref (jet/publish ctx "ord.a" {:n 6}) 5000 ::timeout)
+                 (let [m6 (deref (jet/next oc {:expires-ms 2000}) 5000 ::timeout)]
+                   (is (= {:n 6} (:data m6)) "next on the handle continues from the tracked position")
+                   (is (= 6 (get-in m6 [:js :stream-seq])) "the continuation picks up the next stream sequence"))
+                 (let [infos (deref (jet/list-consumers ctx "ORD") 5000 ::timeout)]
+                   (is (seq infos) "the ordered consumer exists server-side while in use")
+                   (is (every? #(false? (get-in % [:config :durable?])) infos)
+                       "it is ephemeral: no durable consumer is left behind on the Stream")
+                   (is (every? #(= :none (get-in % [:config :ack-policy])) infos)
+                       "it takes no acknowledgements: ack policy none"))))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "ORD" :subjects ["ord.>"] :storage :memory})]
+                  (with-stream ctx "ORD"
+                    (fn []
+                      (p/let [_    (jet/publish ctx "ord.a" {:n 1})
+                              _    (jet/publish ctx "ord.a" {:n 2})
+                              _    (jet/publish ctx "ord.a" {:n 3})
+                              _    (jet/publish ctx "ord.a" {:n 4})
+                              _    (jet/publish ctx "ord.a" {:n 5})
+                              oc   (jet/ordered-consumer ctx "ORD")
+                              msgs (jet/fetch oc {:batch 5 :expires-ms 2000})
+                              _    (jet/publish ctx "ord.a" {:n 6})
+                              m6   (jet/next oc {:expires-ms 2000})
+                              infos (jet/list-consumers ctx "ORD")]
+                        (is (= [{:n 1} {:n 2} {:n 3} {:n 4} {:n 5}] (mapv :data msgs))
+                            "fetch on the ordered handle replays every stored message, :data decoded, in publish order")
+                        (is (= [1 2 3 4 5] (mapv #(get-in % [:js :stream-seq]) msgs))
+                            "the replay is gap-free: consecutive stream sequences, nothing skipped or repeated")
+                        (is (= #{:subject :data :js} (set (keys (first msgs))))
+                            "ordered deliveries are the same pure-data shape as a named Consumer's")
+                        (is (= {:n 6} (:data m6)) "next on the handle continues from the tracked position")
+                        (is (= 6 (get-in m6 [:js :stream-seq])) "the continuation picks up the next stream sequence")
+                        (is (seq infos) "the ordered consumer exists server-side while in use")
+                        (is (every? #(false? (get-in % [:config :durable?])) infos)
+                            "it is ephemeral: no durable consumer is left behind on the Stream")
+                        (is (every? #(= :none (get-in % [:config :ack-policy])) infos)
+                            "it takes no acknowledgements: ack policy none"))))))))))
+
+;; CONTEXT "Ordered consumer" (ADR 0018), integration on the :4222 JetStream server:
+;; `consume` on the ordered handle is the same continuous pull verb a named Consumer
+;; gets — promise-return handler, refill knobs, and a drainable handle — delivering
+;; in stream order with no acks taken, the `:filter-subjects` opt narrowing the
+;; replay. Same on both legs; memory stream, cleans up.
+(deftest ordered-consume-delivers-in-order
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "ORDC" :subjects ["ordc.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "ORDC"
+             (fn []
+               (doseq [n [1 2 3 4 5]] (deref (jet/publish ctx "ordc.a" {:n n}) 5000 ::timeout))
+               (let [seen   (atom [])
+                     oc     (deref (jet/ordered-consumer ctx "ORDC" {:filter-subjects ["ordc.a"]}) 5000 ::timeout)
+                     handle (deref (jet/consume oc
+                                                (fn [m]
+                                                  (swap! seen conj m)
+                                                  (java.util.concurrent.CompletableFuture/completedFuture nil))
+                                                {:expires-ms 2000})
+                                   5000 ::timeout)]
+                 (is (not= ::timeout handle) "consume on the ordered handle resolves to a handle")
+                 (is (wait-for #(= 5 (count @seen)) 5000) "consume delivers every stored message, unprompted by acks")
+                 (is (= [{:n 1} {:n 2} {:n 3} {:n 4} {:n 5}] (mapv :data @seen))
+                     "deliveries arrive in stream order")
+                 (is (= [1 2 3 4 5] (mapv #(get-in % [:js :stream-seq]) @seen))
+                     "the continuous replay is gap-free")
+                 (is (true? (proto/-active? handle)) "the consume handle is active while consuming")
+                 (is (not= ::timeout (deref (nats/drain handle) 10000 ::timeout)) "drain settles once the consume winds down")
+                 (is (false? (proto/-active? handle)) "a drained handle is no longer active")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "ORDC" :subjects ["ordc.>"] :storage :memory})]
+                  (with-stream ctx "ORDC"
+                    (fn []
+                      (let [seen (atom [])]
+                        (p/let [_      (jet/publish ctx "ordc.a" {:n 1})
+                                _      (jet/publish ctx "ordc.a" {:n 2})
+                                _      (jet/publish ctx "ordc.a" {:n 3})
+                                _      (jet/publish ctx "ordc.a" {:n 4})
+                                _      (jet/publish ctx "ordc.a" {:n 5})
+                                oc     (jet/ordered-consumer ctx "ORDC" {:filter-subjects ["ordc.a"]})
+                                handle (jet/consume oc
+                                                    (fn [m]
+                                                      (swap! seen conj m)
+                                                      (p/resolved nil))
+                                                    {:expires-ms 2000})
+                                hit?   (wait-for #(= 5 (count @seen)) 5000)]
+                          (is hit? "consume delivers every stored message, unprompted by acks")
+                          (is (= [{:n 1} {:n 2} {:n 3} {:n 4} {:n 5}] (mapv :data @seen))
+                              "deliveries arrive in stream order")
+                          (is (= [1 2 3 4 5] (mapv #(get-in % [:js :stream-seq]) @seen))
+                              "the continuous replay is gap-free")
+                          (is (true? (proto/-active? handle)) "the consume handle is active while consuming")
+                          (p/let [_ (nats/drain handle)]
+                            (is (false? (proto/-active? handle)) "a drained handle is no longer active"))))))))))))

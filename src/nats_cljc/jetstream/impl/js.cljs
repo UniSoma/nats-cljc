@@ -448,6 +448,62 @@
     (reset! active? false)
     nil))
 
+(defn- next-msg
+  "Poll one message from a nats.js pull Consumer — the interface the named
+   (`consumers.get`) and ordered (`consumers.ordered`) consumers share, so the
+   named and ordered pull paths drive one body. next({expires}) resolves a JsMsg or
+   null on an empty consumer. This inlines the :expires-ms->:expires mapping that
+   fetch routes through ->fetch-options; a new pull option (e.g. :idle-heartbeat)
+   must be wired into both to keep next and fetch in step."
+  [^js c opts]
+  (-> (.next c (clj->js (cond-> {} (:expires-ms opts) (assoc :expires (:expires-ms opts)))))
+      (.then (fn [m] (when m (js-msg->raw m))))))
+
+(defn- start-consume
+  "Start a continuous consume on a nats.js pull Consumer (named or ordered, as
+   `next-msg`): consume() resolves the ConsumerMessages iterable the detached drive
+   loop then owns, wrapped in the JsConsumeHandle. The handle resolves only after
+   the loop is running, so no delivery can race it."
+  [^js c opts handler]
+  (-> (.consume c (->consume-options opts))
+      (.then (fn [cm]
+               (let [active? (atom true)]
+                 (drive-consume! cm handler active?)
+                 (->JsConsumeHandle cm active?))))))
+
+;; The Ordered consumer pull handle: nats.js' ordered pull Consumer (server-managed
+;; ephemeral, ack policy none, recreated on a sequence gap) plus the context codec,
+;; so the facade's decode precedence works on the handle exactly as on the context.
+(defrecord JsOrderedConsumer [consumer codec])
+
+(defn- ->ordered-config
+  "Build a nats.js OrderedConsumerOptions object from the portable closed ordered
+   opts (ADR 0020). Only the keys present are set, so an absent key takes the
+   client default; the deliver-policy keyword routes through the shared wire table.
+   `clj->js` produces the string-keyed object nats.js reads, surviving advanced
+   compilation."
+  [{:keys [filter-subjects deliver-policy]}]
+  (clj->js
+   (cond-> {}
+     filter-subjects (assoc :filter_subjects filter-subjects)
+     deliver-policy  (assoc :deliver_policy (consumer/deliver-policy->wire deliver-policy)))))
+
+(extend-type JsOrderedConsumer
+  proto/OrderedPull
+  ;; The named-pull bodies verbatim, minus the consumers.get resolution — the
+  ;; ordered Consumer is already in hand, and nats.js recreates the underlying
+  ;; ephemeral across these calls when a sequence gap appears.
+  (-oc-next [oc opts]
+    (-> (next-msg (:consumer oc) opts)
+        (.catch (fn [e] (throw (api-error e))))))
+  (-oc-fetch [oc opts]
+    (-> (.fetch ^js (:consumer oc) (->fetch-options opts))
+        (.then drain-fetch)
+        (.catch (fn [e] (throw (api-error e))))))
+  (-oc-consume [oc opts handler]
+    (-> (start-consume (:consumer oc) opts handler)
+        (.catch (fn [e] (throw (api-error e)))))))
+
 (extend-type JsJetStreamContext
   proto/JetStreamData
   (-js-publish [ctx subject headers bytes opts]
@@ -462,14 +518,10 @@
           (.then ->pub-ack)
           (.catch (fn [e] (throw (publish-error e)))))))
   (-js-next [ctx stream consumer opts]
-    ;; consumers.get resolves the pull Consumer (a missing one rejects → normalized via
-    ;; api-error); next({expires}) resolves a JsMsg or null on an empty consumer. This
-    ;; inlines the :expires-ms->:expires mapping that fetch routes through ->fetch-options;
-    ;; a new pull option (e.g. :idle-heartbeat) must be wired into both to keep next and
-    ;; fetch in step.
+    ;; consumers.get resolves the pull Consumer (a missing one rejects → normalized
+    ;; via api-error); the poll itself is the shared `next-msg`.
     (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
-        (.then (fn [c] (.next c (clj->js (cond-> {} (:expires-ms opts) (assoc :expires (:expires-ms opts)))))))
-        (.then (fn [m] (when m (js-msg->raw m))))
+        (.then (fn [c] (next-msg c opts)))
         (.catch (fn [e] (throw (api-error e))))))
   (-js-fetch [ctx stream consumer opts]
     (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
@@ -478,13 +530,15 @@
         (.catch (fn [e] (throw (api-error e))))))
   (-js-consume [ctx stream consumer opts handler]
     ;; consumers.get resolves the pull Consumer (a missing one rejects ->
-    ;; :consumer-not-found via api-error, like next/fetch); consume() resolves the
-    ;; ConsumerMessages iterable the detached drive loop then owns. The handle
-    ;; resolves only after the loop is running, so no delivery can race it.
+    ;; :consumer-not-found via api-error, like next/fetch); the consume start is
+    ;; the shared `start-consume`.
     (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
-        (.then (fn [^js c] (.consume c (->consume-options opts))))
-        (.then (fn [cm]
-                 (let [active? (atom true)]
-                   (drive-consume! cm handler active?)
-                   (->JsConsumeHandle cm active?))))
+        (.then (fn [c] (start-consume c opts handler)))
+        (.catch (fn [e] (throw (api-error e))))))
+  (-js-ordered-consumer [ctx stream opts]
+    ;; consumers.ordered round-trips stream info before building the ephemeral's
+    ;; config (a missing stream rejects → :stream-not-found via api-error, the
+    ;; verify the JVM leg's getStreamContext matches).
+    (-> (.ordered ^js (.-consumers ^js (:js ctx)) stream (->ordered-config opts))
+        (.then (fn [c] (->JsOrderedConsumer c (:codec ctx))))
         (.catch (fn [e] (throw (api-error e)))))))

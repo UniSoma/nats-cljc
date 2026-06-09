@@ -40,6 +40,28 @@
    keyword, used to read a consumer's active deliver policy back into the normalized config map."
   (set/map-invert deliver-policy->wire))
 
+(def ordered-config-keys
+  "The CLOSED set of recognized portable Ordered-consumer opts keys (ADR 0020). An
+   Ordered consumer is server-managed — name, ack policy (none), and recreation are
+   the client library's business — so the caller tunes only what it replays:
+   `:filter-subjects` (a vector of subject strings) and `:deliver-policy` (as in
+   `config-keys`). A key outside the set is caller misuse — `:unknown-config-key`,
+   raised pre-flight — rather than silently dropped."
+  #{:filter-subjects :deliver-policy})
+
+(defn validate-ordered-config
+  "Guard a portable Ordered-consumer `opts` map pre-flight (ADR 0015), before any
+   native call: an unrecognized key (the map is closed) throws `:type
+   :unknown-config-key` carrying the offending `:keys`. Every key is optional —
+   there is no `:name` (the server/client manage the ephemeral's identity).
+   Returns `opts` so it can sit in a promise chain stage."
+  [opts]
+  (let [unknown (remove ordered-config-keys (keys opts))]
+    (when (seq unknown)
+      (throw (ex-info "Unknown ordered consumer config key(s)"
+                      {:type :unknown-config-key :keys (vec unknown)}))))
+  opts)
+
 (defn validate-name
   "Guard a Consumer `name` pre-flight, throwing a `:type :invalid-name` ex-info on
    caller misuse (ADR 0015); returns `name` so it can sit in a promise chain stage.
