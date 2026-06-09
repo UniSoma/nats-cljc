@@ -8,7 +8,8 @@
            [io.nats.client.impl Headers]
            [java.nio.charset StandardCharsets]
            [java.time Duration]
-           [java.util.concurrent CompletableFuture CompletionStage CompletionException ExecutionException CancellationException TimeoutException]
+           [java.util.concurrent CompletableFuture CompletionStage CompletionException ExecutionException CancellationException TimeoutException Executors ExecutorService ThreadFactory]
+           [java.util.concurrent.atomic AtomicLong]
            [java.util.function Supplier Function BiFunction BiConsumer]))
 
 ;; Upper bound for the blocking flush/drain one-shots; a healthy connection
@@ -37,10 +38,11 @@
       (reduce (fn [m ^String k] (assoc m k (vec (.get h k))))
               {} (.keySet h)))))
 
-(defn- msg->raw
+(defn msg->raw
   "Lift a jnats Message into the raw map the facade decodes (ADR 0005): subject,
    wire bytes, the reply-to subject (nil when absent), and the headers map (nil
-   when absent)."
+   when absent). Public (within this `^:no-doc` ns) so the JetStream impl's
+   `js-msg->raw` reuses it for the pull lift rather than rebuilding it (ADR 0019)."
   [^Message msg]
   {:subject (.getSubject msg)
    :bytes   (.getData msg)
@@ -151,7 +153,24 @@
       (catch IllegalStateException _ nil))
     nil))
 
-(defrecord JvmConnection [^Connection client codec on-status registry]
+(defn- new-io-executor
+  "A per-connection cached thread pool for the blocking JetStream pulls (ADR 0018):
+   next/fetch park a thread for the whole long-poll expiry window (up to ~30s), so
+   running them on the shared ForkJoinPool.commonPool a bare `supplyAsync` uses would
+   let a handful of concurrent long-polls saturate it and stall unrelated off-thread
+   JetStream ops. Cached, not fixed, so concurrent polls grow the pool on demand
+   instead of queueing behind a bound; daemon threads so the pool never blocks JVM
+   shutdown. The connection owns it and shuts it down on close/drain — JetStream-typed
+   nowhere, so a core-only connection just holds an idle (thread-free) pool."
+  ^ExecutorService []
+  (let [n (AtomicLong. 0)]
+    (Executors/newCachedThreadPool
+     (reify ThreadFactory
+       (newThread [_ r]
+         (doto (Thread. ^Runnable r (str "nats-cljc-io-" (.getAndIncrement n)))
+           (.setDaemon true)))))))
+
+(defrecord JvmConnection [^Connection client codec on-status registry ^ExecutorService io-executor]
   proto/Conn
   (-publish [_ subject headers bytes]
     ;; The headers map selects jnats' publish(subject, Headers, body) overload; a
@@ -224,10 +243,12 @@
   (-close [_]
     ;; jnats close is blocking and void; run it off-thread so the facade returns
     ;; a settling promise (ADR 0002). The CLOSED event reaches :on-status via the
-    ;; ConnectionListener as the connection tears down.
+    ;; ConnectionListener as the connection tears down. Graceful-shutdown the IO pool
+    ;; once closed: in-flight pulls drain, new submissions are refused (a pull racing
+    ;; the close surfaces :connection-closed — off-thread maps the rejection).
     (CompletableFuture/runAsync
      (reify Runnable
-       (run [_] (.close client)))))
+       (run [_] (.close client) (.shutdown io-executor)))))
   (-request [_ subject bytes timeout-ms]
     ;; jnats' requestWithTimeout returns a CompletableFuture<Message> over its
     ;; muxed reply-inbox. `.handle` lifts a successful Message into the raw map the
@@ -269,8 +290,12 @@
   proto/Drainable
   (-drain [_]
     ;; jnats drain already returns a CompletableFuture<Boolean>; draining ends the
-    ;; connection's subscriptions and closes it (CLOSED reaches :on-status).
-    (.drain client op-timeout)))
+    ;; connection's subscriptions and closes it (CLOSED reaches :on-status). Shut the
+    ;; IO pool down once drain settles (whenComplete passes the Boolean through), the
+    ;; drain analog of -close's shutdown.
+    (.whenComplete ^CompletableFuture (.drain client op-timeout)
+                   (reify BiConsumer
+                     (accept [_ _ _] (.shutdown io-executor))))))
 
 ;; Status spine (ADR 0006/0009): map jnats' native lifecycle events onto the
 ;; canonical status :type set. Unmapped events (e.g. RESUBSCRIBED) are dropped;
@@ -418,7 +443,7 @@
                                 (with-auth auth)
                                 (.build))]
           (try
-            (->JvmConnection (Nats/connect opts) codec on-status registry)
+            (->JvmConnection (Nats/connect opts) codec on-status registry (new-io-executor))
             (catch Exception e
               (throw (ex-info "Failed to connect to NATS"
                               {:type :connect-failed :servers servers}

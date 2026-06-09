@@ -157,4 +157,21 @@
      native publish options (`:msg-id`/`:expect` become the sanctioned reserved
      headers). The promise rejects with an operational `:type :wrong-last-sequence`
      when an `:expect` assertion fails, and the catch-all `:jetstream-api-error`
-     for any other server rejection (ADR 0020)."))
+     for any other server rejection (ADR 0020).")
+  (-js-next [ctx stream consumer opts]
+    "Poll a single message from the `consumer` on Stream `stream` through `ctx`,
+     returning a native promise of ONE raw JetStream message map
+     `{:subject :bytes :headers :js {...}}` (`:headers` is nil when the message carries
+     none) — the per-leg `js-msg->raw` lift, which reads native metadata, captures the
+     ack-subject string, then discards the native object (ADR 0019) — or nil when no
+     message arrives within the poll's `:expires-ms` wait (an empty consumer). `:js` carries
+     `{:stream :consumer :stream-seq :delivery-seq :delivered :pending :redelivered
+     :timestamp :domain :ack-subject}`, `:timestamp` ISO-8601 and `:redelivered` =
+     (delivered > 1). The facade decodes `:bytes`, and adds trimmed `:headers` only when
+     present, dropping it when absent (ADR 0005).")
+  (-js-fetch [ctx stream consumer opts]
+    "Fetch a bounded batch from the `consumer` on Stream `stream` through `ctx`,
+     returning a native promise of a VECTOR of up to `:batch` raw JetStream message
+     maps (the same `js-msg->raw` lift as `-js-next`), in stream order. The batch
+     settles when `:batch` messages have arrived or the `:expires-ms` window elapses,
+     so a consumer with fewer than `:batch` pending yields a shorter vector (ADR 0018)."))

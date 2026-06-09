@@ -15,6 +15,7 @@
             [nats-cljc.jetstream.error :as jet-err]
             [nats-cljc.jetstream.stream :as stream]
             [nats-cljc.jetstream.consumer :as consumer]
+            [nats-cljc.jetstream.pull :as pull]
             ["@nats-io/jetstream" :as jetstream]))
 
 ;; The JetStream context (ADR 0017): one handle holding both nats.js' data-plane
@@ -271,6 +272,77 @@
       (-> (drain-lister (.list consumers stream) [])
           with-api-error))))
 
+(defn- ->canonical-timestamp
+  "Normalize JsMsg's ISO-8601 :timestamp to the canonical form by re-emitting through
+   `Date#toISOString` — UTC, exactly three fractional digits, truncated to millis. The
+   CLJS leg owns the canonical format rather than inheriting whatever nats.js happens to
+   format, so it is byte-identical to the JVM leg's `->canonical-timestamp`."
+  [s]
+  (.toISOString (js/Date. s)))
+
+(defn js-msg->raw
+  "Lift a delivered JsMsg into the pure-data pull map (ADR 0019): the core `msg->raw`
+   carries subject/bytes/headers, the reply-to (the JsMsg's $JS.ACK ack subject) moves
+   UNDER `:js` as `:ack-subject` and is dropped from the top level so a mistaken
+   `(reply conn js-msg)` can't publish to it, and the native DeliveryInfo is read into
+   the rest of `:js`. `:redelivered` is derived (delivered > 1) so both legs agree
+   without leaning on nats.js' separate flag; `:timestamp` is normalized to the canonical
+   UTC-millis form (`->canonical-timestamp`) so it is byte-identical to the JVM leg;
+   `:domain` coerces an absent (empty-string) domain to nil. The native object is then
+   discarded — everything downstream is pure data, the lift's whole point."
+  [^js m]
+  (let [info      ^js (.-info m)
+        delivered (.-deliveryCount info)
+        domain    (.-domain info)]
+    (-> (core/msg->raw m)
+        (dissoc :reply)
+        (assoc :js {:stream       (.-stream info)
+                    :consumer     (.-consumer info)
+                    :stream-seq   (.-streamSequence info)
+                    :delivery-seq (.-deliverySequence info)
+                    :delivered    delivered
+                    :pending      (.-pending info)
+                    :redelivered  (> delivered 1)
+                    :timestamp    (->canonical-timestamp (.-timestamp m))
+                    :domain       (when (seq domain) domain)
+                    :ack-subject  (.-reply m)}))))
+
+(defn drain-fetch
+  "Drain a nats.js ConsumerMessages — the async-iterable `fetch` resolves to — into a
+   vector of lifted pull maps, lifting each JsMsg with `js-msg->raw` as it arrives. The
+   iterable completes (a `done` result) once the bounded batch is exhausted (:max_messages
+   reached or :expires elapsed), which terminates the loop — the CLJS analog of the JVM
+   FetchConsumer.nextMessage null. On the throw path — a lift raising mid-batch — the
+   ConsumerMessages is closed before the rejection propagates, releasing the pull
+   subscription immediately rather than leaking it until the expires/heartbeat window;
+   the natural-done path needs no close, nats.js tears the iterable down on completion.
+   Public (within this `^:no-doc` ns) so the suite can drive its lifecycle directly."
+  [^js cm]
+  (let [it (.call (unchecked-get cm (.-asyncIterator js/Symbol)) cm)]
+    (letfn [(step [acc]
+              (.then (.next it)
+                     (fn [^js r]
+                       (if (.-done r)
+                         acc
+                         (step (conj acc (js-msg->raw (.-value r))))))))]
+      (-> (step [])
+          (.catch (fn [e]
+                    ;; release the pull subscription before re-rejecting — the CLJS
+                    ;; analog of the JVM fetch's `(finally (.close fc))`. close is
+                    ;; idempotent, so a rejection after nats.js already tore the
+                    ;; iterable down is harmless.
+                    (.close ^js cm)
+                    (throw e)))))))
+
+(defn- ->fetch-options
+  "Build a nats.js FetchOptions object from the portable pull `opts` (ADR 0018): `:batch`
+   is `max_messages` (defaulting to `pull/default-batch`, which matches nats.js' own default,
+   so the legs agree when a caller omits it) and `:expires-ms` the `expires` window. `clj->js`
+   produces the string-keyed object nats.js reads, surviving advanced compilation."
+  [{:keys [batch expires-ms]}]
+  (clj->js (cond-> {:max_messages (or batch pull/default-batch)}
+             expires-ms (assoc :expires expires-ms))))
+
 (extend-type JsJetStreamContext
   proto/JetStreamData
   (-js-publish [ctx subject headers bytes opts]
@@ -283,4 +355,19 @@
       (when headers (set! (.-headers o) (core/->headers headers)))
       (-> (.publish ^js (:js ctx) subject bytes o)
           (.then ->pub-ack)
-          (.catch (fn [e] (throw (publish-error e))))))))
+          (.catch (fn [e] (throw (publish-error e)))))))
+  (-js-next [ctx stream consumer opts]
+    ;; consumers.get resolves the pull Consumer (a missing one rejects → normalized via
+    ;; api-error); next({expires}) resolves a JsMsg or null on an empty consumer. This
+    ;; inlines the :expires-ms->:expires mapping that fetch routes through ->fetch-options;
+    ;; a new pull option (e.g. :idle-heartbeat) must be wired into both to keep next and
+    ;; fetch in step.
+    (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
+        (.then (fn [c] (.next c (clj->js (cond-> {} (:expires-ms opts) (assoc :expires (:expires-ms opts)))))))
+        (.then (fn [m] (when m (js-msg->raw m))))
+        (.catch (fn [e] (throw (api-error e))))))
+  (-js-fetch [ctx stream consumer opts]
+    (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
+        (.then (fn [c] (.fetch c (->fetch-options opts))))
+        (.then drain-fetch)
+        (.catch (fn [e] (throw (api-error e)))))))

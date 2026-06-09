@@ -13,6 +13,7 @@
             [nats-cljc.jetstream.stream :as stream]
             [nats-cljc.jetstream.consumer :as consumer]
             [nats-cljc.jetstream.pub :as pub]
+            [nats-cljc.jetstream.pull :as pull]
             #?(:clj  [nats-cljc.jetstream.impl.jvm :as jet-jvm]
                :cljs [nats-cljc.jetstream.impl.js :as jet-js])
             #?(:cljs [promesa.core :as p]))
@@ -122,6 +123,25 @@
                            (accept [_ _ e] (deliver a e))))
        (deref a 5000 ::timeout))))
 
+;; Stream teardown guard: run `f`, then ALWAYS delete `stream` — even when an
+;; assertion derefs to ::timeout or a promise rejects mid-body — so a memory
+;; stream can't leak into a re-run. JVM deletes in a `finally`; CLJS awaits the
+;; delete through `p/handle` (NOT `p/finally`, which ignores the teardown promise)
+;; and re-raises the body's error after cleanup. Teardown is best-effort: a delete
+;; failure is swallowed so it can't mask the body's outcome. Create the stream
+;; BEFORE the guard so a failed create never deletes a stream that isn't there.
+#?(:clj
+   (defn- with-stream [ctx stream f]
+     (try (f)
+          (finally (try (deref (jet/delete-stream ctx stream) 5000 ::timeout)
+                        (catch Throwable _ nil)))))
+   :cljs
+   (defn- with-stream [ctx stream f]
+     (p/handle (p/do (f))
+               (fn [v e]
+                 (p/handle (jet/delete-stream ctx stream)
+                           (fn [_ _] (if e (throw e) v)))))))
+
 ;; AC1 (ADR 0017): (jetstream conn) resolves to a single JetStream context against
 ;; a JetStream-enabled server, identically on both legs.
 (deftest jetstream-resolves-to-a-context
@@ -177,6 +197,12 @@
 ;; it — the cross-leg point is that `:created` is a normalized timestamp string,
 ;; never a native ZonedDateTime/Date (ADR 0020).
 (def ^:private iso-re #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.*")
+
+;; The strict canonical `:timestamp` shape both legs emit (ADR 0019 pure-data parity):
+;; UTC, exactly three fractional digits, ending in `Z` — e.g. 2026-06-09T01:08:17.279Z.
+;; Tighter than `iso-re` on purpose: it rejects the JVM leg's old variable-digit,
+;; source-offset formatting, so a divergence there can't ship green over the live path.
+(def ^:private canonical-ts-re #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
 
 ;; Capture the validation `:type` a synchronous deep-module guard throws, portably.
 (defn- thrown-type [thunk]
@@ -235,6 +261,20 @@
   (is (= "OK" (consumer/validate-name "OK"))
       "a well-formed consumer name passes validation unchanged"))
 
+;; Deep-module unit (ADR 0019), no server: lifting a delivered message's
+;; metadata timestamp is a pure normalization, so feeding each leg's
+;; `->canonical-timestamp` the SAME instant — carried at sub-millisecond precision, which
+;; must truncate (`.279999999` → `.279`, never round to `.280`) — must yield one
+;; byte-identical canonical string. This is the cross-leg parity check the live
+;; integration path can't make (the server picks the instant); it locks the format
+;; against the JVM leg's old ISO_OFFSET_DATE_TIME (variable digits, source offset).
+(deftest deep-module-canonical-timestamp
+  (is (= "2026-06-09T01:08:17.279Z"
+         #?(:clj  (#'jet-jvm/->canonical-timestamp
+                   (java.time.ZonedDateTime/parse "2026-06-09T01:08:17.279999999Z"))
+            :cljs (#'jet-js/->canonical-timestamp "2026-06-09T01:08:17.279999999Z")))
+      "a delivered :timestamp normalizes to UTC, exactly three fractional digits, truncated to millis"))
+
 ;; AC4, deep-module unit (ADR 0015/0020), no server: the reserved-header guard is the
 ;; portable pre-flight that keeps the Nats-* namespace sanctioned-only — :msg-id and
 ;; :expect are the way to set those, so a reserved key set directly in user :headers
@@ -257,6 +297,28 @@
       "nil headers pass through — there are none to guard")
   (is (= :invalid-header (thrown-type #(pub/validate-headers ["Nats-Msg-Id" "x"])))
       "a non-map :headers (e.g. a vector) is :invalid-header, not a raw ClassCastException"))
+
+;; Deep-module unit (ADR 0015), no server: the pull `:expires-ms` guard is the portable
+;; pre-flight that keeps a sub-floor or non-integer poll window from reaching either leg
+;; as an un-normalized native throw (jnats' IllegalArgumentException, nats.js'
+;; InvalidArgumentError — both enforce a 1000ms floor). A below-floor value is caller
+;; misuse, raised as :invalid-expires before any native call; an omitted or well-formed
+;; window passes through unchanged.
+(deftest deep-module-expires-guard
+  (is (= :invalid-expires (thrown-type #(pull/validate-expires {:expires-ms 500})))
+      "a sub-1000ms :expires-ms is :invalid-expires")
+  (is (= :invalid-expires (thrown-type #(pull/validate-expires {:expires-ms 0})))
+      "a zero :expires-ms is below the floor — :invalid-expires, not a native default")
+  (is (= :invalid-expires (thrown-type #(pull/validate-expires {:expires-ms "2000"})))
+      "a non-integer :expires-ms is :invalid-expires, not a raw native type error")
+  (is (= 500 (:expires-ms (ex-data (try (pull/validate-expires {:expires-ms 500})
+                                        (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))))
+      ":invalid-expires carries the offending :expires-ms")
+  (let [ok {:expires-ms 1000 :batch 3}]
+    (is (= ok (pull/validate-expires ok))
+        "an at-floor :expires-ms passes validation unchanged"))
+  (is (= {:batch 3} (pull/validate-expires {:batch 3}))
+      "an omitted :expires-ms passes through to the native default"))
 
 ;; AC1/AC3/AC4, deep-module unit (ADR 0020), no server: building the native publish
 ;; options is a pure local construction, so the portable opts -> native round-trip
@@ -402,6 +464,33 @@
                 (p/then (fn [_] (is false "expected an :invalid-name rejection")))
                 (p/catch (fn [e] (is (= :invalid-name (:type (ex-data e)))
                                      "a malformed stream name rejects the create-consumer promise pre-flight")))
+                (p/finally (fn [_ _] (done)))))))
+
+;; (ADR 0015), no server: a sub-floor `:expires-ms` surfaces through fetch's
+;; and next's OWN channel — the returned promise REJECTS, it does not throw synchronously
+;; — pre-flight, before any native call, and as the SAME typed :invalid-expires on both
+;; legs (where the raw clients diverge: a jnats IllegalArgumentException vs a nats.js
+;; InvalidArgumentError). A nil ctx proves the pre-flight: validation rejects first, so the
+;; native -js-fetch/-js-next never dereferences it.
+(deftest pull-rejects-invalid-expires-on-its-promise
+  #?(:clj
+     (do
+       (is (= :invalid-expires
+              (:type (ex-data (reject-reason (jet/fetch nil "PULL" "PULL_C" {:expires-ms 500})))))
+           "a sub-floor :expires-ms rejects the fetch promise pre-flight")
+       (is (= :invalid-expires
+              (:type (ex-data (reject-reason (jet/next nil "PULL" "PULL_C" {:expires-ms 500})))))
+           "a sub-floor :expires-ms rejects the next promise pre-flight"))
+     :cljs
+     (async done
+            (-> (jet/fetch nil "PULL" "PULL_C" {:expires-ms 500})
+                (p/then (fn [_] (is false "expected an :invalid-expires rejection")))
+                (p/catch (fn [e] (is (= :invalid-expires (:type (ex-data e)))
+                                     "a sub-floor :expires-ms rejects the fetch promise pre-flight")))
+                (p/then (fn [_] (jet/next nil "PULL" "PULL_C" {:expires-ms 500})))
+                (p/then (fn [_] (is false "expected an :invalid-expires rejection")))
+                (p/catch (fn [e] (is (= :invalid-expires (:type (ex-data e)))
+                                     "a sub-floor :expires-ms rejects the next promise pre-flight")))
                 (p/finally (fn [_ _] (done)))))))
 
 ;; AC4 (ADR 0015), no server: the reserved-header guard surfaces through publish's OWN
@@ -842,3 +931,261 @@
                       (is (= ["mid-1"] (get (:headers msg) "Nats-Msg-Id"))
                           ":msg-id is delivered as the sanctioned reserved Nats-Msg-Id header")
                       (jet/delete-stream ctx "CODEC")))))))))
+
+;; A durable pull consumer over a single subject, explicit-ack so messages stay pending
+;; until acked — the deterministic delivery set the pull tracer reads. :deliver-policy
+;; defaults to :all (every stored message), filtered to the one publish subject.
+(def ^:private a-pull-consumer
+  {:name "PULL_C" :durable? true :ack-policy :explicit :filter-subjects ["pull.a"]})
+
+;; AC1 + AC3 (ADR 0018/0019), integration on the :4222 JetStream server: populate a
+;; stream with three acked publishes, then `fetch` up to :batch from a durable consumer.
+;; The promise resolves to a vector of up-to-N PURE-DATA messages {:subject :data :js}:
+;; :data is decoded with the context codec in stream order, and there is NO native
+;; object on the map. The :js metadata is lifted from each leg's native accessor —
+;; stream/consumer, the stream + delivery sequences, the delivery count (⇒ :redelivered
+;; false on a first delivery), pending, an ISO-8601 :timestamp, nil :domain, and the
+;; captured $JS.ACK ack-subject. Same on both legs; memory stream, cleans up.
+(deftest pull-fetch-delivers-pure-data
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "PULL" :subjects ["pull.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "PULL"
+             (fn []
+               (deref (jet/create-consumer ctx "PULL" a-pull-consumer) 5000 ::timeout)
+               (doseq [n [1 2 3]] (deref (jet/publish ctx "pull.a" {:n n}) 5000 ::timeout))
+               (let [msgs (deref (jet/fetch ctx "PULL" "PULL_C" {:batch 3 :expires-ms 2000}) 5000 ::timeout)
+                     m1   (first msgs)
+                     js   (:js m1)]
+                 (is (= 3 (count msgs)) "fetch resolves a vector of up to :batch messages")
+                 (is (= [{:n 1} {:n 2} {:n 3}] (map :data msgs)) "each :data is decoded with the context codec, in stream order")
+                 (is (= ["pull.a" "pull.a" "pull.a"] (map :subject msgs)) "each message carries its publish subject")
+                 (is (= #{:subject :data :js} (set (keys m1))) "a delivered message is pure data (no native object, no :headers when none set)")
+                 (is (= "PULL" (:stream js)) ":js carries the source stream")
+                 (is (= "PULL_C" (:consumer js)) ":js carries the consumer")
+                 (is (= 1 (:stream-seq js)) ":js stream-seq is the message's stream sequence")
+                 (is (= 1 (:delivery-seq js)) ":js delivery-seq is the per-consumer delivery sequence")
+                 (is (= 1 (:delivered js)) "a first delivery has delivered count 1")
+                 (is (false? (:redelivered js)) "delivered once ⇒ not redelivered")
+                 (is (= 2 (:pending js)) "two messages remain pending behind the first")
+                 (is (re-matches canonical-ts-re (:timestamp js)) ":js timestamp is canonical UTC millis (e.g. 2026-06-09T01:08:17.279Z)")
+                 (is (nil? (:domain js)) "no JetStream domain configured ⇒ :js :domain nil")
+                 (is (boolean (re-find #"^\$JS\.ACK\." (:ack-subject js))) ":js ack-subject is the captured $JS.ACK reply subject")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "PULL" :subjects ["pull.>"] :storage :memory})]
+                  (with-stream ctx "PULL"
+                    (fn []
+                      (p/let [_   (jet/create-consumer ctx "PULL" a-pull-consumer)
+                              _   (jet/publish ctx "pull.a" {:n 1})
+                              _   (jet/publish ctx "pull.a" {:n 2})
+                              _   (jet/publish ctx "pull.a" {:n 3})
+                              msgs (jet/fetch ctx "PULL" "PULL_C" {:batch 3 :expires-ms 2000})]
+                        (let [m1 (first msgs)
+                              js (:js m1)]
+                          (is (= 3 (count msgs)) "fetch resolves a vector of up to :batch messages")
+                          (is (= [{:n 1} {:n 2} {:n 3}] (map :data msgs)) "each :data is decoded with the context codec, in stream order")
+                          (is (= ["pull.a" "pull.a" "pull.a"] (map :subject msgs)) "each message carries its publish subject")
+                          (is (= #{:subject :data :js} (set (keys m1))) "a delivered message is pure data (no native object, no :headers when none set)")
+                          (is (= "PULL" (:stream js)) ":js carries the source stream")
+                          (is (= "PULL_C" (:consumer js)) ":js carries the consumer")
+                          (is (= 1 (:stream-seq js)) ":js stream-seq is the message's stream sequence")
+                          (is (= 1 (:delivery-seq js)) ":js delivery-seq is the per-consumer delivery sequence")
+                          (is (= 1 (:delivered js)) "a first delivery has delivered count 1")
+                          (is (false? (:redelivered js)) "delivered once ⇒ not redelivered")
+                          (is (= 2 (:pending js)) "two messages remain pending behind the first")
+                          (is (re-matches canonical-ts-re (:timestamp js)) ":js timestamp is canonical UTC millis (e.g. 2026-06-09T01:08:17.279Z)")
+                          (is (nil? (:domain js)) "no JetStream domain configured ⇒ :js :domain nil")
+                          (is (boolean (re-find #"^\$JS\.ACK\." (:ack-subject js))) ":js ack-subject is the captured $JS.ACK reply subject")))))))))))
+
+;; AC2 (ADR 0018), integration on the :4222 JetStream server: `next` polls one message.
+;; With a single message stored, the first `next` resolves that PURE-DATA message (its
+;; :data decoded, :js metadata lifted); a second `next` against the now-drained consumer
+;; resolves NIL once its `:expires-ms` window elapses with nothing in flight (the first
+;; message is unacked but within ack-wait, so it is not yet redelivered). Same on both
+;; legs; memory stream, cleans up.
+(deftest pull-next-delivers-one-or-nil
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "PULLN" :subjects ["pulln.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "PULLN"
+             (fn []
+               (deref (jet/create-consumer ctx "PULLN" {:name "PULLN_C" :durable? true :ack-policy :explicit :filter-subjects ["pulln.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "pulln.a" {:n 1}) 5000 ::timeout)
+               (let [m (deref (jet/next ctx "PULLN" "PULLN_C" {:expires-ms 2000}) 5000 ::timeout)]
+                 (is (= {:n 1} (:data m)) "next resolves the stored message, :data decoded")
+                 (is (= "pulln.a" (:subject m)) "next's message carries its publish subject")
+                 (is (= 1 (get-in m [:js :stream-seq])) "next's message carries its :js stream-seq")
+                 (let [empty? (deref (jet/next ctx "PULLN" "PULLN_C" {:expires-ms 1000}) 5000 ::timeout)]
+                   (is (nil? empty?) "next against a drained consumer resolves nil"))))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "PULLN" :subjects ["pulln.>"] :storage :memory})]
+                  (with-stream ctx "PULLN"
+                    (fn []
+                      (p/let [_   (jet/create-consumer ctx "PULLN" {:name "PULLN_C" :durable? true :ack-policy :explicit :filter-subjects ["pulln.a"]})
+                              _   (jet/publish ctx "pulln.a" {:n 1})
+                              m   (jet/next ctx "PULLN" "PULLN_C" {:expires-ms 2000})
+                              empty? (jet/next ctx "PULLN" "PULLN_C" {:expires-ms 1000})]
+                        (is (= {:n 1} (:data m)) "next resolves the stored message, :data decoded")
+                        (is (= "pulln.a" (:subject m)) "next's message carries its publish subject")
+                        (is (= 1 (get-in m [:js :stream-seq])) "next's message carries its :js stream-seq")
+                        (is (nil? empty?) "next against a drained consumer resolves nil"))))))))))
+
+;; ADR 0019, integration on the :4222 JetStream server: the :redelivered (delivered > 1)
+;; true branch. A durable consumer with a short `:ack-wait-ms` polls one message and leaves
+;; it UNACKED — delivered 1, not redelivered. Once ack-wait elapses the server requeues it,
+;; so a second `next` (its window spanning that ack-wait) resolves the SAME message with
+;; delivered 2 and :redelivered true, exercising the branch both legs derive from the
+;; delivery count. Memory stream, cleans up.
+(deftest pull-redelivers-unacked-message
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "REDELIV" :subjects ["rd.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "REDELIV"
+             (fn []
+               (deref (jet/create-consumer ctx "REDELIV" {:name "RD_C" :durable? true :ack-policy :explicit :ack-wait-ms 1000 :filter-subjects ["rd.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "rd.a" {:n 1}) 5000 ::timeout)
+               (let [m1 (deref (jet/next ctx "REDELIV" "RD_C" {:expires-ms 2000}) 5000 ::timeout)]
+                 (is (= 1 (get-in m1 [:js :delivered])) "the first delivery has delivered count 1")
+                 (is (false? (get-in m1 [:js :redelivered])) "delivered once ⇒ not redelivered"))
+               ;; m1 is left unacked: after :ack-wait-ms the server redelivers, so this next —
+               ;; waiting past that window — catches the same message on its second delivery.
+               (let [m2 (deref (jet/next ctx "REDELIV" "RD_C" {:expires-ms 5000}) 8000 ::timeout)]
+                 (is (= {:n 1} (:data m2)) "the redelivered message is the same one, :data decoded")
+                 (is (= 2 (get-in m2 [:js :delivered])) "a redelivery has delivered count 2")
+                 (is (true? (get-in m2 [:js :redelivered])) "delivered more than once ⇒ redelivered true")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "REDELIV" :subjects ["rd.>"] :storage :memory})]
+                  (with-stream ctx "REDELIV"
+                    (fn []
+                      (p/let [_   (jet/create-consumer ctx "REDELIV" {:name "RD_C" :durable? true :ack-policy :explicit :ack-wait-ms 1000 :filter-subjects ["rd.a"]})
+                              _   (jet/publish ctx "rd.a" {:n 1})
+                              m1  (jet/next ctx "REDELIV" "RD_C" {:expires-ms 2000})
+                              m2  (jet/next ctx "REDELIV" "RD_C" {:expires-ms 5000})]
+                        (is (= 1 (get-in m1 [:js :delivered])) "the first delivery has delivered count 1")
+                        (is (false? (get-in m1 [:js :redelivered])) "delivered once ⇒ not redelivered")
+                        (is (= {:n 1} (:data m2)) "the redelivered message is the same one, :data decoded")
+                        (is (= 2 (get-in m2 [:js :delivered])) "a redelivery has delivered count 2")
+                        (is (true? (get-in m2 [:js :redelivered])) "delivered more than once ⇒ redelivered true"))))))))))
+
+;; ADR 0018, integration on the :4222 JetStream server: with `:expires-ms` omitted, both
+;; pull verbs fall through to each leg's 30000ms native default (jnats FetchConsumeOptions
+;; / nats.js fetch — verified equal across the legs). With the batch already satisfiable
+;; neither blocks that window: `fetch` settles as soon as :batch is filled and `next` as
+;; soon as a message is in flight, so each resolves inside the 5s deref — far under the 30s
+;; default, proving the omitted path delivers without waiting the full window. A separate
+;; durable consumer feeds each verb from the stream start. Memory stream, cleans up.
+(deftest pull-omitted-expires-delivers-without-blocking
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "PULLO" :subjects ["pullo.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "PULLO"
+             (fn []
+               (deref (jet/create-consumer ctx "PULLO" {:name "PULLO_F" :durable? true :ack-policy :explicit :filter-subjects ["pullo.a"]}) 5000 ::timeout)
+               (deref (jet/create-consumer ctx "PULLO" {:name "PULLO_N" :durable? true :ack-policy :explicit :filter-subjects ["pullo.a"]}) 5000 ::timeout)
+               (doseq [n [1 2 3]] (deref (jet/publish ctx "pullo.a" {:n n}) 5000 ::timeout))
+               (let [msgs (deref (jet/fetch ctx "PULLO" "PULLO_F" {:batch 3}) 5000 ::timeout)]
+                 (is (= [{:n 1} {:n 2} {:n 3}] (map :data msgs))
+                     "fetch with :expires-ms omitted resolves the full batch inside 5s, not the 30s default"))
+               (let [m (deref (jet/next ctx "PULLO" "PULLO_N") 5000 ::timeout)]
+                 (is (= {:n 1} (:data m))
+                     "next with :expires-ms omitted resolves the stored message inside 5s, not the 30s default")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "PULLO" :subjects ["pullo.>"] :storage :memory})]
+                  (with-stream ctx "PULLO"
+                    (fn []
+                      (p/let [_   (jet/create-consumer ctx "PULLO" {:name "PULLO_F" :durable? true :ack-policy :explicit :filter-subjects ["pullo.a"]})
+                              _   (jet/create-consumer ctx "PULLO" {:name "PULLO_N" :durable? true :ack-policy :explicit :filter-subjects ["pullo.a"]})
+                              _   (jet/publish ctx "pullo.a" {:n 1})
+                              _   (jet/publish ctx "pullo.a" {:n 2})
+                              _   (jet/publish ctx "pullo.a" {:n 3})
+                              msgs (jet/fetch ctx "PULLO" "PULLO_F" {:batch 3})
+                              m    (jet/next ctx "PULLO" "PULLO_N")]
+                        (is (= [{:n 1} {:n 2} {:n 3}] (map :data msgs))
+                            "fetch with :expires-ms omitted resolves the full batch promptly, not the 30s default")
+                        (is (= {:n 1} (:data m))
+                            "next with :expires-ms omitted resolves the stored message promptly, not the 30s default"))))))))))
+
+;; ADR 0020, integration on the :4222 JetStream server: next and fetch against a
+;; consumer that does not exist reject with the operational :consumer-not-found
+;; (err_code 10014, normalized via the shared table) — the pull-path analog of
+;; consumer-info's not-found. The two legs reach it by different routes: jnats'
+;; getConsumerContext raises a JetStreamApiException, while nats.js' consumers.get
+;; rejects with a ConsumerNotFoundError (a JetStreamApiError subclass) — both carry
+;; 10014, so both surface the same :type. A stream exists but the named consumer was
+;; never created; cleans up the stream.
+(deftest pull-next-fetch-missing-consumer
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "PULLNF" :subjects ["pullnf.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "PULLNF"
+             (fn []
+               (is (= :consumer-not-found (:type (ex-data (reject-reason (jet/next ctx "PULLNF" "MISSING_C" {:expires-ms 1000})))))
+                   "next against a missing consumer rejects with :consumer-not-found")
+               (is (= :consumer-not-found (:type (ex-data (reject-reason (jet/fetch ctx "PULLNF" "MISSING_C" {:batch 1 :expires-ms 1000})))))
+                   "fetch against a missing consumer rejects with :consumer-not-found"))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "PULLNF" :subjects ["pullnf.>"] :storage :memory})]
+                  (with-stream ctx "PULLNF"
+                    (fn []
+                      (-> (jet/next ctx "PULLNF" "MISSING_C" {:expires-ms 1000})
+                          (p/then (fn [_] (is false "expected :consumer-not-found from next")))
+                          (p/catch (fn [e] (is (= :consumer-not-found (:type (ex-data e)))
+                                               "next against a missing consumer rejects with :consumer-not-found")))
+                          (p/then (fn [_] (jet/fetch ctx "PULLNF" "MISSING_C" {:batch 1 :expires-ms 1000})))
+                          (p/then (fn [_] (is false "expected :consumer-not-found from fetch")))
+                          (p/catch (fn [e] (is (= :consumer-not-found (:type (ex-data e)))
+                                               "fetch against a missing consumer rejects with :consumer-not-found"))))))))))))
+
+;; CLJS only, no server: a per-message lift throwing mid-batch must release the
+;; ConsumerMessages, not leave the pull subscription/inbox dangling until the
+;; expires/heartbeat window — the CLJS analog of the JVM fetch's `(finally (.close fc))`.
+;; A fake ConsumerMessages yields a delivery whose lift throws (an `info` getter that
+;; raises, the way `js-msg->raw` reads DeliveryInfo); `drain-fetch` must reject with that
+;; error AND have called `.close` on the iterable. Drop the throw-path close and `@closed?`
+;; stays false — the leak this guards against.
+#?(:cljs
+   (deftest cljs-drain-fetch-closes-on-lift-throw
+     (async done
+            (let [closed?  (atom false)
+                  boom     (js/Error. "lift boom")
+                  msg      (js/Object.defineProperty
+                            #js {} "info" #js {:get (fn [] (throw boom))})
+                  iterator #js {:next (fn [] (js/Promise.resolve #js {:done false :value msg}))}
+                  cm       #js {:close (fn [] (reset! closed? true) (js/Promise.resolve))}]
+              (unchecked-set cm (.-asyncIterator js/Symbol) (fn [] iterator))
+              (-> (jet-js/drain-fetch cm)
+                  (p/then (fn [_] (is false "a lift throwing mid-batch must reject, not resolve")))
+                  (p/catch (fn [e]
+                             (is (identical? boom e) "drain-fetch rejects with the lift's error")
+                             (is @closed? "drain-fetch closes the ConsumerMessages on the throw path")))
+                  (p/finally (fn [_ _] (done))))))))

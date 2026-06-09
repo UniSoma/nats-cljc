@@ -17,14 +17,16 @@
             [nats-cljc.impl.jvm :as core]
             [nats-cljc.jetstream.error :as jet-err]
             [nats-cljc.jetstream.stream :as stream]
-            [nats-cljc.jetstream.consumer :as consumer])
+            [nats-cljc.jetstream.consumer :as consumer]
+            [nats-cljc.jetstream.pull :as pull])
   (:import [nats_cljc.impl.jvm JvmConnection]
-           [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions]
+           [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions ConsumerContext FetchConsumer FetchConsumeOptions Message]
+           [io.nats.client.impl NatsJetStreamMetaData]
            [io.nats.client.api ServerInfo StreamConfiguration StorageType RetentionPolicy StreamInfo StreamState PublishAck ConsumerConfiguration AckPolicy DeliverPolicy ConsumerInfo SequenceInfo]
            [java.io IOException]
-           [java.time Duration]
-           [java.time.format DateTimeFormatter]
-           [java.util.concurrent CompletableFuture TimeUnit TimeoutException]
+           [java.time Duration ZonedDateTime]
+           [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
+           [java.util.concurrent CompletableFuture ExecutorService RejectedExecutionException TimeUnit TimeoutException]
            [java.util.function BiFunction Supplier]))
 
 ;; The JetStream context (ADR 0017): one handle holding both jnats' data-plane
@@ -32,8 +34,10 @@
 ;; client hands you the two separately; the portable surface collapses them into a
 ;; single value every JetStream operation flows through. `codec` is the connection's
 ;; default (the resolved `Prepared`), captured at entry so acked publish encodes
-;; `:data` with it unless a per-call `:codec` overrides (ADR 0011).
-(defrecord JvmJetStreamContext [^JetStream js ^JetStreamManagement jsm codec])
+;; `:data` with it unless a per-call `:codec` overrides (ADR 0011). `io-executor` is
+;; the connection's per-connection IO pool, carried so every off-thread JetStream op
+;; runs there instead of the shared commonPool (the connection owns its lifecycle).
+(defrecord JvmJetStreamContext [^JetStream js ^JetStreamManagement jsm codec ^ExecutorService io-executor])
 
 (defn verify-io-type
   "Classify the `IOException` jnats raises when the forced `$JS.API.INFO` round-trip
@@ -68,12 +72,15 @@
     ;; CompletionException wrapper — the same deliver-bare guarantee core's `connect`
     ;; gives its own `supplyAsync`. `identity` because the Supplier already returns
     ;; the finished context; only the bare-delivery is wanted, there is nothing to
-    ;; map. `supplyAsync` runs the blocking round-trip off the caller's thread (ADR 0002).
-    (core/then
-     (CompletableFuture/supplyAsync
-      (reify Supplier
-        (get [_]
-          (let [^Connection client (:client conn)]
+    ;; map. `supplyAsync` runs the blocking round-trip off the caller's thread (ADR 0002),
+    ;; on the connection's IO pool — the forced getAccountStatistics below is a real
+    ;; $JS.API.INFO round-trip, so it belongs off commonPool like every other JS op.
+    (let [^Connection client          (:client conn)
+          ^ExecutorService io-executor (:io-executor conn)]
+      (core/then
+       (CompletableFuture/supplyAsync
+        (reify Supplier
+          (get [_]
             (try
               ;; jetStream()/jetStreamManagement() are cheap LOCAL constructions —
               ;; they never touch the server — so their only failure is jnats'
@@ -107,15 +114,16 @@
                                         "JetStream INFO request timed out"
                                         "JetStream is not enabled on the server or account")
                                       {:type (verify-io-type available?)} e)))))
-                (->JvmJetStreamContext js jsm (:codec conn)))
+                (->JvmJetStreamContext js jsm (:codec conn) io-executor))
               (catch IOException e
                 ;; Reached ONLY from the construction above (ensureNotClosing on a
                 ;; non-open connection): the round-trip IOException is already
                 ;; converted to an ex-info inside the inner try, so it never lands
                 ;; here. Key on connection status, not message text (ADR 0006).
                 (throw (ex-info (.getMessage e)
-                                {:type (closing-type (.getStatus client))} e))))))))
-     identity)))
+                                {:type (closing-type (.getStatus client))} e))))))
+        io-executor)
+       identity))))
 
 (defn- api-ex->ex-info
   "Normalize a jnats JetStreamApiException — what `addStream`/`getStreamInfo`/
@@ -151,17 +159,27 @@
       :else                               (ex-info (.getMessage t) {:type :publish-failed} t))))
 
 (defn- off-thread
-  "Run the blocking management thunk `f` off the caller's thread (ADR 0002),
-   normalizing a server-issued JetStreamApiException to its portable operational
-   `:type` and delivering the BARE ex-info on rejection (ADR 0006/0020) — the
-   `then identity` re-wrap the entry point uses, shared by the three verbs."
-  [f]
+  "Run the blocking JetStream thunk `f` off the caller's thread (ADR 0002) on the
+   connection's IO `executor` — never the shared commonPool, so a long-parking pull
+   can't starve the management verbs (ADR 0018). Normalizes a server-issued
+   JetStreamApiException to its portable operational `:type` and delivers the BARE
+   ex-info on rejection (ADR 0006/0020) — the `then identity` re-wrap the entry point
+   uses, shared by every verb. A submit racing the connection's close hits a
+   shut-down executor (RejectedExecutionException); surface it as the same retry-able
+   `:connection-closed` a closed connection's round-trip would, as a rejected future
+   so the facade still settles rather than throwing (ADR 0002/0006)."
+  [^ExecutorService executor f]
   (core/then
-   (CompletableFuture/supplyAsync
-    (reify Supplier
-      (get [_]
-        (try (f)
-             (catch JetStreamApiException e (throw (api-ex->ex-info e)))))))
+   (try
+     (CompletableFuture/supplyAsync
+      (reify Supplier
+        (get [_]
+          (try (f)
+               (catch JetStreamApiException e (throw (api-ex->ex-info e))))))
+      executor)
+     (catch RejectedExecutionException _
+       (CompletableFuture/failedFuture
+        (ex-info "Connection is closed" {:type :connection-closed}))))
    identity))
 
 (defn ->stream-config
@@ -298,22 +316,22 @@
 (extend-type JvmJetStreamContext
   proto/StreamManager
   (-create-stream [ctx config]
-    (off-thread #(stream-info->map (.addStream ^JetStreamManagement (:jsm ctx) (->stream-config config)))))
+    (off-thread (:io-executor ctx) #(stream-info->map (.addStream ^JetStreamManagement (:jsm ctx) (->stream-config config)))))
   (-stream-info [ctx name]
-    (off-thread #(stream-info->map (.getStreamInfo ^JetStreamManagement (:jsm ctx) ^String name))))
+    (off-thread (:io-executor ctx) #(stream-info->map (.getStreamInfo ^JetStreamManagement (:jsm ctx) ^String name))))
   (-delete-stream [ctx name]
-    (off-thread #(do (.deleteStream ^JetStreamManagement (:jsm ctx) ^String name) nil))))
+    (off-thread (:io-executor ctx) #(do (.deleteStream ^JetStreamManagement (:jsm ctx) ^String name) nil))))
 
 (extend-type JvmJetStreamContext
   proto/ConsumerManager
   (-create-consumer [ctx stream config]
-    (off-thread #(consumer-info->map (.createConsumer ^JetStreamManagement (:jsm ctx) ^String stream (->consumer-config config)))))
+    (off-thread (:io-executor ctx) #(consumer-info->map (.createConsumer ^JetStreamManagement (:jsm ctx) ^String stream (->consumer-config config)))))
   (-consumer-info [ctx stream name]
-    (off-thread #(consumer-info->map (.getConsumerInfo ^JetStreamManagement (:jsm ctx) ^String stream ^String name))))
+    (off-thread (:io-executor ctx) #(consumer-info->map (.getConsumerInfo ^JetStreamManagement (:jsm ctx) ^String stream ^String name))))
   (-delete-consumer [ctx stream name]
-    (off-thread #(do (.deleteConsumer ^JetStreamManagement (:jsm ctx) ^String stream ^String name) nil)))
+    (off-thread (:io-executor ctx) #(do (.deleteConsumer ^JetStreamManagement (:jsm ctx) ^String stream ^String name) nil)))
   (-list-consumers [ctx stream]
-    (off-thread #(mapv consumer-info->map (.getConsumers ^JetStreamManagement (:jsm ctx) ^String stream)))))
+    (off-thread (:io-executor ctx) #(mapv consumer-info->map (.getConsumers ^JetStreamManagement (:jsm ctx) ^String stream)))))
 
 (defn- bound-ack
   "Resolve the publishAsync `fut` to a portable PubAck, enforcing the `:timeout-ms`
@@ -341,10 +359,92 @@
                   (->pub-ack ack)))))
    identity))
 
+;; The one canonical `:timestamp` format both legs emit (ADR 0019 pure-data parity):
+;; ISO-8601 in UTC with exactly three fractional digits — e.g. 2026-06-09T01:08:17.279Z.
+;; `appendInstant(3)` truncates sub-millisecond precision (never rounds) and forces the
+;; `Z` offset, so a delivered message's `:timestamp` is byte-identical to the Node leg's
+;; `Date#toISOString`. This is NOT the `ISO_OFFSET_DATE_TIME` `:created` uses — that
+;; carries the source offset and variable fractional digits, which diverge across legs.
+(def ^:private ^DateTimeFormatter canonical-instant
+  (-> (DateTimeFormatterBuilder.) (.appendInstant 3) .toFormatter))
+
+(defn- ->canonical-timestamp
+  "Normalize a jnats metadata ZonedDateTime to the canonical `:timestamp` string."
+  [^ZonedDateTime zdt]
+  (.format canonical-instant (.toInstant zdt)))
+
+(defn js-msg->raw
+  "Lift a delivered JetStream Message into the pure-data pull map (ADR 0019): the core
+   `msg->raw` carries subject/bytes/headers, the reply-to (the message's $JS.ACK ack
+   subject) moves UNDER `:js` as `:ack-subject` and is dropped from the top level so a
+   mistaken `(reply conn js-msg)` can't publish to it, and the native
+   NatsJetStreamMetaData is read into the rest of `:js`. `:redelivered` is derived
+   (delivered > 1) so both legs agree without a native redelivered flag; `:timestamp`
+   is the ZonedDateTime normalized to the canonical UTC-millis form
+   (`->canonical-timestamp`) so it is byte-identical to the Node leg; `:domain`
+   coerces an absent domain to nil. The native object is then discarded — everything
+   downstream is pure data, the lift's whole point."
+  [^Message msg]
+  (let [^NatsJetStreamMetaData md (.metaData msg)
+        delivered (.deliveredCount md)
+        domain    (.getDomain md)]
+    (-> (core/msg->raw msg)
+        (dissoc :reply)
+        (assoc :js {:stream       (.getStream md)
+                    :consumer     (.getConsumer md)
+                    :stream-seq   (.streamSequence md)
+                    :delivery-seq (.consumerSequence md)
+                    :delivered    delivered
+                    :pending      (.pendingCount md)
+                    :redelivered  (> delivered 1)
+                    :timestamp    (->canonical-timestamp (.timestamp md))
+                    :domain       (when (seq domain) domain)
+                    :ack-subject  (.getReplyTo msg)}))))
+
+(defn- ->fetch-options
+  "Build a jnats FetchConsumeOptions from the portable pull `opts` (ADR 0018): `:batch`
+   is the max-messages ceiling — defaulting to `pull/default-batch`, the facade's chosen
+   portable default, so the legs agree when a caller omits it. The explicit default is
+   load-bearing: jnats' own FetchConsumeOptions default (DEFAULT_MESSAGE_COUNT) is 500, so
+   dropping it would let this leg fall back to 500 and diverge from the JS leg. `:expires-ms`
+   is the window after which a batch shorter than `:batch` settles with what it has."
+  ^FetchConsumeOptions [{:keys [batch expires-ms]}]
+  (let [b (FetchConsumeOptions/builder)]
+    (.maxMessages b (int (or batch pull/default-batch)))
+    (when expires-ms (.expiresIn b (long expires-ms)))
+    (.build b)))
+
 (extend-type JvmJetStreamContext
   proto/JetStreamData
   (-js-publish [ctx subject headers bytes opts]
     (bound-ack (.publishAsync ^JetStream (:js ctx) ^String subject
                               (core/->headers headers) ^bytes bytes
                               (->publish-options opts))
-               (:timeout-ms opts))))
+               (:timeout-ms opts)))
+  (-js-next [ctx stream consumer opts]
+    ;; getConsumerContext does a $JS.API round-trip (a missing consumer surfaces as a
+    ;; JetStreamApiException → :consumer-not-found via off-thread), so the whole poll
+    ;; runs off-thread (ADR 0002). next(long) waits :expires-ms and returns null on an
+    ;; empty consumer; next() (no :expires-ms) uses jnats' default expiry. This inlines
+    ;; the :expires-ms->window mapping that fetch routes through ->fetch-options; a new
+    ;; pull option (e.g. :idle-heartbeat) must be wired into both to keep next and fetch
+    ;; in step.
+    (off-thread
+     (:io-executor ctx)
+     #(let [^ConsumerContext cctx (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
+            msg (if-let [e (:expires-ms opts)] (.next cctx (long e)) (.next cctx))]
+        (when msg (js-msg->raw msg)))))
+  (-js-fetch [ctx stream consumer opts]
+    (off-thread
+     (:io-executor ctx)
+     #(let [^ConsumerContext cctx (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
+            ^FetchConsumer fc     (.fetch cctx (->fetch-options opts))]
+        ;; FetchConsumer.nextMessage returns null once the bounded batch is exhausted
+        ;; (maxMessages reached or expiresIn elapsed); close it either way to release
+        ;; the pull subscription.
+        (try
+          (loop [acc (transient [])]
+            (if-let [msg (.nextMessage fc)]
+              (recur (conj! acc (js-msg->raw msg)))
+              (persistent! acc)))
+          (finally (.close fc)))))))

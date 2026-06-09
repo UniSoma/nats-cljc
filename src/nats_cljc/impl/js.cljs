@@ -43,10 +43,11 @@
     (let [r (js->clj (.toRecord ^js h))]
       (when (seq r) r))))
 
-(defn- msg->raw
+(defn msg->raw
   "Lift a nats.js Msg into the raw map the facade decodes (ADR 0005): subject,
    wire bytes, the reply-to subject (nil when absent), and the headers map (nil
-   when absent)."
+   when absent). Public (within this `^:no-doc` ns) so the JetStream impl's
+   `js-msg->raw` reuses it for the pull lift rather than rebuilding it (ADR 0019)."
   [^js msg]
   {:subject (.-subject msg)
    :bytes   (.-data msg)

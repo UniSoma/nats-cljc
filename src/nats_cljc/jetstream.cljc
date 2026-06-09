@@ -9,12 +9,16 @@
    requires it does not pay for (ADR 0016). The impl require is for that load
    side-effect only (it `extend`s the JetStream protocol onto the platform
    Connection record); this facade calls the record through the protocol."
+  ;; `next` is the pull poll-one verb (ADR 0018); the alias `jet/next` is the public
+  ;; name, so clojure.core/next is excluded rather than shadowed in-ns.
+  (:refer-clojure :exclude [next])
   (:require [nats-cljc.core :as core]
             [nats-cljc.codec :as codec]
             [nats-cljc.protocol :as proto]
             [nats-cljc.jetstream.stream :as stream]
             [nats-cljc.jetstream.consumer :as consumer]
             [nats-cljc.jetstream.pub :as pub]
+            [nats-cljc.jetstream.pull :as pull]
             #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])
             #?(:clj  [nats-cljc.jetstream.impl.jvm]
@@ -158,3 +162,66 @@
        (impl/bind (fn [{:keys [headers bytes]}]
                     (proto/-js-publish ctx subject headers bytes
                                        (select-keys opts [:msg-id :expect :timeout-ms])))))))
+
+(defn- decode-js-msg
+  "Decode a raw pull map `{:subject :bytes :headers :js}` (the per-leg `js-msg->raw`
+   lift) into the public pure-data JetStream message `{:subject :data :headers :js}`,
+   decoding `:bytes` with `codec` and carrying the `:js` metadata through untouched.
+   The JetStream counterpart to core's `decode-msg`: same header contract via the
+   shared `core/trim-headers` (surrounding whitespace stripped, an empty map dropped
+   so `:headers` stays absent), but the ack address lives under `:js :ack-subject`,
+   never as a top-level `:reply` (ADR 0019)."
+  [codec {:keys [subject bytes headers js]}]
+  (cond-> {:subject subject
+           :data    (codec/decode codec bytes)
+           :js      js}
+    (seq headers) (assoc :headers (core/trim-headers headers))))
+
+(defn fetch
+  "Fetch a bounded batch from the durable Consumer `consumer` on Stream `stream` through
+   the JetStream context `ctx`, returning a platform-native promise that resolves to a
+   vector of up to `:batch` PURE-DATA messages `{:subject :data :js}` (plus `:headers`
+   when the message carried some), each `:data` decoded with the context codec, in stream
+   order (ADR 0018). A delivered message is plain data — no native object — with its
+   JetStream metadata under `:js` `{:stream :consumer :stream-seq :delivery-seq :delivered
+   :pending :redelivered :timestamp :domain :ack-subject}`, `:timestamp` an ISO-8601 string
+   and `:redelivered` true once `:delivered` exceeds 1 (ADR 0019). `opts`: `:batch` (max
+   messages, default 100), `:expires-ms` (the window after which a batch shorter than
+   `:batch` settles with what it has; omitted, the window is the 30000ms default both
+   clients independently apply — jnats' FetchConsumeOptions and nats.js' fetch — so the
+   legs agree on the wait when a caller omits it), and `:codec` (a per-call decode
+   override). The
+   promise rejects pre-flight with a validation `:type :invalid-name` when `stream` or
+   `consumer` is malformed, and `:invalid-expires` when a supplied `:expires-ms` is below
+   the 1000ms floor both clients enforce or is not a whole number (ADR 0015)."
+  ([ctx stream consumer] (fetch ctx stream consumer {}))
+  ([ctx stream consumer opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (stream/validate-name stream)))
+       (impl/then (fn [_] (consumer/validate-name consumer)))
+       (impl/then (fn [_] (pull/validate-expires opts)))
+       (impl/bind (fn [_] (proto/-js-fetch ctx stream consumer opts)))
+       (impl/then (fn [raws]
+                    (let [codec (core/effective-codec ctx opts)]
+                      (mapv #(decode-js-msg codec %) raws)))))))
+
+(defn next
+  "Poll a single message from the durable Consumer `consumer` on Stream `stream` through
+   the JetStream context `ctx`, returning a platform-native promise that resolves to ONE
+   PURE-DATA message `{:subject :data :js}` (plus `:headers` when present, shape as in
+   `fetch`), or nil when no message arrives within the poll window — an empty consumer
+   (ADR 0018). `opts`: `:expires-ms` (how long to wait for a message before resolving nil;
+   omitted, it waits the 30000ms default both clients independently apply — jnats'
+   no-arg next() and nats.js' next — so the legs agree on the wait) and `:codec`
+   (a per-call decode override). The promise
+   rejects pre-flight with a validation `:type :invalid-name` when `stream` or `consumer`
+   is malformed, and `:invalid-expires` when a supplied `:expires-ms` is below the 1000ms
+   floor both clients enforce or is not a whole number (ADR 0015)."
+  ([ctx stream consumer] (next ctx stream consumer {}))
+  ([ctx stream consumer opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (stream/validate-name stream)))
+       (impl/then (fn [_] (consumer/validate-name consumer)))
+       (impl/then (fn [_] (pull/validate-expires opts)))
+       (impl/bind (fn [_] (proto/-js-next ctx stream consumer opts)))
+       (impl/then (fn [raw] (when raw (decode-js-msg (core/effective-codec ctx opts) raw)))))))

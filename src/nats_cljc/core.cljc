@@ -115,23 +115,31 @@
                    (codec/encode (effective-codec conn opts) data))
    nil))
 
+(defn trim-headers
+  "Apply the portable header-value contract to a raw canonical headers map
+   `{name -> vector-of-strings}`: strip surrounding whitespace from every value,
+   which is insignificant on delivery (nats.js already trims, so the JS leg
+   double-trims harmlessly; jnats does not, so this is what makes the JVM leg
+   agree). The single home of the trim contract, shared by core's `decode-msg`
+   and JetStream's `decode-js-msg` (CONTEXT: Headers)."
+  [headers]
+  (reduce-kv (fn [m k vs] (assoc m k (mapv str/trim vs))) {} headers))
+
 (defn- decode-msg
   "Decode a raw delivery/reply map `{:subject :bytes :reply :headers}` into the
    public message shape `{:subject :data :reply}`, decoding `:bytes` with
    `codec`. `:headers` (canonical `{name -> vector-of-strings}`) is added only
    when the message carried some, so it is absent otherwise.
 
-   This is where the portable header-value contract is enforced: surrounding
-   whitespace is insignificant and stripped on delivery (nats.js already trims,
-   so the JS leg double-trims harmlessly; jnats does not, so this is what makes
-   the JVM leg agree), and an empty map is dropped so `:headers` stays absent
-   regardless of any platform quirk in producing it (CONTEXT: Headers)."
+   This is where the portable header-value contract is enforced: values are
+   trimmed by `trim-headers` (surrounding whitespace is insignificant), and an
+   empty map is dropped so `:headers` stays absent regardless of any platform
+   quirk in producing it (CONTEXT: Headers)."
   [codec {:keys [subject bytes reply headers]}]
   (cond-> {:subject subject
            :reply   reply
            :data    (codec/decode codec bytes)}
-    (seq headers) (assoc :headers (reduce-kv (fn [m k vs] (assoc m k (mapv str/trim vs)))
-                                             {} headers))))
+    (seq headers) (assoc :headers (trim-headers headers))))
 
 (defn subscribe
   "Subscribe to `subject`, returning a Subscription synchronously. `handler` is
