@@ -6,7 +6,7 @@ type: feature
 priority: 2
 mode: afk
 created: '2026-06-06T03:02:10.188611974Z'
-updated: '2026-06-09T20:25:04.261400359Z'
+updated: '2026-06-09T22:19:06.241572827Z'
 parent: nts-01ktdcwwhd76
 tags:
 - jetstream
@@ -23,6 +23,8 @@ acceptance:
   done: false
 deps:
 - nts-01ktde2zv0fm
+links:
+- nts-01ktq7fj46t3
 ---
 
 ## Description
