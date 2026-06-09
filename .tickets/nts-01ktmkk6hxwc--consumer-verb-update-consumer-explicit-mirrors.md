@@ -1,12 +1,12 @@
 ---
 id: nts-01ktmkk6hxwc
 title: 'Consumer verb: update-consumer (explicit, mirrors update-stream)'
-status: open
+status: in_progress
 type: feature
 priority: 2
 mode: afk
 created: '2026-06-08T21:53:05.081326277Z'
-updated: '2026-06-08T21:53:05.081326277Z'
+updated: '2026-06-09T23:01:08.924345367Z'
 parent: nts-01ktdcwwhd76
 tags:
 - jetstream

@@ -288,6 +288,16 @@
       (-> (.add consumers stream (->consumer-config config))
           (.then (fn [ci] (consumer-info->map ci)))
           with-api-error)))
+  (-update-consumer [ctx stream config]
+    ;; nats.js `consumers.update` reads the current config and merges `cfg` over it
+    ;; before the CONSUMER.CREATE action=update request, so an absent portable key
+    ;; keeps its current value — the merge semantics the JVM leg reproduces (ADR
+    ;; 0020). The pre-update read rejects 10014 ⇒ :consumer-not-found for a missing
+    ;; Consumer.
+    (let [consumers ^js (.-consumers ^js (:jsm ctx))]
+      (-> (.update consumers stream (:name config) (->consumer-config config))
+          (.then (fn [ci] (consumer-info->map ci)))
+          with-api-error)))
   (-consumer-info [ctx stream name]
     (let [consumers ^js (.-consumers ^js (:jsm ctx))]
       (-> (.info consumers stream name)

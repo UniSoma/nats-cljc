@@ -151,6 +151,17 @@
      normalized ConsumerInfo map. The promise rejects with an operational
      `:jetstream-api-error` (carrying `{:code :description}`) when the server rejects
      the config (ADR 0020).")
+  (-update-consumer [ctx stream config]
+    "Update an existing durable Consumer's configuration on the Stream `stream` from
+     the portable closed kebab `config` (already validated by the facade), MERGING
+     the keys present over the Consumer's current config — an absent key keeps its
+     current value, never reverts to a server default — and returning a native
+     promise of the normalized ConsumerInfo map. nats.js merges natively (its
+     `consumers.update` reads the current config first); the JVM leg reproduces that
+     read-merge-write so the semantics are identical (ADR 0020). Rejects with `:type
+     :consumer-not-found` when the Consumer does not exist, or an operational
+     `:jetstream-api-error` when the server rejects the change (e.g. an immutable
+     field).")
   (-consumer-info [ctx stream name]
     "Return a native promise of the normalized ConsumerInfo map for the Consumer
      `name` on Stream `stream`, rejecting with `:type :consumer-not-found` when it

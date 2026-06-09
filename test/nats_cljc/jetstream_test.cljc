@@ -877,6 +877,52 @@
                   (is (= 0 (:pending info)) "a fresh consumer has nothing pending")
                   (jet/delete-stream ctx "CTRACER")))))))
 
+;; Integration (ADR 0020/0021), on the JetStream-enabled :4222 server: update-consumer
+;; changes an existing durable's mutable config without recreating it — the key present
+;; (:max-deliver) takes the new value while the absent keys (:ack-wait-ms, :ack-policy)
+;; keep their CURRENT values, the merge semantics both legs share (nats.js merges
+;; natively; the JVM leg reproduces the read-merge-write) — verified through an
+;; independent consumer-info read-back. An update against a missing durable surfaces
+;; the operational :consumer-not-found, same as info/delete. Cleans up.
+(deftest consumer-update-changes-config
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "UCTRACER" :subjects ["uctracer.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "UCTRACER"
+             (fn []
+               (deref (jet/create-consumer ctx "UCTRACER" {:name "UC_TRACER" :ack-policy :explicit
+                                                           :ack-wait-ms 30000 :max-deliver 5}) 5000 ::timeout)
+               (let [updated (deref (jet/update-consumer ctx "UCTRACER" {:name "UC_TRACER" :max-deliver 7}) 5000 ::timeout)
+                     info    (deref (jet/consumer-info ctx "UCTRACER" "UC_TRACER") 5000 ::timeout)]
+                 (is (= 7 (get-in updated [:config :max-deliver])) "update-consumer returns the new active config")
+                 (is (= 7 (get-in info [:config :max-deliver])) "consumer-info confirms the changed key")
+                 (is (= 30000 (get-in info [:config :ack-wait-ms])) "a key absent from the update keeps its current value")
+                 (is (= :explicit (get-in info [:config :ack-policy])) "the current ack policy survives the merge")
+                 (is (= :consumer-not-found (:type (ex-data (reject-reason (jet/update-consumer ctx "UCTRACER" {:name "NO_SUCH_CONSUMER"})))))
+                     "updating a missing consumer surfaces :consumer-not-found")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "UCTRACER" :subjects ["uctracer.>"] :storage :memory})]
+                  (with-stream ctx "UCTRACER"
+                    (fn []
+                      (p/let [_       (jet/create-consumer ctx "UCTRACER" {:name "UC_TRACER" :ack-policy :explicit
+                                                                           :ack-wait-ms 30000 :max-deliver 5})
+                              updated (jet/update-consumer ctx "UCTRACER" {:name "UC_TRACER" :max-deliver 7})
+                              info    (jet/consumer-info ctx "UCTRACER" "UC_TRACER")]
+                        (is (= 7 (get-in updated [:config :max-deliver])) "update-consumer returns the new active config")
+                        (is (= 7 (get-in info [:config :max-deliver])) "consumer-info confirms the changed key")
+                        (is (= 30000 (get-in info [:config :ack-wait-ms])) "a key absent from the update keeps its current value")
+                        (is (= :explicit (get-in info [:config :ack-policy])) "the current ack policy survives the merge")
+                        (-> (jet/update-consumer ctx "UCTRACER" {:name "NO_SUCH_CONSUMER"})
+                            (p/then (fn [_] (is false "expected :consumer-not-found for a missing consumer")))
+                            (p/catch (fn [e] (is (= :consumer-not-found (:type (ex-data e)))
+                                                 "updating a missing consumer surfaces :consumer-not-found")))))))))))))
+
 ;; AC3 (ADR 0020), integration: delete-consumer resolves nil once the durable is gone,
 ;; and a subsequent consumer-info surfaces the operational :consumer-not-found (err_code
 ;; 10014, normalized via the shared table) — the consumer analog of :stream-not-found.

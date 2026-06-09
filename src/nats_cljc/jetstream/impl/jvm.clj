@@ -23,7 +23,7 @@
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions ConsumerContext FetchConsumer FetchConsumeOptions ConsumeOptions ConsumeOptions$Builder MessageConsumer MessageHandler Message]
            [io.nats.client.impl NatsJetStreamMetaData]
-           [io.nats.client.api ServerInfo StreamConfiguration StreamConfiguration$Builder StorageType RetentionPolicy StreamInfo StreamState PublishAck PurgeResponse ConsumerConfiguration AckPolicy DeliverPolicy ConsumerInfo SequenceInfo]
+           [io.nats.client.api ServerInfo StreamConfiguration StreamConfiguration$Builder StorageType RetentionPolicy StreamInfo StreamState PublishAck PurgeResponse ConsumerConfiguration ConsumerConfiguration$Builder AckPolicy DeliverPolicy ConsumerInfo SequenceInfo]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
            [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
@@ -223,31 +223,40 @@
    :retention (stream/wire->retention (str (.getRetentionPolicy c)))
    :max-age-ms (.toMillis (.getMaxAge c))})
 
+(defn- apply-consumer-config
+  "Apply the keys present in the portable closed kebab `config` onto the jnats
+   ConsumerConfiguration builder `b` (ADR 0020) — the shared half of create (a fresh
+   builder) and update (a builder seeded with the current config, see
+   `merged-consumer-config`), the consumer sibling of `apply-stream-config`. Only the
+   keys present are set; the policy keywords route through the shared wire tables and
+   `:ack-wait-ms` becomes a Duration (the CLJS leg uses Nanos). `:name` sets the
+   consumer `name`; for a durable (`:durable?` absent or true) it ALSO sets `durable`
+   — the field whose absence makes the consumer ephemeral (ADR 0021). An ephemeral
+   (`:durable? false`) sets only `name` (a named ephemeral) or, with no `:name`,
+   neither (the server assigns one)."
+  ^ConsumerConfiguration [^ConsumerConfiguration$Builder b config]
+  (when-let [name (:name config)]
+    (.name b ^String name)
+    (when-not (false? (:durable? config))
+      (.durable b ^String name)))
+  (when-let [ack-policy (:ack-policy config)]
+    (.ackPolicy b (AckPolicy/get (consumer/ack-policy->wire ack-policy))))
+  (when-let [deliver-policy (:deliver-policy config)]
+    (.deliverPolicy b (DeliverPolicy/get (consumer/deliver-policy->wire deliver-policy))))
+  (when-let [ack-wait-ms (:ack-wait-ms config)]
+    (.ackWait b (Duration/ofMillis ack-wait-ms)))
+  (when-let [max-deliver (:max-deliver config)]
+    (.maxDeliver b (long max-deliver)))
+  (when-let [filter-subjects (:filter-subjects config)]
+    (.filterSubjects b (into-array String filter-subjects)))
+  (.build b))
+
 (defn ->consumer-config
   "Build a jnats ConsumerConfiguration from the portable closed kebab `config`
    (ADR 0020). Only the keys present are set, so an absent key takes the server
-   default; the policy keywords route through the shared wire tables and `:ack-wait-ms`
-   becomes a Duration (the CLJS leg uses Nanos). `:name` sets the consumer `name`; for a
-   durable (`:durable?` absent or true) it ALSO sets `durable` — the field whose absence
-   makes the consumer ephemeral (ADR 0021). An ephemeral (`:durable? false`) sets only
-   `name` (a named ephemeral) or, with no `:name`, neither (the server assigns one)."
+   default (see `apply-consumer-config`)."
   ^ConsumerConfiguration [config]
-  (let [b (ConsumerConfiguration/builder)]
-    (when-let [name (:name config)]
-      (.name b ^String name)
-      (when-not (false? (:durable? config))
-        (.durable b ^String name)))
-    (when-let [ack-policy (:ack-policy config)]
-      (.ackPolicy b (AckPolicy/get (consumer/ack-policy->wire ack-policy))))
-    (when-let [deliver-policy (:deliver-policy config)]
-      (.deliverPolicy b (DeliverPolicy/get (consumer/deliver-policy->wire deliver-policy))))
-    (when-let [ack-wait-ms (:ack-wait-ms config)]
-      (.ackWait b (Duration/ofMillis ack-wait-ms)))
-    (when-let [max-deliver (:max-deliver config)]
-      (.maxDeliver b (long max-deliver)))
-    (when-let [filter-subjects (:filter-subjects config)]
-      (.filterSubjects b (into-array String filter-subjects)))
-    (.build b)))
+  (apply-consumer-config (ConsumerConfiguration/builder) config))
 
 (defn consumer-config->map
   "Read a jnats ConsumerConfiguration back into the normalized portable kebab map —
@@ -371,10 +380,26 @@
   (-stream-names [ctx]
     (off-thread (:io-executor ctx) #(vec (.getStreamNames ^JetStreamManagement (:jsm ctx))))))
 
+(defn- merged-consumer-config
+  "Build the full ConsumerConfiguration an update sends: read the Consumer's current
+   config from the server and apply the portable `config`'s keys over it, so an
+   absent key keeps its current value — the read-merge-write nats.js' `consumers.update`
+   does natively, reproduced here for identical merge semantics (ADR 0020) and the
+   consumer sibling of `merged-stream-config`. The read raises 10014 ⇒
+   `:consumer-not-found` for a missing Consumer, matching the rejection nats.js'
+   own pre-update read surfaces."
+  ^ConsumerConfiguration [^JetStreamManagement jsm stream config]
+  (let [current (.getConsumerConfiguration (.getConsumerInfo jsm ^String stream ^String (:name config)))]
+    (apply-consumer-config (ConsumerConfiguration/builder current) config)))
+
 (extend-type JvmJetStreamContext
   proto/ConsumerManager
   (-create-consumer [ctx stream config]
     (off-thread (:io-executor ctx) #(consumer-info->map (.createConsumer ^JetStreamManagement (:jsm ctx) ^String stream (->consumer-config config)))))
+  (-update-consumer [ctx stream config]
+    (off-thread (:io-executor ctx)
+                #(let [^JetStreamManagement jsm (:jsm ctx)]
+                   (consumer-info->map (.updateConsumer jsm ^String stream (merged-consumer-config jsm stream config))))))
   (-consumer-info [ctx stream name]
     (off-thread (:io-executor ctx) #(consumer-info->map (.getConsumerInfo ^JetStreamManagement (:jsm ctx) ^String stream ^String name))))
   (-delete-consumer [ctx stream name]

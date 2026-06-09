@@ -142,6 +142,28 @@
       (impl/then (fn [_] (consumer/validate-config config)))
       (impl/bind (fn [_] (proto/-create-consumer ctx stream config)))))
 
+(defn update-consumer
+  "Update an existing durable Consumer's configuration on the Stream named `stream`
+   through the JetStream context `ctx`, from the portable, CLOSED kebab `config` map
+   (same keys as `create-consumer`, `:name` naming the durable to change), returning
+   a platform-native promise that resolves to the normalized ConsumerInfo map
+   carrying the new active config. The keys present are MERGED over the Consumer's
+   current config — an absent key keeps its current value rather than reverting to a
+   server default — so an ack wait or delivery cap can change without restating the
+   whole config (ADR 0020). Updates are deliberate and separate from `create-consumer`,
+   which stays create-only (ADR 0021), mirroring the `create-stream`/`update-stream`
+   split. The map is closed: an unrecognized key rejects pre-flight with a validation
+   `:type :unknown-config-key`, and a malformed `:name` or `stream` with
+   `:invalid-name` (ADR 0015). The promise rejects with an operational `:type
+   :consumer-not-found` when no such Consumer exists, and `:jetstream-api-error`
+   carrying `{:code :description}` when the server rejects the change (e.g. an
+   immutable field) (ADR 0020)."
+  [ctx stream config]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-name stream)))
+      (impl/then (fn [_] (consumer/validate-config config)))
+      (impl/bind (fn [_] (proto/-update-consumer ctx stream config)))))
+
 (defn consumer-info
   "Look up the Consumer named `name` on the Stream `stream` through the JetStream
    context `ctx`, returning a platform-native promise that resolves to the normalized
