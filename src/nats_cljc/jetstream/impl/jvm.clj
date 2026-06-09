@@ -458,7 +458,7 @@
 ;; Drainable/Sub shape core's JvmSubscription gives a Subscription, so the core
 ;; facade's drain/unsubscribe dispatch over it unchanged. There is no slow-consumer
 ;; registry to clean up — pull has no :slow-consumer (ADR 0018).
-(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor drain-deadline-ms]
+(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor drain-deadline-ms closed?]
   proto/Drainable
   ;; stop() ends new pulls but lets buffered messages deliver and the open pull
   ;; wind down; jnats flags isFinished then, with no future to wait on, so the
@@ -482,9 +482,14 @@
              (>= (System/currentTimeMillis) deadline) false
              :else                                    (do (Thread/sleep 50) (recur))))))))
   proto/Sub
-  ;; Stopped covers the drain window too: a draining consume no longer delivers
-  ;; new interest, matching "not yet drained, unsubscribed, or ended".
-  (-active? [_] (not (or (.isStopped mc) (.isFinished mc))))
+  ;; Active through the drain window (ADR 0022): isStopped is deliberately NOT
+  ;; consulted — stop() flips it at drain-initiation while buffered messages are
+  ;; still delivering, and jnats flags isFinished only once the wind-down truly
+  ;; completes. A gave-up drain (the bounded poll above settling false) therefore
+  ;; leaves the handle active: the consumer genuinely never wound down. close()
+  ;; sets only the stopped flag, never finished, so unsubscribe tracks its own
+  ;; `closed?` to flip the handle inactive.
+  (-active? [_] (not (or @closed? (.isFinished mc))))
   ;; close() unsubscribes the underlying pull subscription now, dropping buffered
   ;; messages (un-acked, so the server redelivers them) — the abrupt sibling of
   ;; stop(). jnats' lenientClose already swallows its own teardown errors; the
@@ -496,6 +501,7 @@
       (throw (ex-info "consume handles do not support an auto-unsubscribe max"
                       {:type :invalid-max :max max})))
     (try (.close mc) (catch Exception _ nil))
+    (reset! closed? true)
     nil))
 
 (extend-type JvmJetStreamContext
@@ -558,4 +564,5 @@
                      (catch Exception _ nil))))]
         (->JvmConsumeHandle (.consume cctx (->consume-options opts) mh)
                             (:io-executor ctx)
-                            (->drain-deadline-ms opts))))))
+                            (->drain-deadline-ms opts)
+                            (atom false))))))

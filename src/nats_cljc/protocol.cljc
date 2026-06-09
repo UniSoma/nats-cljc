@@ -67,8 +67,9 @@
 (defprotocol Sub
   "A single subscription's lifecycle, beyond draining."
   (-active? [sub]
-    "True while the subscription is still delivering — not yet drained,
-     unsubscribed, or ended by the connection closing.")
+    "True while the subscription is still delivering — stays true through a
+     drain's wind-down, flipping false only once the drain settles, the sub is
+     unsubscribed, or the connection ends it (ADR 0022).")
   (-unsubscribe [sub max]
     "End this subscription abruptly, the lower-level sibling of `-drain`: tell the
      server to stop and drop any not-yet-delivered messages, returning nil

@@ -1338,7 +1338,7 @@
                       (isStopped [_] false)
                       (close [_] nil))
            executor (doto (Executors/newSingleThreadExecutor) (.shutdown))
-           handle   (jet-jvm/->JvmConsumeHandle mc executor 1000)
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 1000 (atom false))
            fut      (proto/-drain handle)]
        (is (true? @stopped?) "-drain stops the underlying consumer")
        (is (instance? CompletableFuture fut) "-drain returns a future, not a synchronous throw")
@@ -1359,11 +1359,33 @@
                       (isStopped [_] false)
                       (close [_] nil))
            executor (Executors/newSingleThreadExecutor)
-           handle   (jet-jvm/->JvmConsumeHandle mc executor 200)
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false))
            settled  (deref (proto/-drain handle) 3000 ::timeout)]
        (.shutdownNow executor)
        (is (not= ::timeout settled)
            "drain settles at the wind-down deadline when the consume never reports finished"))))
+
+;; ADR 0022, JVM only, no server: a gave-up drain leaves the handle ACTIVE. The fake
+;; consumer pins isFinished=false (the parked-handler stand-in again), so the bounded
+;; wind-down settles false at the deadline — and `-active?` keeps reporting true: the
+;; consumer genuinely never wound down, the settled-false drain already says "didn't
+;; finish within budget", and escalation (unsubscribe) is the caller's call, not a
+;; side effect of the give-up. isStopped=true here also pins that the predicate
+;; ignores the stopped flag (it flips at drain-initiation, not at settle).
+#?(:clj
+   (deftest jvm-consume-gave-up-drain-leaves-handle-active
+     (let [mc       (reify MessageConsumer
+                      (stop [_] nil)
+                      (isFinished [_] false)
+                      (isStopped [_] true)
+                      (close [_] nil))
+           executor (Executors/newSingleThreadExecutor)
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false))
+           settled  (deref (proto/-drain handle) 3000 ::timeout)]
+       (.shutdownNow executor)
+       (is (false? settled) "a wind-down that never finishes settles false at the deadline")
+       (is (true? (proto/-active? handle))
+           "a gave-up drain leaves the handle active — escalation is the caller's call"))))
 
 ;; ADR 0007/0018, integration on the :4222 JetStream server: a slow
 ;; promise-returning handler measurably gates delivery — the consume twin of core's
@@ -1437,6 +1459,59 @@
                             (is (not-any? #(= :slow-consumer (:type %)) @statuses)
                                 "no :slow-consumer is ever raised by pull")
                             (nats/drain handle))))))))))))
+
+;; ADR 0022, integration on the :4222 JetStream server: `-active?` stays true through
+;; the drain window. A gate-parked handler holds the wind-down open deterministically:
+;; drain stops the consumer, but the in-flight delivery hasn't finished, so the handle
+;; still reports active; once the gate settles the wind-down completes, drain settles,
+;; and only then does the handle flip inactive. Same on both legs — the contract a
+;; supervisor polling `(active? handle)` after `(drain handle)` relies on. Memory
+;; stream, cleans up.
+(deftest consume-active-through-drain-window
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "CONSDRW" :subjects ["consdrw.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "CONSDRW"
+             (fn []
+               (deref (jet/create-consumer ctx "CONSDRW" {:name "CONSDRW_C" :durable? true :ack-policy :explicit :filter-subjects ["consdrw.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "consdrw.a" {:n 1}) 5000 ::timeout)
+               (let [seen   (atom 0)
+                     gate   (java.util.concurrent.CompletableFuture.)
+                     handle (deref (jet/consume ctx "CONSDRW" "CONSDRW_C"
+                                                (fn [m] (swap! seen inc) (jet/ack conn m) gate)
+                                                {:expires-ms 2000})
+                                   5000 ::timeout)]
+                 (is (wait-for #(= 1 @seen) 5000) "the handler holds the in-flight message")
+                 (let [drained (nats/drain handle)]
+                   (is (true? (proto/-active? handle)) "the handle stays active through the drain window")
+                   (.complete gate nil)
+                   (is (true? (deref drained 10000 ::timeout)) "drain settles true once the wind-down completes")
+                   (is (false? (proto/-active? handle)) "the handle flips inactive once the drain settles"))))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "CONSDRW" :subjects ["consdrw.>"] :storage :memory})]
+                  (with-stream ctx "CONSDRW"
+                    (fn []
+                      (let [seen (atom 0)
+                            gate (p/deferred)]
+                        (p/let [_      (jet/create-consumer ctx "CONSDRW" {:name "CONSDRW_C" :durable? true :ack-policy :explicit :filter-subjects ["consdrw.a"]})
+                                _      (jet/publish ctx "consdrw.a" {:n 1})
+                                handle (jet/consume ctx "CONSDRW" "CONSDRW_C"
+                                                    (fn [m] (swap! seen inc) (jet/ack conn m) gate)
+                                                    {:expires-ms 2000})
+                                hit?   (wait-for #(= 1 @seen) 5000)]
+                          (is hit? "the handler holds the in-flight message")
+                          (let [drained (nats/drain handle)]
+                            (is (true? (proto/-active? handle)) "the handle stays active through the drain window")
+                            (p/resolve! gate nil)
+                            (p/let [settled drained]
+                              (is (true? settled) "drain settles true once the wind-down completes")
+                              (is (false? (proto/-active? handle)) "the handle flips inactive once the drain settles")))))))))))))
 
 ;; ADR 0012/0015, integration on the :4222 JetStream server: the consume handle
 ;; unsubscribes exactly like a core Subscription. `core/unsubscribe` ends it abruptly —

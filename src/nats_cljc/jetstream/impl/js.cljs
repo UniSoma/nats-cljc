@@ -390,6 +390,8 @@
 ;; Drainable/Sub shape core's JsSubscription gives a Subscription, so the core
 ;; facade's drain/unsubscribe dispatch over it unchanged. `active?` is an atom the
 ;; drive loop and the teardown verbs flip — nats.js exposes no liveness predicate.
+;; The drain path flips it only when close() RESOLVES, never at initiation: the
+;; handle stays active through the drain window (ADR 0022).
 (defrecord JsConsumeHandle [cm active?]
   proto/Drainable
   ;; nats.js close() stops the iterator and resolves once the client side has
