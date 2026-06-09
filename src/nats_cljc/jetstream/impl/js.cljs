@@ -222,42 +222,64 @@
    :duplicate (.-duplicate a)
    :domain    (or (.-domain a) nil)})
 
+(defn- drain-lister
+  "Drain a nats.js Lister — the async-paged iterator the list/names endpoints
+   return — into a vector, calling `.next` for successive pages, normalizing each
+   element through `f`, and accumulating until a page comes back empty (the
+   Lister's end-of-pages signal). The JVM leg's `getConsumers`/`getStreams` hand
+   back the full list in one call; this loop is the CLJS analog."
+  [^js lister f acc]
+  (-> (.next lister)
+      (.then (fn [page]
+               (if (zero? (alength page))
+                 acc
+                 (drain-lister lister f (into acc (map f (array-seq page)))))))))
+
+(defn- with-api-error
+  "Attach the shared management-verb rejection tail: normalize a nats.js error through
+   `api-error` (ADR 0020) before it propagates. Folds the catch-and-normalize tail
+   repeated across the stream/consumer verbs into one place."
+  [p]
+  (.catch p (fn [e] (throw (api-error e)))))
+
 (extend-type JsJetStreamContext
   proto/StreamManager
   (-create-stream [ctx config]
     (let [streams ^js (.-streams ^js (:jsm ctx))]
       (-> (.add streams (->stream-config config))
           (.then (fn [si] (stream-info->map si)))
-          (.catch (fn [e] (throw (api-error e)))))))
+          with-api-error)))
+  (-update-stream [ctx config]
+    ;; nats.js `update` reads the current config and merges `cfg` over it before
+    ;; the STREAM.UPDATE request, so an absent portable key keeps its current
+    ;; value — the merge semantics the JVM leg reproduces (ADR 0020).
+    (let [streams ^js (.-streams ^js (:jsm ctx))]
+      (-> (.update streams (:name config) (->stream-config config))
+          (.then (fn [si] (stream-info->map si)))
+          with-api-error)))
   (-stream-info [ctx name]
     (let [streams ^js (.-streams ^js (:jsm ctx))]
       (-> (.info streams name)
           (.then (fn [si] (stream-info->map si)))
-          (.catch (fn [e] (throw (api-error e)))))))
+          with-api-error)))
+  (-purge-stream [ctx name]
+    (let [streams ^js (.-streams ^js (:jsm ctx))]
+      (-> (.purge streams name)
+          (.then (fn [^js r] {:purged (.-purged r)}))
+          with-api-error)))
   (-delete-stream [ctx name]
     (let [streams ^js (.-streams ^js (:jsm ctx))]
       (-> (.delete streams name)
           (.then (fn [_] nil))
-          (.catch (fn [e] (throw (api-error e))))))))
-
-(defn- drain-lister
-  "Drain a nats.js Lister — the async-paged iterator `consumers.list` returns — into a
-   vector of normalized maps, calling `.next` for successive pages and accumulating
-   until one comes back empty (the Lister's end-of-pages signal). The JVM leg's
-   `getConsumers` hands back the full list in one call; this loop is the CLJS analog."
-  [^js lister acc]
-  (-> (.next lister)
-      (.then (fn [page]
-               (if (zero? (alength page))
-                 acc
-                 (drain-lister lister (into acc (map consumer-info->map (array-seq page)))))))))
-
-(defn- with-api-error
-  "Attach the shared ConsumerManager rejection tail: normalize a nats.js error through
-   `api-error` (ADR 0020) before it propagates. Folds the catch-and-normalize tail
-   repeated across the consumer verbs into one place."
-  [p]
-  (.catch p (fn [e] (throw (api-error e)))))
+          with-api-error)))
+  (-list-streams [ctx]
+    (let [streams ^js (.-streams ^js (:jsm ctx))]
+      (-> (drain-lister (.list streams) stream-info->map [])
+          with-api-error)))
+  (-stream-names [ctx]
+    (let [streams ^js (.-streams ^js (:jsm ctx))]
+      (-> (drain-lister (.names streams) identity [])
+          with-api-error))))
 
 (extend-type JsJetStreamContext
   proto/ConsumerManager
@@ -278,7 +300,7 @@
           with-api-error)))
   (-list-consumers [ctx stream]
     (let [consumers ^js (.-consumers ^js (:jsm ctx))]
-      (-> (drain-lister (.list consumers stream) [])
+      (-> (drain-lister (.list consumers stream) consumer-info->map [])
           with-api-error))))
 
 (defn js-msg->raw

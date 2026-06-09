@@ -1,12 +1,12 @@
 ---
 id: nts-01ktde2zfmb8
 title: 'Stream verbs: update + purge + list (and names)'
-status: open
+status: in_progress
 type: feature
 priority: 2
 mode: afk
 created: '2026-06-06T03:02:09.648894380Z'
-updated: '2026-06-06T03:02:09.648894380Z'
+updated: '2026-06-09T22:50:44.925765330Z'
 parent: nts-01ktdcwwhd76
 tags:
 - jetstream

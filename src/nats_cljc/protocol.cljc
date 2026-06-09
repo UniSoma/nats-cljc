@@ -108,12 +108,33 @@
      the facade), returning a native promise of the normalized StreamInfo map. The
      promise rejects with an operational `:jetstream-api-error` (carrying
      `{:code :description}`) when the server rejects the config (ADR 0020).")
+  (-update-stream [ctx config]
+    "Update an existing Stream's configuration from the portable closed kebab
+     `config` (already validated by the facade), MERGING the keys present over the
+     Stream's current config — an absent key keeps its current value, never reverts
+     to a server default — and returning a native promise of the normalized
+     StreamInfo map. nats.js merges natively (its `update` reads the current config
+     first); the JVM leg reproduces that read-merge-write so the semantics are
+     identical (ADR 0020). Rejects with `:type :stream-not-found` when the Stream
+     does not exist, or an operational `:jetstream-api-error` when the server
+     rejects the change.")
   (-stream-info [ctx name]
     "Return a native promise of the normalized StreamInfo map for the Stream
      `name`, rejecting with `:type :stream-not-found` when it does not exist.")
+  (-purge-stream [ctx name]
+    "Purge every message from the Stream `name` while keeping its definition,
+     returning a native promise of `{:purged <count>}` and rejecting with `:type
+     :stream-not-found` when it does not exist.")
   (-delete-stream [ctx name]
     "Delete the Stream `name`, returning a native promise that resolves to nil once
-     it is gone and rejects with `:type :stream-not-found` when it does not exist."))
+     it is gone and rejects with `:type :stream-not-found` when it does not exist.")
+  (-list-streams [ctx]
+    "Return a native promise of a vector of the normalized StreamInfo maps for
+     every Stream on the server.")
+  (-stream-names [ctx]
+    "Return a native promise of a vector of every Stream name on the server — the
+     dedicated names endpoint both native clients expose (unlike consumer names,
+     which the facade derives), so the listing never pays for full infos."))
 
 (defprotocol ConsumerManager
   "JetStream consumer management (ADR 0017), the management-plane verbs for durable

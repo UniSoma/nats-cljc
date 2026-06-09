@@ -67,6 +67,36 @@
       (impl/then (fn [_] (stream/validate-name name)))
       (impl/bind (fn [_] (proto/-stream-info ctx name)))))
 
+(defn update-stream
+  "Update an existing Stream's configuration on the JetStream context `ctx` from the
+   portable, CLOSED kebab `config` map (same keys as `create-stream`, `:name`
+   naming the Stream to change), returning a platform-native promise that resolves
+   to the normalized StreamInfo map carrying the new active config. The keys
+   present are MERGED over the Stream's current config — an absent key keeps its
+   current value rather than reverting to a server default — so a retention or
+   limit can change without restating the whole config (ADR 0020). The map is
+   closed: an unrecognized key rejects pre-flight with a validation `:type
+   :unknown-config-key`, and a malformed `:name` with `:invalid-name` (ADR 0015).
+   The promise rejects with an operational `:type :stream-not-found` when no such
+   Stream exists, and `:jetstream-api-error` carrying `{:code :description}` when
+   the server rejects the change (e.g. an immutable field) (ADR 0020)."
+  [ctx config]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-config config)))
+      (impl/bind (fn [_] (proto/-update-stream ctx config)))))
+
+(defn purge-stream
+  "Purge every message from the Stream named `name` on the JetStream context `ctx`,
+   keeping the Stream definition itself, returning a platform-native promise that
+   resolves to `{:purged <count>}` — the number of messages the server dropped. The
+   promise rejects with an operational `:type :stream-not-found` when no such
+   Stream exists, and pre-flight with a validation `:type :invalid-name` when
+   `name` is malformed (ADR 0015/0020)."
+  [ctx name]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (stream/validate-name name)))
+      (impl/bind (fn [_] (proto/-purge-stream ctx name)))))
+
 (defn delete-stream
   "Delete the Stream named `name` on the JetStream context `ctx`, returning a
    platform-native promise that resolves to nil once it is gone. The promise
@@ -77,6 +107,21 @@
   (-> (impl/resolved nil)
       (impl/then (fn [_] (stream/validate-name name)))
       (impl/bind (fn [_] (proto/-delete-stream ctx name)))))
+
+(defn list-streams
+  "Enumerate the Streams on the server through the JetStream context `ctx`,
+   returning a platform-native promise that resolves to a vector of normalized
+   StreamInfo maps (see `create-stream`), one per Stream."
+  [ctx]
+  (proto/-list-streams ctx))
+
+(defn stream-names
+  "Enumerate the Stream names on the server through the JetStream context `ctx`,
+   returning a platform-native promise that resolves to a vector of name strings.
+   Unlike `consumer-names`, this rides each leg's dedicated names endpoint rather
+   than deriving from `list-streams`, so it never pays for full infos."
+  [ctx]
+  (proto/-stream-names ctx))
 
 (defn create-consumer
   "Create a durable Consumer on the Stream named `stream` through the JetStream context

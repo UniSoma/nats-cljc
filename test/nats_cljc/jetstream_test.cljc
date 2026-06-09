@@ -702,6 +702,135 @@
                         (p/catch (fn [e] (is (= :stream-not-found (:type (ex-data e)))
                                              "stream-info after delete surfaces :stream-not-found")))))))))))
 
+;; Integration (ADR 0020), on the JetStream-enabled :4222 server: update-stream
+;; changes an existing Stream's config without recreating it — the key present
+;; (:max-age-ms) takes the new value while the absent keys (:subjects, :retention)
+;; keep their CURRENT values, the merge semantics both legs share (nats.js merges
+;; natively; the JVM leg reproduces the read-merge-write) — verified through an
+;; independent stream-info read-back. An update against a missing Stream surfaces
+;; the operational :stream-not-found, same as info/delete. Cleans up.
+(deftest stream-update-changes-config
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "UTRACER" :subjects ["utracer.>"] :storage :memory
+                                          :retention :work-queue :max-age-ms 60000}) 5000 ::timeout)
+           (with-stream ctx "UTRACER"
+             (fn []
+               (let [updated (deref (jet/update-stream ctx {:name "UTRACER" :max-age-ms 120000}) 5000 ::timeout)
+                     info    (deref (jet/stream-info ctx "UTRACER") 5000 ::timeout)]
+                 (is (= 120000 (get-in updated [:config :max-age-ms])) "update-stream returns the new active config")
+                 (is (= 120000 (get-in info [:config :max-age-ms])) "stream-info confirms the changed key")
+                 (is (= ["utracer.>"] (get-in info [:config :subjects])) "a key absent from the update keeps its current value")
+                 (is (= :work-queue (get-in info [:config :retention])) "the current retention survives the merge")
+                 (is (= :stream-not-found (:type (ex-data (reject-reason (jet/update-stream ctx {:name "NO_SUCH_STREAM"})))))
+                     "updating a missing stream surfaces :stream-not-found")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "UTRACER" :subjects ["utracer.>"] :storage :memory
+                                                    :retention :work-queue :max-age-ms 60000})]
+                  (with-stream ctx "UTRACER"
+                    (fn []
+                      (p/let [updated (jet/update-stream ctx {:name "UTRACER" :max-age-ms 120000})
+                              info    (jet/stream-info ctx "UTRACER")]
+                        (is (= 120000 (get-in updated [:config :max-age-ms])) "update-stream returns the new active config")
+                        (is (= 120000 (get-in info [:config :max-age-ms])) "stream-info confirms the changed key")
+                        (is (= ["utracer.>"] (get-in info [:config :subjects])) "a key absent from the update keeps its current value")
+                        (is (= :work-queue (get-in info [:config :retention])) "the current retention survives the merge")
+                        (-> (jet/update-stream ctx {:name "NO_SUCH_STREAM"})
+                            (p/then (fn [_] (is false "expected :stream-not-found for a missing stream")))
+                            (p/catch (fn [e] (is (= :stream-not-found (:type (ex-data e)))
+                                                 "updating a missing stream surfaces :stream-not-found")))))))))))))
+
+;; Integration (ADR 0020): purge-stream drops a Stream's messages while keeping its
+;; definition — it resolves to {:purged <count>}, a subsequent stream-info still
+;; resolves (the Stream survives) and shows zero messages. Same on both legs; cleans up.
+(deftest stream-purge-drops-messages-keeps-stream
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "PTRACER" :subjects ["ptracer.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "PTRACER"
+             (fn []
+               (deref (jet/publish ctx "ptracer.a" {:n 1}) 5000 ::timeout)
+               (deref (jet/publish ctx "ptracer.b" {:n 2}) 5000 ::timeout)
+               (is (= 2 (get-in (deref (jet/stream-info ctx "PTRACER") 5000 ::timeout) [:state :messages]))
+                   "both publishes landed before the purge")
+               (is (= {:purged 2} (deref (jet/purge-stream ctx "PTRACER") 5000 ::timeout))
+                   "purge-stream resolves to the purged count")
+               (let [info (deref (jet/stream-info ctx "PTRACER") 5000 ::timeout)]
+                 (is (= 0 (get-in info [:state :messages])) "the purge dropped every message")
+                 (is (= "PTRACER" (get-in info [:config :name])) "the stream definition survives the purge")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "PTRACER" :subjects ["ptracer.>"] :storage :memory})]
+                  (with-stream ctx "PTRACER"
+                    (fn []
+                      (p/let [_      (jet/publish ctx "ptracer.a" {:n 1})
+                              _      (jet/publish ctx "ptracer.b" {:n 2})
+                              before (jet/stream-info ctx "PTRACER")
+                              purged (jet/purge-stream ctx "PTRACER")
+                              info   (jet/stream-info ctx "PTRACER")]
+                        (is (= 2 (get-in before [:state :messages])) "both publishes landed before the purge")
+                        (is (= {:purged 2} purged) "purge-stream resolves to the purged count")
+                        (is (= 0 (get-in info [:state :messages])) "the purge dropped every message")
+                        (is (= "PTRACER" (get-in info [:config :name])) "the stream definition survives the purge"))))))))))
+
+;; Integration (ADR 0020): list-streams enumerates the server's Streams as normalized
+;; StreamInfo maps and stream-names returns the names (each leg's dedicated names
+;; endpoint). Two streams prove the enumeration; assertions are subset-based so a
+;; stream another test leaks can't fail this one. Cleans up both.
+(deftest stream-list-and-names
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "LTRACER_ONE" :subjects ["ltone.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "LTRACER_ONE"
+             (fn []
+               (deref (jet/create-stream ctx {:name "LTRACER_TWO" :subjects ["lttwo.>"] :storage :memory}) 5000 ::timeout)
+               (with-stream ctx "LTRACER_TWO"
+                 (fn []
+                   (let [infos (deref (jet/list-streams ctx) 5000 ::timeout)
+                         names (deref (jet/stream-names ctx) 5000 ::timeout)
+                         ours  (filter (comp #{"LTRACER_ONE" "LTRACER_TWO"} :name :config) infos)]
+                     (is (= 2 (count ours)) "list-streams enumerates both created streams")
+                     (is (every? #(re-matches canonical-ts-re (:created %)) ours)
+                         "each enumerated info carries the canonical :created timestamp")
+                     (is (= #{["ltone.>"] ["lttwo.>"]} (set (map (comp :subjects :config) ours)))
+                         "each enumerated info carries its normalized config")
+                     (is (every? (set names) ["LTRACER_ONE" "LTRACER_TWO"])
+                         "stream-names returns both created names")))))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "LTRACER_ONE" :subjects ["ltone.>"] :storage :memory})]
+                  (with-stream ctx "LTRACER_ONE"
+                    (fn []
+                      (p/let [_ (jet/create-stream ctx {:name "LTRACER_TWO" :subjects ["lttwo.>"] :storage :memory})]
+                        (with-stream ctx "LTRACER_TWO"
+                          (fn []
+                            (p/let [infos (jet/list-streams ctx)
+                                    names (jet/stream-names ctx)]
+                              (let [ours (filter (comp #{"LTRACER_ONE" "LTRACER_TWO"} :name :config) infos)]
+                                (is (= 2 (count ours)) "list-streams enumerates both created streams")
+                                (is (every? #(re-matches canonical-ts-re (:created %)) ours)
+                                    "each enumerated info carries the canonical :created timestamp")
+                                (is (= #{["ltone.>"] ["lttwo.>"]} (set (map (comp :subjects :config) ours)))
+                                    "each enumerated info carries its normalized config")
+                                (is (every? (set names) ["LTRACER_ONE" "LTRACER_TWO"])
+                                    "stream-names returns both created names"))))))))))))))
+
 ;; A stream the consumer integration tests hang their durable consumers off. Its
 ;; subjects cover the consumer config's two filter subjects. :memory so a skipped
 ;; teardown vanishes on restart.

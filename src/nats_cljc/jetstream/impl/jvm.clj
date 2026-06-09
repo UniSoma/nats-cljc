@@ -23,7 +23,7 @@
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions ConsumerContext FetchConsumer FetchConsumeOptions ConsumeOptions ConsumeOptions$Builder MessageConsumer MessageHandler Message]
            [io.nats.client.impl NatsJetStreamMetaData]
-           [io.nats.client.api ServerInfo StreamConfiguration StorageType RetentionPolicy StreamInfo StreamState PublishAck ConsumerConfiguration AckPolicy DeliverPolicy ConsumerInfo SequenceInfo]
+           [io.nats.client.api ServerInfo StreamConfiguration StreamConfiguration$Builder StorageType RetentionPolicy StreamInfo StreamState PublishAck PurgeResponse ConsumerConfiguration AckPolicy DeliverPolicy ConsumerInfo SequenceInfo]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
            [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
@@ -185,23 +185,31 @@
         (ex-info "Connection is closed" {:type :connection-closed}))))
    identity))
 
+(defn- apply-stream-config
+  "Apply the keys present in the portable closed kebab `config` onto the jnats
+   StreamConfiguration builder `b` (ADR 0020) — the shared half of create (a fresh
+   builder, so an absent key takes the server default) and update (a builder seeded
+   from the current config, so an absent key keeps its current value). The enum
+   keywords route through the shared wire tables and `:max-age-ms` becomes a
+   Duration (the CLJS leg uses Nanos)."
+  ^StreamConfiguration [^StreamConfiguration$Builder b config]
+  (.name b ^String (:name config))
+  (when-let [subjects (:subjects config)]
+    (.subjects b ^"[Ljava.lang.String;" (into-array String subjects)))
+  (when-let [storage (:storage config)]
+    (.storageType b (StorageType/get (stream/storage->wire storage))))
+  (when-let [retention (:retention config)]
+    (.retentionPolicy b (RetentionPolicy/get (stream/retention->wire retention))))
+  (when-let [max-age-ms (:max-age-ms config)]
+    (.maxAge b (Duration/ofMillis max-age-ms)))
+  (.build b))
+
 (defn ->stream-config
   "Build a jnats StreamConfiguration from the portable closed kebab `config`
    (ADR 0020). Only the keys present are set, so an absent key takes the server
-   default; the enum keywords route through the shared wire tables and
-   `:max-age-ms` becomes a Duration (the CLJS leg uses Nanos)."
+   default (see `apply-stream-config`)."
   ^StreamConfiguration [config]
-  (let [b (StreamConfiguration/builder)]
-    (.name b ^String (:name config))
-    (when-let [subjects (:subjects config)]
-      (.subjects b ^"[Ljava.lang.String;" (into-array String subjects)))
-    (when-let [storage (:storage config)]
-      (.storageType b (StorageType/get (stream/storage->wire storage))))
-    (when-let [retention (:retention config)]
-      (.retentionPolicy b (RetentionPolicy/get (stream/retention->wire retention))))
-    (when-let [max-age-ms (:max-age-ms config)]
-      (.maxAge b (Duration/ofMillis max-age-ms)))
-    (.build b)))
+  (apply-stream-config (StreamConfiguration/builder) config))
 
 (defn stream-config->map
   "Read a jnats StreamConfiguration back into the normalized portable kebab map —
@@ -332,14 +340,36 @@
    :duplicate (.isDuplicate a)
    :domain    (.getDomain a)})
 
+(defn- merged-stream-config
+  "Build the full StreamConfiguration an update sends: read the Stream's current
+   config from the server and apply the portable `config`'s keys over it, so an
+   absent key keeps its current value — the read-merge-write nats.js' `update` does
+   natively, reproduced here for identical merge semantics (ADR 0020). The read
+   raises 10059 ⇒ `:stream-not-found` for a missing Stream, exactly as the update
+   itself would."
+  ^StreamConfiguration [^JetStreamManagement jsm config]
+  (let [current (.getConfiguration (.getStreamInfo jsm ^String (:name config)))]
+    (apply-stream-config (StreamConfiguration/builder current) config)))
+
 (extend-type JvmJetStreamContext
   proto/StreamManager
   (-create-stream [ctx config]
     (off-thread (:io-executor ctx) #(stream-info->map (.addStream ^JetStreamManagement (:jsm ctx) (->stream-config config)))))
+  (-update-stream [ctx config]
+    (off-thread (:io-executor ctx)
+                #(let [^JetStreamManagement jsm (:jsm ctx)]
+                   (stream-info->map (.updateStream jsm (merged-stream-config jsm config))))))
   (-stream-info [ctx name]
     (off-thread (:io-executor ctx) #(stream-info->map (.getStreamInfo ^JetStreamManagement (:jsm ctx) ^String name))))
+  (-purge-stream [ctx name]
+    (off-thread (:io-executor ctx) #(let [^PurgeResponse r (.purgeStream ^JetStreamManagement (:jsm ctx) ^String name)]
+                                      {:purged (.getPurged r)})))
   (-delete-stream [ctx name]
-    (off-thread (:io-executor ctx) #(do (.deleteStream ^JetStreamManagement (:jsm ctx) ^String name) nil))))
+    (off-thread (:io-executor ctx) #(do (.deleteStream ^JetStreamManagement (:jsm ctx) ^String name) nil)))
+  (-list-streams [ctx]
+    (off-thread (:io-executor ctx) #(mapv stream-info->map (.getStreams ^JetStreamManagement (:jsm ctx)))))
+  (-stream-names [ctx]
+    (off-thread (:io-executor ctx) #(vec (.getStreamNames ^JetStreamManagement (:jsm ctx))))))
 
 (extend-type JvmJetStreamContext
   proto/ConsumerManager
