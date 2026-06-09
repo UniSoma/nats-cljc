@@ -4,7 +4,14 @@
    canonical operational `:type` is a single portable lookup — the JetStream
    sibling of `nats-cljc.error`'s server-error classifier. Seeded with the Phase-2
    entry point's code, the Stream/Consumer tracers' not-found codes, and acked
-   publish's wrong-last-sequence; later slices add rows.")
+   publish's wrong-last-sequence; later slices add rows.
+
+   Also home to the consume side-band classifier: the 409 statuses the server
+   issues against an open pull are the same wire values on both legs (jnats hands
+   the raw Status through its ErrorListener, nats.js through its consume status
+   events), so classifying them into the per-consume operational `:type`s is one
+   shared, case-insensitive table too (ADR 0020)."
+  (:require [clojure.string :as str]))
 
 (def ^:private err-code->type
   "JetStream API `err_code` → canonical operational `:type` (ADR 0020)."
@@ -28,3 +35,48 @@
    exception carried it."
   [code description]
   {:type (api-error-type code) :code code :description description})
+
+(defn side-band-type
+  "Classify a consume-time side-band status — a 409 the server issues against an
+   open pull — into its canonical operational `:type` (ADR 0020): `consumer
+   deleted` is `:consumer-deleted`, `stream deleted` reuses `:stream-not-found`
+   (a backing-stream loss), the `exceeded max*` family and `message size exceeds
+   maxbytes` collapse into `:exceeded-limits`, and any other status falls to the
+   `:jetstream-api-error` catch-all. Case-insensitive on purpose: the wire values
+   are identical on both legs, but jnats surfaces them title-cased (`Consumer
+   Deleted`) where nats.js lowercases — one shared table must absorb both."
+  [code description]
+  (let [d (str/lower-case (or description ""))]
+    (if (= 409 code)
+      (cond
+        (= d "consumer deleted")                  :consumer-deleted
+        (= d "stream deleted")                    :stream-not-found
+        (str/starts-with? d "exceeded max")       :exceeded-limits
+        (= d "message size exceeds maxbytes")     :exceeded-limits
+        :else                                     :jetstream-api-error)
+      :jetstream-api-error)))
+
+(defn side-band-error
+  "Build the portable ex-info for a consume side-band status from its `code` and
+   `description` (ADR 0020): the classified `:type` plus the raw `:code` and
+   `:description`, one shared shape so both legs deliver the condition to a
+   consume's `:on-error` identically."
+  [code description]
+  (ex-info (str "Consume side-band status: " description)
+           {:type (side-band-type code description) :code code :description description}))
+
+(defn side-band-terminal?
+  "Is a classified side-band `:type` terminal — the consumer or its backing stream
+   is gone, so the consume cannot continue and its handle completes (ADR 0020)?
+   `:heartbeats-missed` and `:exceeded-limits` are conditions a consume can ride
+   out; these are not."
+  [type]
+  (contains? #{:consumer-deleted :stream-not-found :consumer-not-found} type))
+
+(defn heartbeats-missed-error
+  "Build the portable ex-info for the client-side missed-idle-heartbeats condition
+   (ADR 0020). Synthesized by each native client's own monitor rather than read
+   off the wire, so it carries no status code — a bare `{:type ...}` keeps the two
+   legs byte-identical."
+  []
+  (ex-info "Idle heartbeats missed" {:type :heartbeats-missed}))

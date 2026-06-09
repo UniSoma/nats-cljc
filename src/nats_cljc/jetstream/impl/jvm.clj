@@ -23,6 +23,7 @@
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions BaseConsumerContext OrderedConsumerContext StreamContext FetchConsumer FetchConsumeOptions ConsumeOptions ConsumeOptions$Builder MessageConsumer MessageHandler Message]
            [io.nats.client.impl NatsJetStreamMetaData]
+           [io.nats.client.support Status]
            [io.nats.client.api ServerInfo StreamConfiguration StreamConfiguration$Builder StorageType RetentionPolicy StreamInfo StreamState PublishAck PurgeResponse ConsumerConfiguration ConsumerConfiguration$Builder AckPolicy DeliverPolicy ConsumerInfo SequenceInfo OrderedConsumerConfiguration]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
@@ -40,7 +41,11 @@
 ;; runs there instead of the shared commonPool (the connection owns its lifecycle).
 ;; `client` is the owning jnats Connection, carried so consume handles can consult
 ;; its status as a liveness input (ADR 0022's "connection ends it" clause).
-(defrecord JvmJetStreamContext [^JetStream js ^JetStreamManagement jsm codec ^ExecutorService io-executor ^Connection client])
+;; `registry` is the connection's sink registry: the consume verbs register their
+;; side-band sinks there under `[stream consumer]` so the connection-level
+;; ErrorListener can route jnats' heartbeat-alarm / pull-status callbacks back to
+;; the per-consume `:on-error` (ADR 0020 — the slow-consumer routing row).
+(defrecord JvmJetStreamContext [^JetStream js ^JetStreamManagement jsm codec ^ExecutorService io-executor ^Connection client registry])
 
 (defn verify-io-type
   "Classify the `IOException` jnats raises when the forced `$JS.API.INFO` round-trip
@@ -117,7 +122,7 @@
                                         "JetStream INFO request timed out"
                                         "JetStream is not enabled on the server or account")
                                       {:type (verify-io-type available?)} e)))))
-                (->JvmJetStreamContext js jsm (:codec conn) io-executor client))
+                (->JvmJetStreamContext js jsm (:codec conn) io-executor client (:registry conn)))
               (catch IOException e
                 ;; Reached ONLY from the construction above (ensureNotClosing on a
                 ;; non-open connection): the round-trip IOException is already
@@ -485,15 +490,23 @@
    client derives its heartbeat from the expires window — so the knob is accepted
    portably but the cadence here is native (ADR 0006 shape-not-cadence).
 
-   thresholdPercent/expiresIn are inherited from jnats' PROTECTED BaseConsumeOptions
-   Builder with no public-subclass override (unlike FetchConsumeOptions' builder),
-   so plain interop falls back to reflection and dies on the non-public declaring
-   class; the param-tagged qualified calls resolve them through the public
-   ConsumeOptions$Builder instead — re-verify on any jnats bump (pinned 2.25.3)."
+   thresholdPercent/expiresIn/raiseStatusWarnings are inherited from jnats'
+   PROTECTED BaseConsumeOptions Builder with no public-subclass override (unlike
+   FetchConsumeOptions' builder), so plain interop falls back to reflection and
+   dies on the non-public declaring class; the param-tagged qualified calls resolve
+   them through the public ConsumeOptions$Builder instead — re-verify on any jnats
+   bump (pinned 2.25.3).
+
+   raiseStatusWarnings is always on: jnats gates the warning-grade 409s (the
+   `Exceeded Max*` family) behind it, and those are exactly the `:exceeded-limits`
+   side-band conditions the consume's `:on-error` must see (ADR 0020); without a
+   registered sink the callback is dropped at the registry, so enabling it costs
+   an unsinked consume nothing."
   ^ConsumeOptions [{:keys [batch threshold expires-ms max-bytes]}]
   (let [bm (int (or batch pull/default-batch))
         ^ConsumeOptions$Builder b (ConsumeOptions/builder)]
     (.batchSize b bm)
+    (^[boolean] ConsumeOptions$Builder/.raiseStatusWarnings b true)
     (when threshold (^[int] ConsumeOptions$Builder/.thresholdPercent b (int (refill/threshold->percent threshold bm))))
     (when expires-ms (^[long] ConsumeOptions$Builder/.expiresIn b (long expires-ms)))
     (when max-bytes (.batchBytes b (long max-bytes)))
@@ -517,7 +530,7 @@
 ;; Drainable/Sub shape core's JvmSubscription gives a Subscription, so the core
 ;; facade's drain/unsubscribe dispatch over it unchanged. There is no slow-consumer
 ;; registry to clean up — pull has no :slow-consumer (ADR 0018).
-(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor drain-deadline-ms closed? conn-closed?]
+(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor drain-deadline-ms closed? conn-closed? unregister!]
   proto/Drainable
   ;; stop() ends new pulls but lets buffered messages deliver and the open pull
   ;; wind down; jnats flags isFinished then, with no future to wait on, so the
@@ -528,8 +541,13 @@
   ;; plus a flush grace): a handler whose returned promise never settles parks the
   ;; dispatcher so isFinished never flips, and without the deadline the loop would
   ;; spin and leak the IO thread for the process lifetime; at the deadline it gives
-  ;; up (false) and releases the thread.
+  ;; up (false) and releases the thread. `closed?` also finishes the poll: a consume
+  ;; a terminal side-band condition already ended (ADR 0020) has nothing left to
+  ;; wind down, so its drain settles now instead of spinning to the deadline.
+  ;; Release the side-band sink at drain initiation, like core's -drain dissocs the
+  ;; slow-consumer registry entry, so a drained consume leaks no sink (ADR 0006).
   (-drain [_]
+    (unregister!)
     (.stop mc)
     (off-thread
      io-executor
@@ -537,7 +555,7 @@
        (let [deadline (+ (System/currentTimeMillis) drain-deadline-ms)]
          (loop []
            (cond
-             (.isFinished mc)                         true
+             (or (.isFinished mc) @closed?)           true
              (>= (System/currentTimeMillis) deadline) false
              :else                                    (do (Thread/sleep 50) (recur))))))))
   proto/Sub
@@ -566,6 +584,7 @@
     (when max
       (throw (ex-info "consume handles do not support an auto-unsubscribe max"
                       {:type :invalid-max :max max})))
+    (unregister!)
     (try (.close mc) (catch Exception _ nil))
     (reset! closed? true)
     nil))
@@ -597,6 +616,15 @@
           (persistent! acc)))
       (finally (.close fc)))))
 
+(defn- sink!
+  "Deliver `e` to a consume's `:on-error` sink, swallowing a throwing sink (the
+   ADR 0007 route-error! precedent — this runs inside jnats callbacks, where a
+   rethrow would escape into the client's own threads). A nil sink drops the
+   error: side-band conditions are per-consume only, never `:on-status` (ADR 0020)."
+  [on-error e]
+  (when on-error
+    (try (on-error e) (catch Exception _ nil))))
+
 (defn- start-consume
   "Start a continuous consume on a jnats consumer context (`BaseConsumerContext`, as
    `next-msg`) and wrap it in the JvmConsumeHandle. Road 2 (ADR 0007/0018):
@@ -605,26 +633,66 @@
    promise-return backpressure fall out, and the backlog gates jnats' OWN refill
    (pendingUpdated never fires past a blocked handler), so the read rate bounds the
    pull rate with nothing overflowing. Blocking — runs inside the callers'
-   off-thread."
-  [^BaseConsumerContext cctx opts handler ^ExecutorService io-executor ^Connection client]
-  (let [mh (reify MessageHandler
-             (onMessage [_ msg]
-               (try
-                 (let [r (handler (js-msg->raw msg))]
-                   (when (instance? CompletionStage r)
-                     (.join (.toCompletableFuture ^CompletionStage r))))
-                 ;; Catch Exception, not Throwable (the core -subscribe
-                 ;; precedent): a handler/decode failure must not re-raise
-                 ;; into jnats' dispatch loop. Routing it to a per-consume
-                 ;; :on-error is the consume error-model follow-up; until
-                 ;; that lands the failure is contained and delivery
-                 ;; continues.
-                 (catch Exception _ nil))))]
-    (->JvmConsumeHandle (.consume cctx (->consume-options opts) mh)
+   off-thread.
+
+   A handler throw or a decode failure is contained (never re-raised into jnats'
+   dispatch loop) and routed to the per-consume `:on-error` in `opts`; delivery
+   continues — the consume sibling of core -subscribe's route, minus the
+   `:on-status` fallback (every consume failure stays per-consume, ADR 0020).
+
+   `reg-key` (`[stream consumer]`, named consumes only) registers the side-band
+   sinks in the connection `registry` the ErrorListener routes through (ADR 0020):
+   a heartbeat alarm and the warning-grade 409s deliver their normalized error and
+   the consume rides on; a terminal 409 — the consumer or its backing stream is
+   gone — additionally ENDS the consume, completing the handle, because jnats
+   itself never stops a consume whose consumer was deleted (it would re-pull into
+   the same 409 forever). nil `reg-key` (the ordered path, whose ephemeral's name
+   jnats owns and recreates) skips registration."
+  [^BaseConsumerContext cctx opts handler ^ExecutorService io-executor ^Connection client registry reg-key]
+  (let [on-error (:on-error opts)
+        closed?  (atom false)
+        mh       (reify MessageHandler
+                   (onMessage [_ msg]
+                     (try
+                       (let [r (handler (js-msg->raw msg))]
+                         (when (instance? CompletionStage r)
+                           (.join (.toCompletableFuture ^CompletionStage r))))
+                       ;; Catch Exception, not Throwable (the core -subscribe
+                       ;; precedent): a JVM Error still propagates.
+                       (catch Exception e (sink! on-error e)))))
+        ^MessageConsumer mc (.consume cctx (->consume-options opts) mh)
+        token    (Object.)
+        unregister! (fn []
+                      (when reg-key
+                        (swap! registry
+                               (fn [r]
+                                 (let [entries (dissoc (get r reg-key) token)]
+                                   (if (seq entries)
+                                     (assoc r reg-key entries)
+                                     (dissoc r reg-key)))))))
+        ;; Terminal side-band end: deliver first, then close the underlying pull
+        ;; subscription (dropping its buffer — un-acked, so a recreated consumer
+        ;; would redeliver) and flip `closed?` so -active? reports false and a
+        ;; later drain settles immediately.
+        terminate! (fn [e]
+                     (sink! on-error e)
+                     (unregister!)
+                     (try (.close mc) (catch Exception _ nil))
+                     (reset! closed? true))]
+    (when reg-key
+      (swap! registry assoc-in [reg-key token]
+             {:heartbeat-alarm! (fn [] (sink! on-error (jet-err/heartbeats-missed-error)))
+              :pull-status!     (fn [^Status status]
+                                  (let [e (jet-err/side-band-error (.getCode status) (.getMessage status))]
+                                    (if (jet-err/side-band-terminal? (:type (ex-data e)))
+                                      (terminate! e)
+                                      (sink! on-error e))))}))
+    (->JvmConsumeHandle mc
                         io-executor
                         (->drain-deadline-ms opts)
-                        (atom false)
-                        (fn [] (= Connection$Status/CLOSED (.getStatus client))))))
+                        closed?
+                        (fn [] (= Connection$Status/CLOSED (.getStatus client)))
+                        unregister!)))
 
 ;; The Ordered consumer pull handle: jnats' OrderedConsumerContext (server-managed
 ;; ephemeral, ack policy none, recreated on a sequence gap) plus the context state
@@ -666,7 +734,7 @@
     (off-thread
      (:io-executor ctx)
      #(start-consume (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
-                     opts handler (:io-executor ctx) (:client ctx))))
+                     opts handler (:io-executor ctx) (:client ctx) (:registry ctx) [stream consumer])))
   (-js-ordered-consumer [ctx stream opts]
     ;; getStreamContext round-trips stream info (a missing stream surfaces as a
     ;; JetStreamApiException → :stream-not-found via off-thread, matching the
@@ -689,4 +757,4 @@
     (off-thread (:io-executor oc) #(fetch-batch (:occ oc) opts)))
   (-oc-consume [oc opts handler]
     (off-thread (:io-executor oc)
-                #(start-consume (:occ oc) opts handler (:io-executor oc) (:client oc)))))
+                #(start-consume (:occ oc) opts handler (:io-executor oc) (:client oc) nil nil))))

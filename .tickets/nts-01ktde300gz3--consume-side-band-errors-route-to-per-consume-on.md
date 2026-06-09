@@ -1,12 +1,12 @@
 ---
 id: nts-01ktde300gz3
 title: Consume side-band errors route to per-consume :on-error
-status: open
+status: in_progress
 type: feature
 priority: 2
 mode: afk
 created: '2026-06-06T03:02:10.188611974Z'
-updated: '2026-06-09T22:19:06.241572827Z'
+updated: '2026-06-09T23:30:05.124712180Z'
 parent: nts-01ktdcwwhd76
 tags:
 - jetstream

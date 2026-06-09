@@ -53,6 +53,44 @@
   (is (= :jetstream-api-error (jet-err/api-error-type 99999))
       "an unseeded code defaults to the operational catch-all :jetstream-api-error"))
 
+;; Deep-module unit (ADR 0020), no server: the consume side-band classifier is one
+;; shared table over the 409 pull statuses both legs see on the wire — jnats hands
+;; them through its ErrorListener title-cased, nats.js lowercases — so the mapping
+;; must be case-insensitive and identical on both legs. A backing-stream loss
+;; reuses :stream-not-found; only a gone consumer/stream is terminal.
+(deftest side-band-classifier-maps-status-to-type
+  (is (= :consumer-deleted (jet-err/side-band-type 409 "Consumer Deleted"))
+      "the jnats title-cased consumer-deleted 409 classifies to :consumer-deleted")
+  (is (= :consumer-deleted (jet-err/side-band-type 409 "consumer deleted"))
+      "the nats.js lowercased twin classifies identically")
+  (is (= :stream-not-found (jet-err/side-band-type 409 "Stream Deleted"))
+      "a backing-stream loss reuses :stream-not-found")
+  (is (= :exceeded-limits (jet-err/side-band-type 409 "Exceeded MaxRequestBatch of 10"))
+      "an exceeded max-request-batch 409 classifies to :exceeded-limits")
+  (is (= :exceeded-limits (jet-err/side-band-type 409 "exceeded maxwaiting"))
+      "an exceeded max-waiting 409 classifies to :exceeded-limits")
+  (is (= :exceeded-limits (jet-err/side-band-type 409 "Exceeded MaxRequestExpires of 1s"))
+      "an exceeded max-request-expires 409 classifies to :exceeded-limits")
+  (is (= :exceeded-limits (jet-err/side-band-type 409 "Message Size Exceeds MaxBytes"))
+      "a message-size-exceeds-maxbytes 409 classifies to :exceeded-limits")
+  (is (= :jetstream-api-error (jet-err/side-band-type 409 "Consumer is push based"))
+      "an unrecognized 409 falls to the operational catch-all")
+  (is (= :jetstream-api-error (jet-err/side-band-type 400 "bad request"))
+      "a non-409 status falls to the operational catch-all")
+  (is (= {:type :consumer-deleted :code 409 :description "Consumer Deleted"}
+         (ex-data (jet-err/side-band-error 409 "Consumer Deleted")))
+      "the side-band ex-info carries the classified :type plus the raw :code and :description")
+  (is (= {:type :heartbeats-missed} (ex-data (jet-err/heartbeats-missed-error)))
+      "the client-synthesized heartbeats-missed condition is a bare {:type ...}")
+  (is (true? (jet-err/side-band-terminal? :consumer-deleted))
+      "a deleted consumer is terminal — the consume cannot continue")
+  (is (true? (jet-err/side-band-terminal? :stream-not-found))
+      "a lost backing stream is terminal")
+  (is (false? (jet-err/side-band-terminal? :heartbeats-missed))
+      "missed heartbeats are a condition a consume can ride out")
+  (is (false? (jet-err/side-band-terminal? :exceeded-limits))
+      "an exceeded limit is a condition a consume can ride out"))
+
 ;; Deep-module unit (ADR 0017), no server: the verify round-trip is a request, so
 ;; only a no-responder means "JetStream is off"; a transient timeout or a
 ;; closing/closed connection pass through as their core :type, identically on both
@@ -1550,7 +1588,7 @@
                       (isStopped [_] false)
                       (close [_] nil))
            executor (doto (Executors/newSingleThreadExecutor) (.shutdown))
-           handle   (jet-jvm/->JvmConsumeHandle mc executor 1000 (atom false) (constantly false))
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 1000 (atom false) (constantly false) (constantly nil))
            fut      (proto/-drain handle)]
        (is (true? @stopped?) "-drain stops the underlying consumer")
        (is (instance? CompletableFuture fut) "-drain returns a future, not a synchronous throw")
@@ -1571,7 +1609,7 @@
                       (isStopped [_] false)
                       (close [_] nil))
            executor (Executors/newSingleThreadExecutor)
-           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false) (constantly false))
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false) (constantly false) (constantly nil))
            settled  (deref (proto/-drain handle) 3000 ::timeout)]
        (.shutdownNow executor)
        (is (not= ::timeout settled)
@@ -1592,7 +1630,7 @@
                       (isStopped [_] true)
                       (close [_] nil))
            executor (Executors/newSingleThreadExecutor)
-           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false) (constantly false))
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false) (constantly false) (constantly nil))
            settled  (deref (proto/-drain handle) 3000 ::timeout)]
        (.shutdownNow executor)
        (is (false? settled) "a wind-down that never finishes settles false at the deadline")
@@ -1911,6 +1949,173 @@
                           (is hit? "a byte-bounded pull delivers every stored message")
                           (is (= [{:n 1} {:n 2} {:n 3}] @seen) "the byte window preserves stream order")
                           (nats/drain handle)))))))))))
+
+;; ADR 0020, integration on the :4222 JetStream server: deleting the Consumer
+;; mid-consume is the terminal side-band fault. The normalized :consumer-deleted
+;; reaches the consume's :on-error ONLY — the connection :on-status sees no :error
+;; event (the slow-consumer routing row) — and, being terminal, the consume ENDS:
+;; the handle goes inactive. One message is delivered first so the fault hits a
+;; live, established pull on both legs. Memory stream, cleans up.
+(deftest consume-consumer-deleted-routes-to-on-error
+  #?(:clj
+     (let [[statuses on-status] (status-collector)]
+       (with-conn {:servers [server-url] :on-status on-status}
+         (fn [conn]
+           (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+             (deref (jet/create-stream ctx {:name "SIDEBAND" :subjects ["sideband.>"] :storage :memory}) 5000 ::timeout)
+             (with-stream ctx "SIDEBAND"
+               (fn []
+                 (deref (jet/create-consumer ctx "SIDEBAND" {:name "SIDEBAND_C" :durable? true :ack-policy :explicit :filter-subjects ["sideband.a"]}) 5000 ::timeout)
+                 (deref (jet/publish ctx "sideband.a" {:n 1}) 5000 ::timeout)
+                 (let [seen   (atom [])
+                       errs   (atom [])
+                       handle (deref (jet/consume ctx "SIDEBAND" "SIDEBAND_C"
+                                                  (fn [m] (swap! seen conj (:data m)) (jet/ack conn m) nil)
+                                                  {:expires-ms 2000 :on-error (fn [e] (swap! errs conj e))})
+                                     5000 ::timeout)]
+                   (is (wait-for #(= 1 (count @seen)) 5000) "the consume is live before the fault")
+                   (deref (jet/delete-consumer ctx "SIDEBAND" "SIDEBAND_C") 5000 ::timeout)
+                   (is (wait-for #(some (fn [e] (= :consumer-deleted (:type (ex-data e)))) @errs) 5000)
+                       "deleting the consumer mid-consume delivers a normalized :consumer-deleted to the consume's :on-error")
+                   (is (wait-for #(false? (proto/-active? handle)) 5000)
+                       "the terminal condition completes the handle")
+                   (is (not-any? #(= :error (:type %)) @statuses)
+                       "the side-band condition never reaches the connection :on-status"))))))))
+     :cljs
+     (async done
+            (let [[statuses on-status] (status-collector)]
+              (with-conn {:servers [server-url] :on-status on-status} done
+                (fn [conn]
+                  (p/let [ctx (jet/jetstream conn)
+                          _   (jet/create-stream ctx {:name "SIDEBAND" :subjects ["sideband.>"] :storage :memory})]
+                    (with-stream ctx "SIDEBAND"
+                      (fn []
+                        (let [seen (atom [])
+                              errs (atom [])]
+                          (p/let [_      (jet/create-consumer ctx "SIDEBAND" {:name "SIDEBAND_C" :durable? true :ack-policy :explicit :filter-subjects ["sideband.a"]})
+                                  _      (jet/publish ctx "sideband.a" {:n 1})
+                                  handle (jet/consume ctx "SIDEBAND" "SIDEBAND_C"
+                                                      (fn [m] (swap! seen conj (:data m)) (jet/ack conn m) nil)
+                                                      {:expires-ms 2000 :on-error (fn [e] (swap! errs conj e))})
+                                  live?  (wait-for #(= 1 (count @seen)) 5000)
+                                  _      (jet/delete-consumer ctx "SIDEBAND" "SIDEBAND_C")
+                                  hit?   (wait-for #(some (fn [e] (= :consumer-deleted (:type (ex-data e)))) @errs) 5000)
+                                  done?  (wait-for #(false? (proto/-active? handle)) 5000)]
+                            (is live? "the consume is live before the fault")
+                            (is hit? "deleting the consumer mid-consume delivers a normalized :consumer-deleted to the consume's :on-error")
+                            (is done? "the terminal condition completes the handle")
+                            (is (not-any? #(= :error (:type %)) @statuses)
+                                "the side-band condition never reaches the connection :on-status"))))))))))))
+
+;; ADR 0020, integration on the :4222 JetStream server: the drop-if-unset half of
+;; the routing row. With NO :on-error on the consume, the same fault is silently
+;; dropped — nothing reaches the connection :on-status — yet the terminal
+;; condition still ENDS the consume: the handle completes whether or not a sink is
+;; set. Memory stream, cleans up.
+(deftest consume-consumer-deleted-without-on-error-still-completes
+  #?(:clj
+     (let [[statuses on-status] (status-collector)]
+       (with-conn {:servers [server-url] :on-status on-status}
+         (fn [conn]
+           (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+             (deref (jet/create-stream ctx {:name "SIDEBAND_DROP" :subjects ["sidebanddrop.>"] :storage :memory}) 5000 ::timeout)
+             (with-stream ctx "SIDEBAND_DROP"
+               (fn []
+                 (deref (jet/create-consumer ctx "SIDEBAND_DROP" {:name "SIDEBAND_DROP_C" :durable? true :ack-policy :explicit :filter-subjects ["sidebanddrop.a"]}) 5000 ::timeout)
+                 (deref (jet/publish ctx "sidebanddrop.a" {:n 1}) 5000 ::timeout)
+                 (let [seen   (atom [])
+                       handle (deref (jet/consume ctx "SIDEBAND_DROP" "SIDEBAND_DROP_C"
+                                                  (fn [m] (swap! seen conj (:data m)) (jet/ack conn m) nil)
+                                                  {:expires-ms 2000})
+                                     5000 ::timeout)]
+                   (is (wait-for #(= 1 (count @seen)) 5000) "the consume is live before the fault")
+                   (deref (jet/delete-consumer ctx "SIDEBAND_DROP" "SIDEBAND_DROP_C") 5000 ::timeout)
+                   (is (wait-for #(false? (proto/-active? handle)) 5000)
+                       "the terminal condition completes the handle even with no :on-error set")
+                   (is (not-any? #(= :error (:type %)) @statuses)
+                       "an unset :on-error drops the condition — it never falls back to :on-status"))))))))
+     :cljs
+     (async done
+            (let [[statuses on-status] (status-collector)]
+              (with-conn {:servers [server-url] :on-status on-status} done
+                (fn [conn]
+                  (p/let [ctx (jet/jetstream conn)
+                          _   (jet/create-stream ctx {:name "SIDEBAND_DROP" :subjects ["sidebanddrop.>"] :storage :memory})]
+                    (with-stream ctx "SIDEBAND_DROP"
+                      (fn []
+                        (let [seen (atom [])]
+                          (p/let [_      (jet/create-consumer ctx "SIDEBAND_DROP" {:name "SIDEBAND_DROP_C" :durable? true :ack-policy :explicit :filter-subjects ["sidebanddrop.a"]})
+                                  _      (jet/publish ctx "sidebanddrop.a" {:n 1})
+                                  handle (jet/consume ctx "SIDEBAND_DROP" "SIDEBAND_DROP_C"
+                                                      (fn [m] (swap! seen conj (:data m)) (jet/ack conn m) nil)
+                                                      {:expires-ms 2000})
+                                  live?  (wait-for #(= 1 (count @seen)) 5000)
+                                  _      (jet/delete-consumer ctx "SIDEBAND_DROP" "SIDEBAND_DROP_C")
+                                  done?  (wait-for #(false? (proto/-active? handle)) 5000)]
+                            (is live? "the consume is live before the fault")
+                            (is done? "the terminal condition completes the handle even with no :on-error set")
+                            (is (not-any? #(= :error (:type %)) @statuses)
+                                "an unset :on-error drops the condition — it never falls back to :on-status"))))))))))))
+
+;; ADR 0007/0020, integration on the :4222 JetStream server: a handler throw (or a
+;; decode failure — same containment site) is no longer swallowed silently: it
+;; reaches the same per-consume :on-error, and delivery CONTINUES — the consume
+;; survives its own handler, exactly like a core subscription survives its. The
+;; thrown value passes through unchanged (the consumer's own exception, no
+;; canonical :type). Memory stream, cleans up.
+(deftest consume-handler-throw-routes-to-on-error
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "SIDEBAND_THROW" :subjects ["sidebandthrow.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "SIDEBAND_THROW"
+             (fn []
+               (deref (jet/create-consumer ctx "SIDEBAND_THROW" {:name "SIDEBAND_THROW_C" :durable? true :ack-policy :explicit :filter-subjects ["sidebandthrow.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "sidebandthrow.a" {:n 1}) 5000 ::timeout)
+               (deref (jet/publish ctx "sidebandthrow.a" {:n 2}) 5000 ::timeout)
+               (let [seen   (atom [])
+                     errs   (atom [])
+                     handle (deref (jet/consume ctx "SIDEBAND_THROW" "SIDEBAND_THROW_C"
+                                                (fn [m]
+                                                  (swap! seen conj (:data m))
+                                                  (jet/ack conn m)
+                                                  (when (= 1 (:n (:data m)))
+                                                    (throw (ex-info "handler boom" {:boom true})))
+                                                  nil)
+                                                {:expires-ms 2000 :on-error (fn [e] (swap! errs conj e))})
+                                   5000 ::timeout)]
+                 (is (wait-for #(= [{:n 1} {:n 2}] @seen) 5000)
+                     "delivery continues past the throwing handler call")
+                 (is (wait-for #(= [{:boom true}] (mapv ex-data @errs)) 5000)
+                     "the handler's own throw reaches the per-consume :on-error unchanged")
+                 (nats/unsubscribe handle)))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "SIDEBAND_THROW" :subjects ["sidebandthrow.>"] :storage :memory})]
+                  (with-stream ctx "SIDEBAND_THROW"
+                    (fn []
+                      (let [seen (atom [])
+                            errs (atom [])]
+                        (p/let [_      (jet/create-consumer ctx "SIDEBAND_THROW" {:name "SIDEBAND_THROW_C" :durable? true :ack-policy :explicit :filter-subjects ["sidebandthrow.a"]})
+                                _      (jet/publish ctx "sidebandthrow.a" {:n 1})
+                                _      (jet/publish ctx "sidebandthrow.a" {:n 2})
+                                handle (jet/consume ctx "SIDEBAND_THROW" "SIDEBAND_THROW_C"
+                                                    (fn [m]
+                                                      (swap! seen conj (:data m))
+                                                      (jet/ack conn m)
+                                                      (when (= 1 (:n (:data m)))
+                                                        (throw (ex-info "handler boom" {:boom true})))
+                                                      nil)
+                                                    {:expires-ms 2000 :on-error (fn [e] (swap! errs conj e))})
+                                seen?  (wait-for #(= [{:n 1} {:n 2}] @seen) 5000)
+                                errs?  (wait-for #(= [{:boom true}] (mapv ex-data @errs)) 5000)]
+                          (is seen? "delivery continues past the throwing handler call")
+                          (is errs? "the handler's own throw reaches the per-consume :on-error unchanged")
+                          (nats/unsubscribe handle)))))))))))
 
 ;; ADR 0019, integration on the :4222 JetStream server: `ack` is sugar
 ;; over publish of +ACK to the message's ack subject — synchronous, returns nil, and

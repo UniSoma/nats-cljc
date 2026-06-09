@@ -4,7 +4,7 @@
   (:require [nats-cljc.auth :as auth]
             [nats-cljc.error :as error]
             [nats-cljc.protocol :as proto])
-  (:import [io.nats.client Nats Options Options$Builder Connection Connection$Status Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener]
+  (:import [io.nats.client Nats Options Options$Builder Connection Connection$Status Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener JetStreamSubscription]
            [io.nats.client.impl Headers]
            [java.nio.charset StandardCharsets]
            [java.time Duration]
@@ -331,6 +331,15 @@
         (when (and reconnect? (= :disconnected t))
           (on-status {:type :reconnecting}))))))
 
+(defn- js-sub-sinks
+  "The consume side-band sink entries registered under a JetStream subscription's
+   `[stream consumer]` names — the only public bridge from the JetStreamSubscription
+   jnats hands the ErrorListener callbacks back to the consume that owns it (the
+   MessageConsumer never exposes its subscription). An unregistered sub (no consume,
+   or one that set no sink) yields nothing, so the condition is dropped."
+  [registry ^JetStreamSubscription sub]
+  (vals (get @registry [(.getStreamName sub) (.getConsumerName sub)])))
+
 (defn error-listener
   "A connection-level ErrorListener (ADR 0006). `slowConsumerDetected` fires with
    only the native Consumer — the Dispatcher — so the dispatcher→sink `registry`
@@ -342,7 +351,15 @@
    must dissoc here too. `errorOccurred` is connection-level with no subscription
    identity, so a permissions/protocol error reaches `:on-status` as an `:error`
    event ONLY — never a per-sub override — and is dropped when no `:on-status` is
-   set. `:pending` is native-approximate."
+   set. `:pending` is native-approximate.
+
+   The three JetStream callbacks are the JVM seam for consume side-band conditions
+   (ADR 0020): jnats reports a missed-heartbeat alarm and the 409 pull statuses
+   here, at connection level, so the same registry carries `[stream consumer]`
+   keyed entries of sink functions the JetStream impl registers per consume. The
+   dispatch is deliberately generic — the entries own the normalization — so this
+   core ns stays JetStream-free; nothing here ever reaches `:on-status` (side-band
+   conditions are inherently per-consume, the slow-consumer routing row)."
   ^ErrorListener [on-status registry]
   (reify ErrorListener
     (slowConsumerDetected [_ _conn consumer]
@@ -350,6 +367,15 @@
         (on-error (ex-info "Slow consumer"
                            {:type :slow-consumer :subject subject :max-pending max-pending
                             :pending (.getPendingMessageCount ^Consumer consumer)}))))
+    (heartbeatAlarm [_ _conn sub _last-stream-seq _last-consumer-seq]
+      (doseq [{:keys [heartbeat-alarm!]} (js-sub-sinks registry sub)]
+        (when heartbeat-alarm! (heartbeat-alarm!))))
+    (pullStatusWarning [_ _conn sub status]
+      (doseq [{:keys [pull-status!]} (js-sub-sinks registry sub)]
+        (when pull-status! (pull-status! status))))
+    (pullStatusError [_ _conn sub status]
+      (doseq [{:keys [pull-status!]} (js-sub-sinks registry sub)]
+        (when pull-status! (pull-status! status))))
     (errorOccurred [_ _conn error]
       (when on-status
         (on-status {:type  :error

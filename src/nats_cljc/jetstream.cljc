@@ -376,6 +376,16 @@
    1000ms floor or not a whole number (ADR 0015) — and operationally with
    `:consumer-not-found` when no such Consumer exists (ADR 0020).
 
+   `:on-error` (named consumes) is the per-consume error sink (ADR 0020): the
+   consume-time side-band conditions — `:heartbeats-missed`, `:consumer-deleted`,
+   `:exceeded-limits`, with a backing-stream loss reusing `:stream-not-found` —
+   reach it as bare ex-infos, exactly like core's per-subscription
+   `:slow-consumer` row: this sink ONLY, dropped when unset, never the connection
+   `:on-status`. A handler throw or decode failure reaches the same sink, and
+   delivery continues. Terminal conditions (the Consumer or its backing Stream is
+   gone) additionally END the consume — the handle goes inactive — whether or not
+   `:on-error` is set.
+
    On the handle, `core/drain` stops new pulls and settles once the consume winds
    down (on the JVM buffered messages deliver first; on CLJS the buffer is
    discarded — un-acked, so the server redelivers them); `core/unsubscribe` ends it
@@ -403,7 +413,7 @@
        (impl/bind (fn [_]
                     (let [codec (core/effective-codec ctx opts)]
                       (proto/-js-consume ctx stream consumer
-                                         (select-keys opts [:batch :threshold :expires-ms :idle-heartbeat-ms :max-bytes])
+                                         (select-keys opts [:batch :threshold :expires-ms :idle-heartbeat-ms :max-bytes :on-error])
                                          (fn [raw] (handler (decode-js-msg codec raw))))))))))
 
 (defn- ack-publish!

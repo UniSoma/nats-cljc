@@ -385,15 +385,30 @@
    pulse, `:max-bytes` the `max_bytes` cap. nats.js forbids a user setting
    `max_messages` alongside `max_bytes`, so a byte window omits `max_messages`
    entirely (refill/validate-opts has already ruled out a `:batch`/`:threshold`
-   pairing); a message window sends `max_messages` as before. `clj->js` produces the
-   string-keyed object nats.js reads, surviving advanced compilation."
-  [{:keys [batch threshold expires-ms idle-heartbeat-ms max-bytes]}]
+   pairing); a message window sends `max_messages` as before. The internal
+   `:abort-on-missing-resource` (set by the NAMED consume path, never the ordered
+   one — recreation is the ordered contract) maps to nats.js'
+   `abort_on_missing_resource`, which ends the iterator when the consumer or its
+   backing stream is gone — the terminal side-band conditions completing the
+   handle (ADR 0020). `clj->js` produces the string-keyed object nats.js reads,
+   surviving advanced compilation."
+  [{:keys [batch threshold expires-ms idle-heartbeat-ms max-bytes abort-on-missing-resource]}]
   (clj->js (cond-> {}
              (not max-bytes)   (assoc :max_messages (or batch pull/default-batch))
              threshold         (assoc :threshold_messages threshold)
              expires-ms        (assoc :expires expires-ms)
              idle-heartbeat-ms (assoc :idle_heartbeat idle-heartbeat-ms)
-             max-bytes         (assoc :max_bytes max-bytes))))
+             max-bytes         (assoc :max_bytes max-bytes)
+             abort-on-missing-resource (assoc :abort_on_missing_resource true))))
+
+(defn- sink!
+  "Deliver `e` to a consume's `:on-error` sink, swallowing a throwing sink (the
+   ADR 0007 route funnel precedent — this runs inside the detached drive/status
+   loops). A nil sink drops the error: consume failures are per-consume only,
+   never `:on-status` (ADR 0020)."
+  [on-error e]
+  (when on-error
+    (try (on-error e) (catch :default _ nil))))
 
 (defn- drive-consume!
   "Drive a nats.js ConsumerMessages — the async-iterable `consume` resolves to —
@@ -402,11 +417,12 @@
    backpressure, and because nats.js refills from its OWN buffered count, the
    read rate gates the pull rate with nothing overflowing. The consume sibling of
    core's `consume!` and this ns's `drain-fetch`. The iterable completing
-   (close/stop) ends the loop and flips `active?` off; a handler/decode throw or
-   rejection is contained and the loop CONTINUES — routing it to a per-consume
-   :on-error is the consume error-model follow-up. The `.next` `.catch` swallows
-   the close-race like core's loop."
-  [^js cm handler active?]
+   (close/stop — including nats.js aborting on a terminal missing-resource
+   condition, whose normalized error the status pump delivers) ends the loop and
+   flips `active?` off; a handler/decode throw or rejection is contained, routed
+   to the per-consume `:on-error`, and the loop CONTINUES (ADR 0020). The `.next`
+   `.catch` swallows the close-race like core's loop."
+  [^js cm handler active? on-error]
   (let [it (.call (unchecked-get cm (.-asyncIterator js/Symbol)) cm)]
     (letfn [(step []
               (-> (.next it)
@@ -415,8 +431,48 @@
                              (reset! active? false)
                              (-> (js/Promise. (fn [resolve _] (resolve (handler (js-msg->raw (.-value res))))))
                                  (.then (fn [_] (step)))
-                                 (.catch (fn [_] (step)))))))
+                                 (.catch (fn [e] (sink! on-error e) (step)))))))
                   (.catch (fn [_] (reset! active? false)))))]
+      (step))))
+
+(defn- consume-status->error
+  "Normalize one nats.js consume status event into its portable side-band ex-info,
+   or nil for the event types that are not error conditions (debug/next/discard/
+   reset/recreation chatter). The 409-backed events (`consumer_deleted`,
+   `exceeded_limits`) carry the wire code+description, so they route through the
+   SHARED classifier — the same table the JVM leg feeds jnats' raw Status — and
+   the client-synthesized ones map directly: `heartbeats_missed` to the shared
+   bare `:heartbeats-missed`, `stream_not_found` to `:stream-not-found` (the
+   backing-stream loss reuse), `consumer_not_found` to `:consumer-not-found`
+   (ADR 0020)."
+  [^js ev]
+  (case (.-type ev)
+    "heartbeats_missed" (jet-err/heartbeats-missed-error)
+    ("consumer_deleted" "exceeded_limits") (jet-err/side-band-error (.-code ev) (.-description ev))
+    "stream_not_found" (ex-info "Stream not found"
+                                {:type :stream-not-found :stream (.-name ev)})
+    "consumer_not_found" (ex-info "Consumer not found"
+                                  {:type :consumer-not-found :stream (.-stream ev) :consumer (.-name ev)})
+    nil))
+
+(defn- pump-consume-status!
+  "Funnel a ConsumerMessages' side-band `status()` iterable onto the per-consume
+   `:on-error` (ADR 0020): each error-grade event normalizes via
+   `consume-status->error` and is delivered bare, exactly like core's
+   :slow-consumer routing row — never `:on-status`, never both. The consume
+   sibling of core's `pump-status!`; nats.js stops the listener iterator when the
+   consume ends, which settles `.next` done and ends the pump."
+  [^js cm on-error]
+  (let [statuses (.status cm)
+        it (.call (unchecked-get statuses (.-asyncIterator js/Symbol)) statuses)]
+    (letfn [(step []
+              (-> (.next it)
+                  (.then (fn [^js res]
+                           (when-not (.-done res)
+                             (when-some [e (consume-status->error (.-value res))]
+                               (sink! on-error e))
+                             (step))))
+                  (.catch (fn [_] nil))))]
       (step))))
 
 ;; The consume handle (ADR 0018): wraps nats.js' ConsumerMessages in the same
@@ -463,13 +519,18 @@
   "Start a continuous consume on a nats.js pull Consumer (named or ordered, as
    `next-msg`): consume() resolves the ConsumerMessages iterable the detached drive
    loop then owns, wrapped in the JsConsumeHandle. The handle resolves only after
-   the loop is running, so no delivery can race it."
+   the loop is running, so no delivery can race it. A per-consume `:on-error` in
+   `opts` starts the side-band status pump alongside the drive loop (ADR 0020);
+   without one, side-band conditions drop — termination on a terminal condition is
+   nats.js' own abort (see `->consume-options`), so it does not depend on a sink."
   [^js c opts handler]
-  (-> (.consume c (->consume-options opts))
-      (.then (fn [cm]
-               (let [active? (atom true)]
-                 (drive-consume! cm handler active?)
-                 (->JsConsumeHandle cm active?))))))
+  (let [on-error (:on-error opts)]
+    (-> (.consume c (->consume-options opts))
+        (.then (fn [cm]
+                 (let [active? (atom true)]
+                   (when on-error (pump-consume-status! cm on-error))
+                   (drive-consume! cm handler active? on-error)
+                   (->JsConsumeHandle cm active?)))))))
 
 ;; The Ordered consumer pull handle: nats.js' ordered pull Consumer (server-managed
 ;; ephemeral, ack policy none, recreated on a sequence gap) plus the context codec,
@@ -531,9 +592,11 @@
   (-js-consume [ctx stream consumer opts handler]
     ;; consumers.get resolves the pull Consumer (a missing one rejects ->
     ;; :consumer-not-found via api-error, like next/fetch); the consume start is
-    ;; the shared `start-consume`.
+    ;; the shared `start-consume`. Named consumes abort on a missing resource so a
+    ;; terminal side-band condition completes the handle (ADR 0020); the ordered
+    ;; path never sets the flag — recreation is its contract.
     (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
-        (.then (fn [c] (start-consume c opts handler)))
+        (.then (fn [c] (start-consume c (assoc opts :abort-on-missing-resource true) handler)))
         (.catch (fn [e] (throw (api-error e))))))
   (-js-ordered-consumer [ctx stream opts]
     ;; consumers.ordered round-trips stream info before building the ephemeral's
