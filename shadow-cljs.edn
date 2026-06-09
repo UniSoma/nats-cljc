@@ -13,7 +13,8 @@
   :browser
   {:target    :karma
    :output-to "target/karma-test.js"
-   :ns-regexp "-test$"}
+   :ns-regexp "-test$"
+   :compiler-options {:output-feature-set :es-unsupported}}
 
   ;; Externs gate: the ONLY :advanced compile in the repo. nats-cljc
   ;; ships as source, so the optimizing compile happens in each CONSUMER's build —
