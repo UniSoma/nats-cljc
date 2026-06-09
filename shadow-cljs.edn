@@ -16,7 +16,7 @@
    :ns-regexp "-test$"
    :compiler-options {:output-feature-set :es-unsupported}}
 
-  ;; Externs gate: the ONLY :advanced compile in the repo. nats-cljc
+  ;; Externs gate: an :advanced compile (alongside :core-bundle-check below). nats-cljc
   ;; ships as source, so the optimizing compile happens in each CONSUMER's build —
   ;; this repo's :none test compiles (node/browser) never run externs inference.
   ;; shadow infers most JS-interop accesses (it propagates `^js` through method/
@@ -38,4 +38,17 @@
                               nats-cljc.jetstream
                               nats-cljc.codec
                               nats-cljc.codec.json
-                              nats-cljc.codec.transit]}}}}}
+                              nats-cljc.codec.transit]}}}
+
+  ;; Bundle-isolation guard (ADR 0016): a core-only entry — nats-cljc.core and
+  ;; nothing else — released to an optimized browser bundle. @nats-io/jetstream
+  ;; is declared unconditionally in src/deps.cljs, but shadow only bundles an
+  ;; npm package that a reachable namespace actually requires, so this bundle
+  ;; must contain zero JetStream bytes. `bb bundle:check` (and CI) compiles this
+  ;; and scans the output for JetStream markers; a hit means the
+  ;; ["@nats-io/jetstream"] import leaked into a core-reachable namespace
+  ;; (e.g. folded into nats-cljc.impl.js) and core-only consumers would ship it.
+  :core-bundle-check
+  {:target     :browser
+   :output-dir "target/core-bundle-check"
+   :modules {:main {:entries [nats-cljc.core]}}}}}

@@ -95,7 +95,7 @@ jobs:
           npx shadow-cljs compile node
           node target/node-tests.js
 
-      # Externs gate: the repo's only :advanced compile. nats-cljc
+      # Externs gate: an :advanced compile. nats-cljc
       # ships as source, so the optimizing compile happens in consumers' builds,
       # never in the :none test compiles above — an un-inferable (^js-less) JS
       # property access renames silently under advanced, invisibly to CI. shadow
@@ -108,6 +108,22 @@ jobs:
           npx shadow-cljs release externs-check 2>&1 | tee externs-check.log
           if grep -q "Cannot infer target type" externs-check.log; then
             echo "::error::Externs gate: a JS-interop property access is missing a ^js hint (see 'Cannot infer' above)."
+            exit 1
+          fi
+
+      # Bundle-isolation guard (ADR 0016): @nats-io/jetstream is an
+      # unconditional npm dep, but it enters a consumer's bundle only when a
+      # namespace they require imports it. Release the core-only build (its
+      # single entry is nats-cljc.core) and fail if the optimized bundle
+      # contains any JetStream bytes — a hit means the ["@nats-io/jetstream"]
+      # import leaked into a core-reachable namespace.
+      - name: Bundle-isolation guard (core-only release)
+        if: matrix.platform == 'node'
+        run: |
+          npx shadow-cljs release core-bundle-check
+          if grep -riq -e 'jetstream' -e '\$JS\.API' target/core-bundle-check/*.js; then
+            echo "::error::Bundle guard: the core-only bundle contains @nats-io/jetstream bytes — the import leaked into a core-reachable namespace (ADR 0016)."
+            grep -rioc -e 'jetstream' -e '\$JS\.API' target/core-bundle-check/*.js
             exit 1
           fi
 
