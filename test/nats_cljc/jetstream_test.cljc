@@ -14,6 +14,7 @@
             [nats-cljc.jetstream.consumer :as consumer]
             [nats-cljc.jetstream.pub :as pub]
             [nats-cljc.jetstream.pull :as pull]
+            [nats-cljc.jetstream.acks :as acks]
             #?(:clj  [nats-cljc.jetstream.impl.jvm :as jet-jvm]
                :cljs [nats-cljc.jetstream.impl.js :as jet-js])
             #?(:cljs [promesa.core :as p]))
@@ -353,6 +354,35 @@
   (let [->opts #?(:clj jet-jvm/->publish-options :cljs jet-js/->publish-options)]
     (is (nil? (->opts {})) "empty opts -> nil (no native options object)")
     (is (nil? (->opts nil)) "nil opts -> nil (no native options object)")))
+
+;; Deep-module unit (ADR 0019), no server: the ack verbs are sugar over publish
+;; of the library-owned protocol payloads, so the payload construction is a pure
+;; msg+opts -> wire-bytes module both legs share — one code path, byte-identical
+;; everywhere. Asserted through `bytes->str` so the test reads the exact wire form.
+(deftest deep-module-ack-payload-bytes
+  (is (= "+ACK" (codec/bytes->str (acks/payload :ack nil))) "ack -> +ACK")
+  (is (= "-NAK" (codec/bytes->str (acks/payload :nak nil))) "nak -> -NAK")
+  (is (= "-NAK {\"delay\":30000000000}" (codec/bytes->str (acks/payload :nak {:delay-ms 30000})))
+      "nak with :delay-ms -> -NAK with the delay as JSON nanoseconds")
+  (is (= "+WPI" (codec/bytes->str (acks/payload :working nil))) "working -> +WPI")
+  (is (= "+TERM" (codec/bytes->str (acks/payload :term nil))) "term -> +TERM"))
+
+;; Deep-module unit (ADR 0019), no server: the ack address lives UNDER :js as
+;; :ack-subject, never as a top-level :reply. So the verbs read it through one
+;; guarded accessor — a message that never came off a JetStream pull (no :js
+;; :ack-subject) throws :no-ack-subject instead of publishing to a nil subject —
+;; and a mistaken core (reply conn js-msg ...) raises :no-reply-subject rather than
+;; publishing garbage to the ack subject. Both guards fire before any publish, so
+;; conn can be nil here.
+(deftest deep-module-ack-subject-and-reply-guard
+  (let [js-msg {:subject "orders.new" :data {:n 1}
+                :js {:ack-subject "$JS.ACK.S.C.1.7.7.0.0"}}]
+    (is (= "$JS.ACK.S.C.1.7.7.0.0" (acks/ack-subject js-msg))
+        "the ack address is read from :js :ack-subject")
+    (is (= :no-ack-subject (thrown-type #(acks/ack-subject (dissoc js-msg :js))))
+        "a message without an ack subject throws :no-ack-subject")
+    (is (= :no-reply-subject (thrown-type #(nats/reply nil js-msg {:ok true})))
+        "core reply on a JetStream message throws :no-reply-subject (no top-level :reply)")))
 
 ;; JVM only: the ack deadline is enforced by `bound-ack` bounding the returned
 ;; future, NOT by jnats reading PublishOptions.streamTimeout (the publish path ignores it,
@@ -1165,6 +1195,249 @@
                           (p/then (fn [_] (is false "expected :consumer-not-found from fetch")))
                           (p/catch (fn [e] (is (= :consumer-not-found (:type (ex-data e)))
                                                "fetch against a missing consumer rejects with :consumer-not-found"))))))))))))
+
+;; ADR 0019, integration on the :4222 JetStream server: `ack` is sugar
+;; over publish of +ACK to the message's ack subject — synchronous, returns nil, and
+;; idempotent (a second ack of the SAME message is a harmless publish the server
+;; ignores, never a throw). Acked, the message stops redelivering: a probe `next`
+;; whose window spans the consumer's 1000ms ack-wait resolves nil, where the unacked
+;; twin (pull-redelivers-unacked-message, same consumer shape) catches a redelivery.
+;; Memory stream, cleans up.
+(deftest ack-stops-redelivery-and-is-idempotent
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "ACKS" :subjects ["acks.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "ACKS"
+             (fn []
+               (deref (jet/create-consumer ctx "ACKS" {:name "ACKS_C" :durable? true :ack-policy :explicit :ack-wait-ms 1000 :filter-subjects ["acks.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "acks.a" {:n 1}) 5000 ::timeout)
+               (let [m (deref (jet/next ctx "ACKS" "ACKS_C" {:expires-ms 2000}) 5000 ::timeout)]
+                 (is (nil? (jet/ack conn m)) "ack returns nil synchronously")
+                 (is (nil? (jet/ack conn m)) "acking the same message again is a harmless no-op, not a throw")
+                 (is (nil? (deref (jet/next ctx "ACKS" "ACKS_C" {:expires-ms 2000}) 5000 ::timeout))
+                     "an acked message is not redelivered once ack-wait elapses")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "ACKS" :subjects ["acks.>"] :storage :memory})]
+                  (with-stream ctx "ACKS"
+                    (fn []
+                      (p/let [_ (jet/create-consumer ctx "ACKS" {:name "ACKS_C" :durable? true :ack-policy :explicit :ack-wait-ms 1000 :filter-subjects ["acks.a"]})
+                              _ (jet/publish ctx "acks.a" {:n 1})
+                              m (jet/next ctx "ACKS" "ACKS_C" {:expires-ms 2000})]
+                        (is (nil? (jet/ack conn m)) "ack returns nil synchronously")
+                        (is (nil? (jet/ack conn m)) "acking the same message again is a harmless no-op, not a throw")
+                        (p/let [probe (jet/next ctx "ACKS" "ACKS_C" {:expires-ms 2000})]
+                          (is (nil? probe) "an acked message is not redelivered once ack-wait elapses")))))))))))
+
+;; ADR 0019, integration on the :4222 JetStream server: `nak` (sugar over
+;; publish of -NAK to the ack subject) signals "redeliver now". The consumer's
+;; ack-wait is left at the 30s default, so a redelivery arriving inside the 2s probe
+;; window can only be the nak's doing — drop the nak and the probe times out to nil.
+;; Memory stream, cleans up.
+(deftest nak-triggers-redelivery
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "NAKS" :subjects ["naks.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "NAKS"
+             (fn []
+               (deref (jet/create-consumer ctx "NAKS" {:name "NAKS_C" :durable? true :ack-policy :explicit :filter-subjects ["naks.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "naks.a" {:n 1}) 5000 ::timeout)
+               (let [m (deref (jet/next ctx "NAKS" "NAKS_C" {:expires-ms 2000}) 5000 ::timeout)]
+                 (is (nil? (jet/nak conn m)) "nak returns nil synchronously")
+                 (let [m2 (deref (jet/next ctx "NAKS" "NAKS_C" {:expires-ms 2000}) 5000 ::timeout)]
+                   (is (= {:n 1} (:data m2)) "the nak'd message is redelivered")
+                   (is (true? (get-in m2 [:js :redelivered])) "the redelivery is marked :redelivered"))))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "NAKS" :subjects ["naks.>"] :storage :memory})]
+                  (with-stream ctx "NAKS"
+                    (fn []
+                      (p/let [_ (jet/create-consumer ctx "NAKS" {:name "NAKS_C" :durable? true :ack-policy :explicit :filter-subjects ["naks.a"]})
+                              _ (jet/publish ctx "naks.a" {:n 1})
+                              m (jet/next ctx "NAKS" "NAKS_C" {:expires-ms 2000})]
+                        (is (nil? (jet/nak conn m)) "nak returns nil synchronously")
+                        (p/let [m2 (jet/next ctx "NAKS" "NAKS_C" {:expires-ms 2000})]
+                          (is (= {:n 1} (:data m2)) "the nak'd message is redelivered")
+                          (is (true? (get-in m2 [:js :redelivered])) "the redelivery is marked :redelivered")))))))))))
+
+;; ADR 0019, integration on the :4222 JetStream server: nak with `:delay-ms`
+;; postpones the redelivery it requests. After `(nak conn m {:delay-ms 3000})` a 1s
+;; probe `next` must come up EMPTY — sensitive to the wire unit: were the payload's
+;; delay sent as milliseconds (the server speaks nanoseconds), it would round to
+;; ~instant redelivery and the probe would catch it — while a second probe spanning
+;; the 3s mark catches the delayed redelivery. Memory stream, cleans up.
+(deftest nak-delay-postpones-redelivery
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "NAKD" :subjects ["nakd.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "NAKD"
+             (fn []
+               (deref (jet/create-consumer ctx "NAKD" {:name "NAKD_C" :durable? true :ack-policy :explicit :filter-subjects ["nakd.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "nakd.a" {:n 1}) 5000 ::timeout)
+               (let [m (deref (jet/next ctx "NAKD" "NAKD_C" {:expires-ms 2000}) 5000 ::timeout)]
+                 (is (nil? (jet/nak conn m {:delay-ms 3000})) "nak with :delay-ms returns nil synchronously")
+                 (is (nil? (deref (jet/next ctx "NAKD" "NAKD_C" {:expires-ms 1000}) 5000 ::timeout))
+                     "inside the delay window the message is not yet redelivered")
+                 (let [m2 (deref (jet/next ctx "NAKD" "NAKD_C" {:expires-ms 5000}) 8000 ::timeout)]
+                   (is (= {:n 1} (:data m2)) "past the delay the nak'd message is redelivered")
+                   (is (true? (get-in m2 [:js :redelivered])) "the delayed redelivery is marked :redelivered"))))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "NAKD" :subjects ["nakd.>"] :storage :memory})]
+                  (with-stream ctx "NAKD"
+                    (fn []
+                      (p/let [_ (jet/create-consumer ctx "NAKD" {:name "NAKD_C" :durable? true :ack-policy :explicit :filter-subjects ["nakd.a"]})
+                              _ (jet/publish ctx "nakd.a" {:n 1})
+                              m (jet/next ctx "NAKD" "NAKD_C" {:expires-ms 2000})]
+                        (is (nil? (jet/nak conn m {:delay-ms 3000})) "nak with :delay-ms returns nil synchronously")
+                        (p/let [probe (jet/next ctx "NAKD" "NAKD_C" {:expires-ms 1000})]
+                          (is (nil? probe) "inside the delay window the message is not yet redelivered")
+                          (p/let [m2 (jet/next ctx "NAKD" "NAKD_C" {:expires-ms 5000})]
+                            (is (= {:n 1} (:data m2)) "past the delay the nak'd message is redelivered")
+                            (is (true? (get-in m2 [:js :redelivered])) "the delayed redelivery is marked :redelivered"))))))))))))
+
+;; ADR 0019, integration on the :4222 JetStream server: `term` (sugar
+;; over publish of +TERM to the ack subject) gives up on the message — like ack it
+;; stops redelivery, here for a message that was NEVER processed. Same consumer
+;; shape as pull-redelivers-unacked-message (1000ms ack-wait), whose unacked twin
+;; catches a redelivery in this very window — drop the term and this probe does too.
+;; Memory stream, cleans up.
+(deftest term-stops-redelivery
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "TERMS" :subjects ["terms.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "TERMS"
+             (fn []
+               (deref (jet/create-consumer ctx "TERMS" {:name "TERMS_C" :durable? true :ack-policy :explicit :ack-wait-ms 1000 :filter-subjects ["terms.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "terms.a" {:n 1}) 5000 ::timeout)
+               (let [m (deref (jet/next ctx "TERMS" "TERMS_C" {:expires-ms 2000}) 5000 ::timeout)]
+                 (is (nil? (jet/term conn m)) "term returns nil synchronously")
+                 (is (nil? (deref (jet/next ctx "TERMS" "TERMS_C" {:expires-ms 2000}) 5000 ::timeout))
+                     "a terminated message is never redelivered, even past ack-wait")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "TERMS" :subjects ["terms.>"] :storage :memory})]
+                  (with-stream ctx "TERMS"
+                    (fn []
+                      (p/let [_ (jet/create-consumer ctx "TERMS" {:name "TERMS_C" :durable? true :ack-policy :explicit :ack-wait-ms 1000 :filter-subjects ["terms.a"]})
+                              _ (jet/publish ctx "terms.a" {:n 1})
+                              m (jet/next ctx "TERMS" "TERMS_C" {:expires-ms 2000})]
+                        (is (nil? (jet/term conn m)) "term returns nil synchronously")
+                        (p/let [probe (jet/next ctx "TERMS" "TERMS_C" {:expires-ms 2000})]
+                          (is (nil? probe) "a terminated message is never redelivered, even past ack-wait")))))))))))
+
+;; ADR 0019, integration on the :4222 JetStream server: `working` (sugar
+;; over publish of +WPI to the ack subject) means "still processing" — it postpones
+;; the ack-wait timer without acknowledging. With a 3000ms ack-wait, a +WPI sent at
+;; ~1500ms moves the redelivery deadline from ~3000ms to ~4500ms after delivery: a
+;; probe `next` spanning [~3200, ~4200] — PAST the original deadline, short of the
+;; postponed one — must come up empty (drop the working and it catches the
+;; redelivery), while a final longer `next` catches the message's second delivery,
+;; proving working kept it pending rather than terminating it. Unlike its terminal
+;; siblings `working` is a repeatable progress signal by design. Memory stream,
+;; cleans up.
+(deftest working-postpones-ack-wait
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "WPIS" :subjects ["wpis.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "WPIS"
+             (fn []
+               (deref (jet/create-consumer ctx "WPIS" {:name "WPIS_C" :durable? true :ack-policy :explicit :ack-wait-ms 3000 :filter-subjects ["wpis.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "wpis.a" {:n 1}) 5000 ::timeout)
+               (let [m (deref (jet/next ctx "WPIS" "WPIS_C" {:expires-ms 2000}) 5000 ::timeout)]
+                 (Thread/sleep 1500)
+                 (is (nil? (jet/working conn m)) "working returns nil synchronously")
+                 (Thread/sleep 1700)
+                 (is (nil? (deref (jet/next ctx "WPIS" "WPIS_C" {:expires-ms 1000}) 5000 ::timeout))
+                     "past the original ack-wait but short of the postponed one, no redelivery")
+                 (let [m2 (deref (jet/next ctx "WPIS" "WPIS_C" {:expires-ms 5000}) 8000 ::timeout)]
+                   (is (= {:n 1} (:data m2)) "once the postponed ack-wait elapses the message redelivers — working is not terminal")
+                   (is (true? (get-in m2 [:js :redelivered])) "the post-working redelivery is marked :redelivered"))))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "WPIS" :subjects ["wpis.>"] :storage :memory})]
+                  (with-stream ctx "WPIS"
+                    (fn []
+                      (p/let [_ (jet/create-consumer ctx "WPIS" {:name "WPIS_C" :durable? true :ack-policy :explicit :ack-wait-ms 3000 :filter-subjects ["wpis.a"]})
+                              _ (jet/publish ctx "wpis.a" {:n 1})
+                              m (jet/next ctx "WPIS" "WPIS_C" {:expires-ms 2000})
+                              _ (p/delay 1500)]
+                        (is (nil? (jet/working conn m)) "working returns nil synchronously")
+                        (p/let [_ (p/delay 1700)
+                                probe (jet/next ctx "WPIS" "WPIS_C" {:expires-ms 1000})]
+                          (is (nil? probe) "past the original ack-wait but short of the postponed one, no redelivery")
+                          (p/let [m2 (jet/next ctx "WPIS" "WPIS_C" {:expires-ms 5000})]
+                            (is (= {:n 1} (:data m2)) "once the postponed ack-wait elapses the message redelivers — working is not terminal")
+                            (is (true? (get-in m2 [:js :redelivered])) "the post-working redelivery is marked :redelivered"))))))))))))
+
+;; ADR 0019, integration on the :4222 JetStream server: `double-ack` is
+;; sugar over REQUEST of +ACK to the ack subject — the server's (empty) reply is the
+;; confirmation, so it returns a promise resolving true once the ack is KNOWN
+;; processed, where plain `ack` is fire-and-forget. Named double-ack (the NATS
+;; community term), not jnats' ack-sync: ours is asynchronous. The server confirms a
+;; redundant ack too, so double-acking the same message twice resolves true both
+;; times — never a throw. Acked, the message stops redelivering (1000ms ack-wait,
+;; the redelivering twin again pull-redelivers-unacked-message). Memory stream,
+;; cleans up.
+(deftest double-ack-resolves-confirmed
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "DACK" :subjects ["dack.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "DACK"
+             (fn []
+               (deref (jet/create-consumer ctx "DACK" {:name "DACK_C" :durable? true :ack-policy :explicit :ack-wait-ms 1000 :filter-subjects ["dack.a"]}) 5000 ::timeout)
+               (deref (jet/publish ctx "dack.a" {:n 1}) 5000 ::timeout)
+               (let [m (deref (jet/next ctx "DACK" "DACK_C" {:expires-ms 2000}) 5000 ::timeout)]
+                 (is (true? (deref (jet/double-ack conn m) 5000 ::timeout))
+                     "double-ack resolves true once the server confirms the ack")
+                 (is (true? (deref (jet/double-ack conn m) 5000 ::timeout))
+                     "double-acking the same message again resolves true — never a throw")
+                 (is (nil? (deref (jet/next ctx "DACK" "DACK_C" {:expires-ms 2000}) 5000 ::timeout))
+                     "a double-acked message is not redelivered once ack-wait elapses")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "DACK" :subjects ["dack.>"] :storage :memory})]
+                  (with-stream ctx "DACK"
+                    (fn []
+                      (p/let [_  (jet/create-consumer ctx "DACK" {:name "DACK_C" :durable? true :ack-policy :explicit :ack-wait-ms 1000 :filter-subjects ["dack.a"]})
+                              _  (jet/publish ctx "dack.a" {:n 1})
+                              m  (jet/next ctx "DACK" "DACK_C" {:expires-ms 2000})
+                              c1 (jet/double-ack conn m)
+                              c2 (jet/double-ack conn m)
+                              probe (jet/next ctx "DACK" "DACK_C" {:expires-ms 2000})]
+                        (is (true? c1) "double-ack resolves true once the server confirms the ack")
+                        (is (true? c2) "double-acking the same message again resolves true — never a throw")
+                        (is (nil? probe) "a double-acked message is not redelivered once ack-wait elapses"))))))))))
 
 ;; CLJS only, no server: a per-message lift throwing mid-batch must release the
 ;; ConsumerMessages, not leave the pull subscription/inbox dangling until the

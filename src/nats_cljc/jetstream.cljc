@@ -19,6 +19,7 @@
             [nats-cljc.jetstream.consumer :as consumer]
             [nats-cljc.jetstream.pub :as pub]
             [nats-cljc.jetstream.pull :as pull]
+            [nats-cljc.jetstream.acks :as acks]
             #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])
             #?(:clj  [nats-cljc.jetstream.impl.jvm]
@@ -225,3 +226,76 @@
        (impl/then (fn [_] (pull/validate-expires opts)))
        (impl/bind (fn [_] (proto/-js-next ctx stream consumer opts)))
        (impl/then (fn [raw] (when raw (decode-js-msg (core/effective-codec ctx opts) raw)))))))
+
+(defn- ack-publish!
+  "The one ack code path (ADR 0019): publish the `verb` protocol payload to `msg`'s
+   ack subject on `conn`, fire-and-forget — `reply`'s shape, byte-identical on both
+   legs. Synchronous, returns nil."
+  [conn msg verb opts]
+  (proto/-publish conn (acks/ack-subject msg) nil (acks/payload verb opts))
+  nil)
+
+(defn ack
+  "Acknowledge the delivered JetStream message `msg` as processed, on `conn` (the
+   connection, explicit as in core `reply`), stopping its redelivery. Sugar over
+   publish of the `+ACK` protocol payload to the message's ack subject (under `:js
+   :ack-subject`) — never a native `.ack()`, so the wire bytes are identical on
+   both legs (ADR 0019). Synchronous, returns nil, and idempotent: a redundant ack
+   of an already-acked message is a harmless publish the server ignores, never a
+   throw. Throws an ex-info `:type :no-ack-subject` when `msg` carries no ack
+   subject (it is not a delivered JetStream message), rather than publishing to a
+   nil subject — the `reply` `:no-reply-subject` precedent."
+  [conn msg]
+  (ack-publish! conn msg :ack nil))
+
+(defn nak
+  "Negatively acknowledge the delivered JetStream message `msg` on `conn`: signal
+   it was NOT processed, asking the server to redeliver it (immediately, or after
+   `:delay-ms` milliseconds when set in `opts`). Sugar over publish of the `-NAK`
+   protocol payload — `-NAK {\"delay\":ns}` with a delay — to the message's ack
+   subject (ADR 0019), shaped exactly as `ack`: synchronous, returns nil,
+   idempotent, and throws `:type :no-ack-subject` on a message without an ack
+   subject."
+  ([conn msg] (nak conn msg {}))
+  ([conn msg opts]
+   (ack-publish! conn msg :nak opts)))
+
+(defn term
+  "Terminate the delivered JetStream message `msg` on `conn`: give up on it, so the
+   server never redelivers it — `ack`'s terminal sibling for a message that was NOT
+   processed and never will be. Sugar over publish of the `+TERM` protocol payload
+   to the message's ack subject (ADR 0019), shaped exactly as `ack`: synchronous,
+   returns nil, idempotent, and throws `:type :no-ack-subject` on a message without
+   an ack subject."
+  [conn msg]
+  (ack-publish! conn msg :term nil))
+
+(defn working
+  "Signal the delivered JetStream message `msg` is still being processed, on
+   `conn`, postponing the consumer's ack-wait timer so the server holds off
+   redelivering while work continues. Sugar over publish of the `+WPI` protocol
+   payload to the message's ack subject (ADR 0019), shaped exactly as `ack`:
+   synchronous, returns nil, and throws `:type :no-ack-subject` on a message
+   without an ack subject. Unlike its terminal siblings it is a REPEATABLE
+   progress signal — send it again whenever the deadline nears."
+  [conn msg]
+  (ack-publish! conn msg :working nil))
+
+(defn double-ack
+  "Acknowledge the delivered JetStream message `msg` on `conn` AND await the
+   server's confirmation, returning a platform-native promise that resolves to
+   true once the ack is known processed — where `ack` is fire-and-forget. Sugar
+   over `request` of the `+ACK` protocol payload to the message's ack subject; the
+   server's (empty) reply is the confirmation (ADR 0019). Named double-ack (the
+   NATS community term), not jnats' ack-sync — ours is asynchronous. Idempotent:
+   the server confirms a redundant ack too, so double-acking the same message
+   again resolves true, never throws. `opts` may set `:timeout-ms` (default 5000);
+   a confirmation that never arrives rejects with the core `:timeout`, and a
+   message without an ack subject rejects with `:type :no-ack-subject` — on the
+   returned promise, never a synchronous throw (ADR 0006)."
+  ([conn msg] (double-ack conn msg {}))
+  ([conn msg opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (acks/ack-subject msg)))
+       (impl/bind (fn [subject] (proto/-request conn subject (acks/payload :ack nil) (:timeout-ms opts 5000))))
+       (impl/then (fn [_] true)))))
