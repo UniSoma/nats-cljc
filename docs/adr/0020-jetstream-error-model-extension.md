@@ -28,7 +28,7 @@ Operational (ADR 0006), rejecting the relevant operation's promise:
 
 Operational, side-band, routed to a consume's `:on-error` only: `:heartbeats-missed`, `:consumer-deleted`, `:exceeded-limits`.
 
-Validation (ADR 0015), raised pre-flight on the operation's own channel: `:invalid-name`, `:unknown-config-key`, `:reserved-header`, and the normalized nats.js `InvalidArgument` / `InvalidOperation` family (e.g. binding an ordered consumer).
+Validation (ADR 0015), raised pre-flight on the operation's own channel: `:invalid-name`, `:unknown-config-key`, `:reserved-header`, and the normalized nats.js `InvalidArgument` / `InvalidOperation` family (e.g. binding an ordered consumer). The `consume` refill guard later extended this open set — a minor bump per ADR 0009 — with `:invalid-batch` (a `:batch` that is not a positive integer), `:invalid-threshold` (a `:threshold` that is not a positive integer no greater than `:batch`), and `:exclusive-window` (`:max-bytes` combined with `:batch`/`:threshold` — a pull window is bounded by message count or by bytes, never both); CONTEXT.md's Validation-error term carries each `:type`'s payload keys.
 
 `:no-message-found` (10037) is **deferred**: its only producer is get-message / direct-get, which is out of Phase 2 scope, and pull `next` returns `nil` on an empty consumer rather than raising. The `:type` lands with direct-get.
 
