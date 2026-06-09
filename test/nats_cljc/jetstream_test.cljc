@@ -9,11 +9,13 @@
             [nats-cljc.codec :as codec]
             [nats-cljc.codec.json]
             [nats-cljc.jetstream :as jet]
+            [nats-cljc.protocol :as proto]
             [nats-cljc.jetstream.error :as jet-err]
             [nats-cljc.jetstream.stream :as stream]
             [nats-cljc.jetstream.consumer :as consumer]
             [nats-cljc.jetstream.pub :as pub]
             [nats-cljc.jetstream.pull :as pull]
+            [nats-cljc.jetstream.refill :as refill]
             [nats-cljc.jetstream.acks :as acks]
             #?(:clj  [nats-cljc.jetstream.impl.jvm :as jet-jvm]
                :cljs [nats-cljc.jetstream.impl.js :as jet-js])
@@ -143,6 +145,34 @@
                  (p/handle (jet/delete-stream ctx stream)
                            (fn [_ _] (if e (throw e) v)))))))
 
+;; Consume delivery arrives on the native client's own schedule, so the consume
+;; assertions wait for a state rather than race it — core-test's poll helper and
+;; its CLJS promise twin.
+#?(:clj
+   (defn- wait-for
+     "Poll `pred` until truthy or `timeout-ms` elapses; return the last value."
+     [pred timeout-ms]
+     (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+       (loop []
+         (or (pred)
+             (when (< (System/currentTimeMillis) deadline)
+               (Thread/sleep 20)
+               (recur))))))
+   :cljs
+   (defn- wait-for
+     "Promise resolving to true once `pred` is truthy (polling every 25ms), or
+      false at `timeout-ms` — the async-friendly twin of the JVM poll."
+     [pred timeout-ms]
+     (p/create
+      (fn [resolve _reject]
+        (let [deadline (+ (js/Date.now) timeout-ms)]
+          (letfn [(check []
+                    (cond
+                      (pred)                     (resolve true)
+                      (< (js/Date.now) deadline) (js/setTimeout check 25)
+                      :else                      (resolve false)))]
+            (check)))))))
+
 ;; AC1 (ADR 0017): (jetstream conn) resolves to a single JetStream context against
 ;; a JetStream-enabled server, identically on both legs.
 (deftest jetstream-resolves-to-a-context
@@ -204,6 +234,13 @@
 ;; Tighter than `iso-re` on purpose: it rejects the JVM leg's old variable-digit,
 ;; source-offset formatting, so a divergence there can't ship green over the live path.
 (def ^:private canonical-ts-re #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
+
+;; An :on-status handler closing over an atom of the status maps it receives
+;; (core-test's twin): the consume backpressure test watches it to prove pull never
+;; raises a :slow-consumer.
+(defn- status-collector []
+  (let [seen (atom [])]
+    [seen (fn [s] (swap! seen conj s))]))
 
 ;; Capture the validation `:type` a synchronous deep-module guard throws, portably.
 (defn- thrown-type [thunk]
@@ -320,6 +357,50 @@
         "an at-floor :expires-ms passes validation unchanged"))
   (is (= {:batch 3} (pull/validate-expires {:batch 3}))
       "an omitted :expires-ms passes through to the native default"))
+
+;; Deep-module unit (ADR 0018), no server: the refill decision is the one
+;; piece of consume flow control our layer owns. The portable :threshold is a COUNT
+;; (nats.js-native: repull when the buffered count drops to it); jnats expresses the
+;; same decision as a PERCENT whose repull point sits at batch - max(1, batch*P/100),
+;; so the conversion must pick the P whose repull point equals the portable count.
+;; The validation guard keeps a malformed :threshold (or a sub-floor :expires-ms,
+;; via the shared pull guard) from reaching either leg as an un-typed native throw.
+(deftest deep-module-refill-decision
+  (is (= 25 (refill/threshold->percent 75 100))
+      "the cross-client default identity: count 75 of batch 100 is jnats' default 25%")
+  (is (= 99 (refill/threshold->percent 1 100))
+      "a low count refills late, so the percent is high")
+  (is (= 67 (refill/threshold->percent 1 3))
+      "rounds up so integer division can't refill later than the count asks (3*67/100=2 -> repull point 1)")
+  (is (= 29 (refill/threshold->percent 5 7))
+      "non-divisible batch still lands the repull point exactly on the count (7*29/100=2 -> 5)")
+  (is (= 1 (refill/threshold->percent 100 100))
+      "count = batch (refill on any consumption) clamps to the 1% floor")
+  (is (= :invalid-threshold (thrown-type #(refill/validate-opts {:threshold 0})))
+      "a non-positive :threshold is :invalid-threshold")
+  (is (= :invalid-threshold (thrown-type #(refill/validate-opts {:threshold "5"})))
+      "a non-integer :threshold is :invalid-threshold")
+  (is (= :invalid-threshold (thrown-type #(refill/validate-opts {:threshold 5 :batch 4})))
+      "a :threshold above :batch could never trigger a sane refill — rejected")
+  (is (= :invalid-threshold (thrown-type #(refill/validate-opts {:threshold 101})))
+      "with :batch omitted the default batch (100) bounds :threshold")
+  (is (= 101 (:threshold (ex-data (try (refill/validate-opts {:threshold 101})
+                                       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))))
+      ":invalid-threshold carries the offending :threshold")
+  (is (= :invalid-expires (thrown-type #(refill/validate-opts {:expires-ms 500})))
+      "consume opts route :expires-ms through the shared pull guard")
+  (is (= :exclusive-window (thrown-type #(refill/validate-opts {:batch 2 :max-bytes 1024})))
+      "a byte window (:max-bytes) and a message-count window (:batch) are mutually exclusive — nats.js forbids both")
+  (is (= :exclusive-window (thrown-type #(refill/validate-opts {:threshold 1 :max-bytes 1024})))
+      ":max-bytes is mutually exclusive with the count :threshold too")
+  (let [count-window {:batch 10 :threshold 3 :expires-ms 2000 :idle-heartbeat-ms 1000}]
+    (is (= count-window (refill/validate-opts count-window))
+        "a well-formed message-count window passes validation unchanged"))
+  (let [byte-window {:max-bytes 1048576 :expires-ms 2000 :idle-heartbeat-ms 1000}]
+    (is (= byte-window (refill/validate-opts byte-window))
+        "a well-formed byte window passes validation unchanged"))
+  (is (= {} (refill/validate-opts {}))
+      "every knob is optional — empty opts pass through to the native defaults"))
 
 ;; AC1/AC3/AC4, deep-module unit (ADR 0020), no server: building the native publish
 ;; options is a pure local construction, so the portable opts -> native round-trip
@@ -1195,6 +1276,279 @@
                           (p/then (fn [_] (is false "expected :consumer-not-found from fetch")))
                           (p/catch (fn [e] (is (= :consumer-not-found (:type (ex-data e)))
                                                "fetch against a missing consumer rejects with :consumer-not-found"))))))))))))
+
+;; ADR 0018, integration on the :4222 JetStream server: `consume` is the
+;; continuous pull verb — it resolves to a handle and delivers every stored message
+;; through the core promise-return handler contract (ADR 0007), each one the same
+;; PURE-DATA shape fetch/next deliver ({:subject :data :js}, :data decoded with the
+;; context codec, the :js ack-subject feeding the ack family). The handle is a core
+;; Subscription's shape: active while consuming, and `nats/drain` (the core facade,
+;; dispatching over proto/Drainable) settles once the consume winds down — the open
+;; pull expires (:expires-ms 2000 keeps that prompt) — after which it is inactive.
+;; Same on both legs; memory stream, cleans up.
+(deftest consume-delivers-and-drain-settles
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "CONSUME" :subjects ["consume.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "CONSUME"
+             (fn []
+               (deref (jet/create-consumer ctx "CONSUME" {:name "CONSUME_C" :durable? true :ack-policy :explicit :filter-subjects ["consume.a"]}) 5000 ::timeout)
+               (doseq [n [1 2 3]] (deref (jet/publish ctx "consume.a" {:n n}) 5000 ::timeout))
+               (let [seen   (atom [])
+                     handle (deref (jet/consume ctx "CONSUME" "CONSUME_C"
+                                                (fn [m]
+                                                  (swap! seen conj m)
+                                                  (jet/ack conn m)
+                                                  (java.util.concurrent.CompletableFuture/completedFuture nil))
+                                                {:expires-ms 2000})
+                                   5000 ::timeout)]
+                 (is (not= ::timeout handle) "consume resolves to a handle")
+                 (is (wait-for #(= 3 (count @seen)) 5000) "consume delivers every stored message")
+                 (is (= [{:n 1} {:n 2} {:n 3}] (mapv :data @seen)) "each :data is decoded with the context codec, in stream order")
+                 (is (= #{:subject :data :js} (set (keys (first @seen)))) "a delivered message is pure data (no native object)")
+                 (is (boolean (re-find #"^\$JS\.ACK\." (get-in (first @seen) [:js :ack-subject]))) "messages carry the :js ack-subject the ack family publishes to")
+                 (is (true? (proto/-active? handle)) "the handle is active while consuming")
+                 (is (not= ::timeout (deref (nats/drain handle) 10000 ::timeout)) "drain settles once the consume winds down")
+                 (is (false? (proto/-active? handle)) "a drained handle is no longer active")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "CONSUME" :subjects ["consume.>"] :storage :memory})]
+                  (with-stream ctx "CONSUME"
+                    (fn []
+                      (let [seen (atom [])]
+                        (p/let [_      (jet/create-consumer ctx "CONSUME" {:name "CONSUME_C" :durable? true :ack-policy :explicit :filter-subjects ["consume.a"]})
+                                _      (jet/publish ctx "consume.a" {:n 1})
+                                _      (jet/publish ctx "consume.a" {:n 2})
+                                _      (jet/publish ctx "consume.a" {:n 3})
+                                handle (jet/consume ctx "CONSUME" "CONSUME_C"
+                                                    (fn [m]
+                                                      (swap! seen conj m)
+                                                      (jet/ack conn m)
+                                                      (p/resolved nil))
+                                                    {:expires-ms 2000})
+                                hit?   (wait-for #(= 3 (count @seen)) 5000)]
+                          (is hit? "consume delivers every stored message")
+                          (is (= [{:n 1} {:n 2} {:n 3}] (mapv :data @seen)) "each :data is decoded with the context codec, in stream order")
+                          (is (= #{:subject :data :js} (set (keys (first @seen)))) "a delivered message is pure data (no native object)")
+                          (is (boolean (re-find #"^\$JS\.ACK\." (get-in (first @seen) [:js :ack-subject]))) "messages carry the :js ack-subject the ack family publishes to")
+                          (is (true? (proto/-active? handle)) "the handle is active while consuming")
+                          (p/let [_ (nats/drain handle)]
+                            (is (false? (proto/-active? handle)) "a drained handle is no longer active"))))))))))))
+
+;; ADR 0007/0018, integration on the :4222 JetStream server: a slow
+;; promise-returning handler measurably gates delivery — the consume twin of core's
+;; `pending-promise-handler-applies-backpressure` (gate-deferred, NOT a timing sleep). The
+;; handler returns a pending gate for the FIRST message only; the second, already buffered
+;; from the pull, is NOT delivered until the gate settles, because delivery is serial and
+;; the handler's promise must settle first (road 2: onMessage blocks the consume dispatcher
+;; on the JVM / the drive loop awaits the handler before the next `.next` on CLJS). That
+;; blocked handler also gates the client's refill, so NO `:slow-consumer` ever reaches the
+;; connection's `:on-status` (ADR 0018): a slow handler simply slows the pull. Memory
+;; stream, cleans up.
+(deftest consume-applies-backpressure
+  #?(:clj
+     (let [[statuses on-status] (status-collector)]
+       (with-conn {:servers [server-url] :on-status on-status}
+         (fn [conn]
+           (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+             (deref (jet/create-stream ctx {:name "CONSBP" :subjects ["consbp.>"] :storage :memory}) 5000 ::timeout)
+             (with-stream ctx "CONSBP"
+               (fn []
+                 (deref (jet/create-consumer ctx "CONSBP" {:name "CONSBP_C" :durable? true :ack-policy :explicit :filter-subjects ["consbp.a"]}) 5000 ::timeout)
+                 (deref (jet/publish ctx "consbp.a" {:n 1}) 5000 ::timeout)
+                 (deref (jet/publish ctx "consbp.a" {:n 2}) 5000 ::timeout)
+                 (let [order  (atom [])
+                       gate   (java.util.concurrent.CompletableFuture.)
+                       handle (deref (jet/consume ctx "CONSBP" "CONSBP_C"
+                                                  (fn [m]
+                                                    (swap! order conj (:data m))
+                                                    (jet/ack conn m)
+                                                    (when (= {:n 1} (:data m)) gate))
+                                                  {:expires-ms 2000})
+                                     5000 ::timeout)]
+                   (is (wait-for #(= [{:n 1}] @order) 5000) "the first message is delivered")
+                   (Thread/sleep 300)
+                   (is (= [{:n 1}] @order)
+                       "a pending-promise handler gates delivery of the next message")
+                   (.complete gate nil)
+                   (is (wait-for #(= [{:n 1} {:n 2}] @order) 5000)
+                       "the next message is delivered once the promise settles")
+                   (is (not-any? #(= :slow-consumer (:type %)) @statuses)
+                       "no :slow-consumer is ever raised by pull")
+                   (deref (nats/drain handle) 10000 ::timeout))))))))
+     :cljs
+     (async done
+            (let [[statuses on-status] (status-collector)]
+              (with-conn {:servers [server-url] :on-status on-status} done
+                (fn [conn]
+                  (p/let [ctx (jet/jetstream conn)
+                          _   (jet/create-stream ctx {:name "CONSBP" :subjects ["consbp.>"] :storage :memory})]
+                    (with-stream ctx "CONSBP"
+                      (fn []
+                        (let [order (atom [])
+                              gate  (p/deferred)]
+                          (p/let [_      (jet/create-consumer ctx "CONSBP" {:name "CONSBP_C" :durable? true :ack-policy :explicit :filter-subjects ["consbp.a"]})
+                                  _      (jet/publish ctx "consbp.a" {:n 1})
+                                  _      (jet/publish ctx "consbp.a" {:n 2})
+                                  handle (jet/consume ctx "CONSBP" "CONSBP_C"
+                                                      (fn [m]
+                                                        (swap! order conj (:data m))
+                                                        (jet/ack conn m)
+                                                        (when (= {:n 1} (:data m)) gate))
+                                                      {:expires-ms 2000})
+                                  hit1   (wait-for #(= [{:n 1}] @order) 5000)
+                                  _      (is hit1 "the first message is delivered")
+                                  _      (p/delay 300)
+                                  _      (is (= [{:n 1}] @order)
+                                             "a pending-promise handler gates delivery of the next message")
+                                  _      (p/resolve! gate nil)
+                                  hit2   (wait-for #(= [{:n 1} {:n 2}] @order) 5000)]
+                            (is hit2 "the next message is delivered once the promise settles")
+                            (is (not-any? #(= :slow-consumer (:type %)) @statuses)
+                                "no :slow-consumer is ever raised by pull")
+                            (nats/drain handle))))))))))))
+
+;; ADR 0012/0015, integration on the :4222 JetStream server: the consume handle
+;; unsubscribes exactly like a core Subscription. `core/unsubscribe` ends it abruptly —
+;; synchronous nil, `-active?` false after — and is idempotent (a second call is a no-op,
+;; never a throw). A consume has no auto-unsubscribe count, so a `max` that is valid for a
+;; core subscription is still out of range here: `(unsubscribe handle 5)` throws
+;; `:invalid-max` from the handle's own guard (the facade's positive-int check passes 5
+;; through). Memory stream, cleans up.
+(deftest consume-unsubscribe-stops-and-rejects-max
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "CONSUNSUB" :subjects ["consunsub.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "CONSUNSUB"
+             (fn []
+               (deref (jet/create-consumer ctx "CONSUNSUB" {:name "CONSUNSUB_C" :durable? true :ack-policy :explicit :filter-subjects ["consunsub.a"]}) 5000 ::timeout)
+               (let [handle (deref (jet/consume ctx "CONSUNSUB" "CONSUNSUB_C"
+                                                (fn [m] (jet/ack conn m) nil)
+                                                {:expires-ms 2000})
+                                   5000 ::timeout)]
+                 (is (true? (proto/-active? handle)) "the handle is active while consuming")
+                 (is (nil? (nats/unsubscribe handle)) "unsubscribe ends the consume synchronously, returning nil")
+                 (is (false? (proto/-active? handle)) "an unsubscribed handle is no longer active")
+                 (is (nil? (nats/unsubscribe handle)) "a second unsubscribe is an idempotent no-op")
+                 (is (= :invalid-max (thrown-type #(nats/unsubscribe handle 5)))
+                     "a consume handle takes no auto-unsubscribe max")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "CONSUNSUB" :subjects ["consunsub.>"] :storage :memory})]
+                  (with-stream ctx "CONSUNSUB"
+                    (fn []
+                      (p/let [_      (jet/create-consumer ctx "CONSUNSUB" {:name "CONSUNSUB_C" :durable? true :ack-policy :explicit :filter-subjects ["consunsub.a"]})
+                              handle (jet/consume ctx "CONSUNSUB" "CONSUNSUB_C"
+                                                  (fn [m] (jet/ack conn m) nil)
+                                                  {:expires-ms 2000})]
+                        (is (true? (proto/-active? handle)) "the handle is active while consuming")
+                        (is (nil? (nats/unsubscribe handle)) "unsubscribe ends the consume synchronously, returning nil")
+                        (is (false? (proto/-active? handle)) "an unsubscribed handle is no longer active")
+                        (is (nil? (nats/unsubscribe handle)) "a second unsubscribe is an idempotent no-op")
+                        (is (= :invalid-max (thrown-type #(nats/unsubscribe handle 5)))
+                            "a consume handle takes no auto-unsubscribe max"))))))))))
+
+;; ADR 0018, integration on the :4222 JetStream server: the message-count refill
+;; knobs are accepted portably AND the refill across pull windows actually engages. With
+;; `:batch 2` and `:threshold 1`, no single pull window holds all five stored messages —
+;; delivering them all proves the client repulls as the buffered count drops to the
+;; threshold, carrying `:expires-ms` and `:idle-heartbeat-ms` through both legs' native
+;; option builders without either rejecting the config. Memory stream, cleans up.
+(deftest consume-refill-across-batches
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "CONSKNOBS" :subjects ["consknobs.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "CONSKNOBS"
+             (fn []
+               (deref (jet/create-consumer ctx "CONSKNOBS" {:name "CONSKNOBS_C" :durable? true :ack-policy :explicit :filter-subjects ["consknobs.a"]}) 5000 ::timeout)
+               (doseq [n [1 2 3 4 5]] (deref (jet/publish ctx "consknobs.a" {:n n}) 5000 ::timeout))
+               (let [seen   (atom [])
+                     handle (deref (jet/consume ctx "CONSKNOBS" "CONSKNOBS_C"
+                                                (fn [m] (swap! seen conj (:data m)) (jet/ack conn m) nil)
+                                                {:batch 2 :threshold 1 :expires-ms 2000 :idle-heartbeat-ms 1000})
+                                   5000 ::timeout)]
+                 (is (wait-for #(= 5 (count @seen)) 5000) "every message is delivered across multiple pull windows")
+                 (is (= [{:n 1} {:n 2} {:n 3} {:n 4} {:n 5}] @seen) "refill across batches preserves stream order")
+                 (deref (nats/drain handle) 10000 ::timeout)))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "CONSKNOBS" :subjects ["consknobs.>"] :storage :memory})]
+                  (with-stream ctx "CONSKNOBS"
+                    (fn []
+                      (let [seen (atom [])]
+                        (p/let [_      (jet/create-consumer ctx "CONSKNOBS" {:name "CONSKNOBS_C" :durable? true :ack-policy :explicit :filter-subjects ["consknobs.a"]})
+                                _      (jet/publish ctx "consknobs.a" {:n 1})
+                                _      (jet/publish ctx "consknobs.a" {:n 2})
+                                _      (jet/publish ctx "consknobs.a" {:n 3})
+                                _      (jet/publish ctx "consknobs.a" {:n 4})
+                                _      (jet/publish ctx "consknobs.a" {:n 5})
+                                handle (jet/consume ctx "CONSKNOBS" "CONSKNOBS_C"
+                                                    (fn [m] (swap! seen conj (:data m)) (jet/ack conn m) nil)
+                                                    {:batch 2 :threshold 1 :expires-ms 2000 :idle-heartbeat-ms 1000})
+                                hit?   (wait-for #(= 5 (count @seen)) 5000)]
+                          (is hit? "every message is delivered across multiple pull windows")
+                          (is (= [{:n 1} {:n 2} {:n 3} {:n 4} {:n 5}] @seen) "refill across batches preserves stream order")
+                          (nats/drain handle)))))))))))
+
+;; ADR 0018, integration on the :4222 JetStream server: the byte window is accepted
+;; portably — `:max-bytes` (with no `:batch`/`:threshold`, the mutually-exclusive count
+;; window) survives both legs' native option builders, where the naive always-set
+;; `max_messages` had made nats.js reject the pull as `max_messages`/`max_bytes` mutually
+;; exclusive. A 1MiB cap comfortably holds the three small stored messages, so delivering
+;; them all proves the byte-bounded pull works end to end. Memory stream, cleans up.
+(deftest consume-byte-window-delivers
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "CONSBYTES" :subjects ["consbytes.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "CONSBYTES"
+             (fn []
+               (deref (jet/create-consumer ctx "CONSBYTES" {:name "CONSBYTES_C" :durable? true :ack-policy :explicit :filter-subjects ["consbytes.a"]}) 5000 ::timeout)
+               (doseq [n [1 2 3]] (deref (jet/publish ctx "consbytes.a" {:n n}) 5000 ::timeout))
+               (let [seen   (atom [])
+                     handle (deref (jet/consume ctx "CONSBYTES" "CONSBYTES_C"
+                                                (fn [m] (swap! seen conj (:data m)) (jet/ack conn m) nil)
+                                                {:max-bytes 1048576 :expires-ms 2000})
+                                   5000 ::timeout)]
+                 (is (wait-for #(= 3 (count @seen)) 5000) "a byte-bounded pull delivers every stored message")
+                 (is (= [{:n 1} {:n 2} {:n 3}] @seen) "the byte window preserves stream order")
+                 (deref (nats/drain handle) 10000 ::timeout)))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "CONSBYTES" :subjects ["consbytes.>"] :storage :memory})]
+                  (with-stream ctx "CONSBYTES"
+                    (fn []
+                      (let [seen (atom [])]
+                        (p/let [_      (jet/create-consumer ctx "CONSBYTES" {:name "CONSBYTES_C" :durable? true :ack-policy :explicit :filter-subjects ["consbytes.a"]})
+                                _      (jet/publish ctx "consbytes.a" {:n 1})
+                                _      (jet/publish ctx "consbytes.a" {:n 2})
+                                _      (jet/publish ctx "consbytes.a" {:n 3})
+                                handle (jet/consume ctx "CONSBYTES" "CONSBYTES_C"
+                                                    (fn [m] (swap! seen conj (:data m)) (jet/ack conn m) nil)
+                                                    {:max-bytes 1048576 :expires-ms 2000})
+                                hit?   (wait-for #(= 3 (count @seen)) 5000)]
+                          (is hit? "a byte-bounded pull delivers every stored message")
+                          (is (= [{:n 1} {:n 2} {:n 3}] @seen) "the byte window preserves stream order")
+                          (nats/drain handle)))))))))))
 
 ;; ADR 0019, integration on the :4222 JetStream server: `ack` is sugar
 ;; over publish of +ACK to the message's ack subject — synchronous, returns nil, and

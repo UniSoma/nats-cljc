@@ -343,6 +343,76 @@
   (clj->js (cond-> {:max_messages (or batch pull/default-batch)}
              expires-ms (assoc :expires expires-ms))))
 
+(defn- ->consume-options
+  "Build a nats.js ConsumeOptions object from the portable refill knobs (ADR 0018):
+   `:batch` is `max_messages` (defaulted to `pull/default-batch`, matching nats.js'
+   own default so the legs agree), `:threshold` is `threshold_messages` VERBATIM —
+   the portable count is nats.js-native, the JVM leg owns the percent conversion —
+   `:expires-ms` the `expires` window, `:idle-heartbeat-ms` the `idle_heartbeat`
+   pulse, `:max-bytes` the `max_bytes` cap. nats.js forbids a user setting
+   `max_messages` alongside `max_bytes`, so a byte window omits `max_messages`
+   entirely (refill/validate-opts has already ruled out a `:batch`/`:threshold`
+   pairing); a message window sends `max_messages` as before. `clj->js` produces the
+   string-keyed object nats.js reads, surviving advanced compilation."
+  [{:keys [batch threshold expires-ms idle-heartbeat-ms max-bytes]}]
+  (clj->js (cond-> {}
+             (not max-bytes)   (assoc :max_messages (or batch pull/default-batch))
+             threshold         (assoc :threshold_messages threshold)
+             expires-ms        (assoc :expires expires-ms)
+             idle-heartbeat-ms (assoc :idle_heartbeat idle-heartbeat-ms)
+             max-bytes         (assoc :max_bytes max-bytes))))
+
+(defn- drive-consume!
+  "Drive a nats.js ConsumerMessages — the async-iterable `consume` resolves to —
+   with a detached `.next` loop that awaits the handler before pulling the next
+   message (road 2, ADR 0007/0018): a returned promise applies per-message
+   backpressure, and because nats.js refills from its OWN buffered count, the
+   read rate gates the pull rate with nothing overflowing. The consume sibling of
+   core's `consume!` and this ns's `drain-fetch`. The iterable completing
+   (close/stop) ends the loop and flips `active?` off; a handler/decode throw or
+   rejection is contained and the loop CONTINUES — routing it to a per-consume
+   :on-error is the consume error-model follow-up. The `.next` `.catch` swallows
+   the close-race like core's loop."
+  [^js cm handler active?]
+  (let [it (.call (unchecked-get cm (.-asyncIterator js/Symbol)) cm)]
+    (letfn [(step []
+              (-> (.next it)
+                  (.then (fn [^js res]
+                           (if (.-done res)
+                             (reset! active? false)
+                             (-> (js/Promise. (fn [resolve _] (resolve (handler (js-msg->raw (.-value res))))))
+                                 (.then (fn [_] (step)))
+                                 (.catch (fn [_] (step)))))))
+                  (.catch (fn [_] (reset! active? false)))))]
+      (step))))
+
+;; The consume handle (ADR 0018): wraps nats.js' ConsumerMessages in the same
+;; Drainable/Sub shape core's JsSubscription gives a Subscription, so the core
+;; facade's drain/unsubscribe dispatch over it unchanged. `active?` is an atom the
+;; drive loop and the teardown verbs flip — nats.js exposes no liveness predicate.
+(defrecord JsConsumeHandle [cm active?]
+  proto/Drainable
+  ;; nats.js close() stops the iterator and resolves once the client side has
+  ;; cleaned up. Buffered undelivered messages are DISCARDED — un-acked, so the
+  ;; server redelivers them — where the JVM leg delivers them first: the settle's
+  ;; shape is portable, the wind-down native (ADR 0006).
+  (-drain [_]
+    (-> (.close ^js cm)
+        (core/then (fn [_] (reset! active? false) true))))
+  proto/Sub
+  (-active? [_] @active?)
+  ;; QueuedIterator stop() ends the iterator now and is a no-op once done — the
+  ;; idempotent abrupt teardown (ADR 0012). A consume has no auto-unsubscribe
+  ;; count, so any `max` is outside the range this operation accepts (ADR 0015's
+  ;; :invalid-max).
+  (-unsubscribe [_ max]
+    (when max
+      (throw (ex-info "consume handles do not support an auto-unsubscribe max"
+                      {:type :invalid-max :max max})))
+    (.stop ^js cm)
+    (reset! active? false)
+    nil))
+
 (extend-type JsJetStreamContext
   proto/JetStreamData
   (-js-publish [ctx subject headers bytes opts]
@@ -370,4 +440,16 @@
     (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
         (.then (fn [c] (.fetch c (->fetch-options opts))))
         (.then drain-fetch)
+        (.catch (fn [e] (throw (api-error e))))))
+  (-js-consume [ctx stream consumer opts handler]
+    ;; consumers.get resolves the pull Consumer (a missing one rejects ->
+    ;; :consumer-not-found via api-error, like next/fetch); consume() resolves the
+    ;; ConsumerMessages iterable the detached drive loop then owns. The handle
+    ;; resolves only after the loop is running, so no delivery can race it.
+    (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
+        (.then (fn [^js c] (.consume c (->consume-options opts))))
+        (.then (fn [cm]
+                 (let [active? (atom true)]
+                   (drive-consume! cm handler active?)
+                   (->JsConsumeHandle cm active?))))
         (.catch (fn [e] (throw (api-error e)))))))

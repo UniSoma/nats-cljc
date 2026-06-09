@@ -18,15 +18,16 @@
             [nats-cljc.jetstream.error :as jet-err]
             [nats-cljc.jetstream.stream :as stream]
             [nats-cljc.jetstream.consumer :as consumer]
-            [nats-cljc.jetstream.pull :as pull])
+            [nats-cljc.jetstream.pull :as pull]
+            [nats-cljc.jetstream.refill :as refill])
   (:import [nats_cljc.impl.jvm JvmConnection]
-           [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions ConsumerContext FetchConsumer FetchConsumeOptions Message]
+           [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions ConsumerContext FetchConsumer FetchConsumeOptions ConsumeOptions ConsumeOptions$Builder MessageConsumer MessageHandler Message]
            [io.nats.client.impl NatsJetStreamMetaData]
            [io.nats.client.api ServerInfo StreamConfiguration StorageType RetentionPolicy StreamInfo StreamState PublishAck ConsumerConfiguration AckPolicy DeliverPolicy ConsumerInfo SequenceInfo]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
            [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
-           [java.util.concurrent CompletableFuture ExecutorService RejectedExecutionException TimeUnit TimeoutException]
+           [java.util.concurrent CompletableFuture CompletionStage ExecutorService RejectedExecutionException TimeUnit TimeoutException]
            [java.util.function BiFunction Supplier]))
 
 ;; The JetStream context (ADR 0017): one handle holding both jnats' data-plane
@@ -414,6 +415,68 @@
     (when expires-ms (.expiresIn b (long expires-ms)))
     (.build b)))
 
+(defn- ->consume-options
+  "Build a jnats ConsumeOptions from the portable refill knobs (ADR 0018): `:batch`
+   is the per-pull-window message ceiling (explicitly defaulted to
+   `pull/default-batch` — jnats' own consume default is 500, nats.js' 100, so the
+   pin keeps the legs agreeing); `:threshold` is the portable refill COUNT,
+   converted to jnats' percent unit by the refill deep module so the repull point
+   lands exactly on the count; `:expires-ms` the pull window; `:max-bytes` the
+   byte cap (jnats' batchBytes). `:idle-heartbeat-ms` has no jnats setter — the
+   client derives its heartbeat from the expires window — so the knob is accepted
+   portably but the cadence here is native (ADR 0006 shape-not-cadence).
+
+   thresholdPercent/expiresIn are inherited from jnats' PROTECTED BaseConsumeOptions
+   Builder with no public-subclass override (unlike FetchConsumeOptions' builder),
+   so plain interop falls back to reflection and dies on the non-public declaring
+   class; the param-tagged qualified calls resolve them through the public
+   ConsumeOptions$Builder instead — re-verify on any jnats bump (pinned 2.25.3)."
+  ^ConsumeOptions [{:keys [batch threshold expires-ms max-bytes]}]
+  (let [bm (int (or batch pull/default-batch))
+        ^ConsumeOptions$Builder b (ConsumeOptions/builder)]
+    (.batchSize b bm)
+    (when threshold (^[int] ConsumeOptions$Builder/.thresholdPercent b (int (refill/threshold->percent threshold bm))))
+    (when expires-ms (^[long] ConsumeOptions$Builder/.expiresIn b (long expires-ms)))
+    (when max-bytes (.batchBytes b (long max-bytes)))
+    (.build b)))
+
+;; The consume handle (ADR 0018): wraps jnats' MessageConsumer in the same
+;; Drainable/Sub shape core's JvmSubscription gives a Subscription, so the core
+;; facade's drain/unsubscribe dispatch over it unchanged. There is no slow-consumer
+;; registry to clean up — pull has no :slow-consumer (ADR 0018).
+(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor]
+  proto/Drainable
+  ;; stop() ends new pulls but lets buffered messages deliver and the open pull
+  ;; wind down (bounded by the consume's :expires-ms window); jnats flags
+  ;; isFinished then, with no future to wait on, so the settle is an off-thread
+  ;; poll on the connection's IO pool — the pool built for long parks (ADR 0018).
+  (-drain [_]
+    (.stop mc)
+    (CompletableFuture/supplyAsync
+     (reify Supplier
+       (get [_]
+         (loop []
+           (if (.isFinished mc)
+             true
+             (do (Thread/sleep 50) (recur))))))
+     io-executor))
+  proto/Sub
+  ;; Stopped covers the drain window too: a draining consume no longer delivers
+  ;; new interest, matching "not yet drained, unsubscribed, or ended".
+  (-active? [_] (not (or (.isStopped mc) (.isFinished mc))))
+  ;; close() unsubscribes the underlying pull subscription now, dropping buffered
+  ;; messages (un-acked, so the server redelivers them) — the abrupt sibling of
+  ;; stop(). jnats' lenientClose already swallows its own teardown errors; the
+  ;; catch covers the checked signature for the idempotent no-op (ADR 0012).
+  ;; A consume has no auto-unsubscribe count, so any `max` is outside the range
+  ;; this operation accepts (ADR 0015's :invalid-max).
+  (-unsubscribe [_ max]
+    (when max
+      (throw (ex-info "consume handles do not support an auto-unsubscribe max"
+                      {:type :invalid-max :max max})))
+    (try (.close mc) (catch Exception _ nil))
+    nil))
+
 (extend-type JvmJetStreamContext
   proto/JetStreamData
   (-js-publish [ctx subject headers bytes opts]
@@ -447,4 +510,30 @@
             (if-let [msg (.nextMessage fc)]
               (recur (conj! acc (js-msg->raw msg)))
               (persistent! acc)))
-          (finally (.close fc)))))))
+          (finally (.close fc))))))
+  (-js-consume [ctx stream consumer opts handler]
+    ;; Road 2 (ADR 0007/0018): onMessage BLOCKS the consume's dispatcher thread on
+    ;; the handler's CompletionStage, exactly as core -subscribe does — serial
+    ;; delivery and promise-return backpressure fall out, and the backlog gates
+    ;; jnats' OWN refill (pendingUpdated never fires past a blocked handler), so
+    ;; the read rate bounds the pull rate with nothing overflowing. The
+    ;; getConsumerContext round-trip surfaces a missing consumer as
+    ;; :consumer-not-found via off-thread, like next/fetch.
+    (off-thread
+     (:io-executor ctx)
+     #(let [^ConsumerContext cctx (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
+            mh (reify MessageHandler
+                 (onMessage [_ msg]
+                   (try
+                     (let [r (handler (js-msg->raw msg))]
+                       (when (instance? CompletionStage r)
+                         (.join (.toCompletableFuture ^CompletionStage r))))
+                     ;; Catch Exception, not Throwable (the core -subscribe
+                     ;; precedent): a handler/decode failure must not re-raise
+                     ;; into jnats' dispatch loop. Routing it to a per-consume
+                     ;; :on-error is the consume error-model follow-up; until
+                     ;; that lands the failure is contained and delivery
+                     ;; continues.
+                     (catch Exception _ nil))))]
+        (->JvmConsumeHandle (.consume cctx (->consume-options opts) mh)
+                            (:io-executor ctx))))))

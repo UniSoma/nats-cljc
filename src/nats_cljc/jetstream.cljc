@@ -19,6 +19,7 @@
             [nats-cljc.jetstream.consumer :as consumer]
             [nats-cljc.jetstream.pub :as pub]
             [nats-cljc.jetstream.pull :as pull]
+            [nats-cljc.jetstream.refill :as refill]
             [nats-cljc.jetstream.acks :as acks]
             #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])
@@ -226,6 +227,54 @@
        (impl/then (fn [_] (pull/validate-expires opts)))
        (impl/bind (fn [_] (proto/-js-next ctx stream consumer opts)))
        (impl/then (fn [raw] (when raw (decode-js-msg (core/effective-codec ctx opts) raw)))))))
+
+(defn consume
+  "Continuously deliver from the durable Consumer `consumer` on Stream `stream`
+   through the JetStream context `ctx`, invoking `handler` with one PURE-DATA
+   message `{:subject :data :js}` at a time (plus `:headers` when present, shape as
+   in `fetch`), and returning a platform-native promise that resolves to a handle —
+   drainable and unsubscribable exactly like a core Subscription, via `core/drain`
+   and `core/unsubscribe` (ADR 0018).
+
+   `handler` is the core handler contract (ADR 0007): it may return a promise, and
+   the runtime waits for that promise to settle before delivering the next message
+   AND refilling — per-message backpressure with no async dependency, the client's
+   read rate gating its own pull rate. There is NO `:max-pending`/`:slow-consumer`
+   in pull: unrequested messages simply wait on the server (ADR 0018).
+
+   `opts` are the refill knobs (ADR 0018): `:batch` (max messages per pull window,
+   default 100), `:threshold` (refill once the buffered count drops to it; a COUNT
+   portably — the JVM converts count->percent; each client's default is 75% of
+   `:batch`), `:expires-ms` (the pull window — also how long a `drain` may take to
+   wind down the open pull), `:idle-heartbeat-ms` (server liveness pulses while
+   idle; accepted on both legs, but the JVM client derives its own cadence from
+   `:expires-ms` — shape, not cadence, ADR 0006), `:max-bytes` (a BYTE window per
+   pull, mutually exclusive with the message-count window — nats.js forbids setting
+   both, so `:max-bytes` with `:batch` or `:threshold` is rejected), and `:codec` (a
+   per-call decode override). The promise rejects pre-flight with a validation
+   `:type :invalid-name` when `stream` or `consumer` is malformed,
+   `:invalid-threshold` when `:threshold` is not a positive integer no greater than
+   `:batch`, `:exclusive-window` when `:max-bytes` is combined with `:batch`/
+   `:threshold`, `:invalid-expires` when a supplied `:expires-ms` is below the
+   1000ms floor or not a whole number (ADR 0015) — and operationally with
+   `:consumer-not-found` when no such Consumer exists (ADR 0020).
+
+   On the handle, `core/drain` stops new pulls and settles once the consume winds
+   down (on the JVM buffered messages deliver first; on CLJS the buffer is
+   discarded — un-acked, so the server redelivers them); `core/unsubscribe` ends it
+   abruptly and idempotently, and takes no `max` (a consume has no auto-unsubscribe
+   count — passing one throws `:type :invalid-max`)."
+  ([ctx stream consumer handler] (consume ctx stream consumer handler {}))
+  ([ctx stream consumer handler opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (stream/validate-name stream)))
+       (impl/then (fn [_] (consumer/validate-name consumer)))
+       (impl/then (fn [_] (refill/validate-opts opts)))
+       (impl/bind (fn [_]
+                    (let [codec (core/effective-codec ctx opts)]
+                      (proto/-js-consume ctx stream consumer
+                                         (select-keys opts [:batch :threshold :expires-ms :idle-heartbeat-ms :max-bytes])
+                                         (fn [raw] (handler (decode-js-msg codec raw))))))))))
 
 (defn- ack-publish!
   "The one ack code path (ADR 0019): publish the `verb` protocol payload to `msg`'s

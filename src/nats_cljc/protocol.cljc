@@ -174,4 +174,17 @@
      returning a native promise of a VECTOR of up to `:batch` raw JetStream message
      maps (the same `js-msg->raw` lift as `-js-next`), in stream order. The batch
      settles when `:batch` messages have arrived or the `:expires-ms` window elapses,
-     so a consumer with fewer than `:batch` pending yields a shorter vector (ADR 0018)."))
+     so a consumer with fewer than `:batch` pending yields a shorter vector (ADR 0018).")
+  (-js-consume [ctx stream consumer opts handler]
+    "Continuously deliver from the `consumer` on Stream `stream` through `ctx`,
+     returning a native promise of a handle carrying `Drainable`/`Sub` — the
+     JetStream counterpart of `-subscribe`'s Subscription record (ADR 0018).
+     `handler` is the low-level handler, invoked per message with ONE raw JetStream
+     message map (the per-leg `js-msg->raw` lift, as `-js-next`); a returned
+     promise suspends the next delivery until it settles, gating the impl's own
+     pull rate (per-message backpressure, ADR 0007 road 2 — each leg drives its
+     native consume machinery, so the refill engages natively). `opts` is the
+     validated refill-knob map `{:batch :threshold :expires-ms :idle-heartbeat-ms
+     :max-bytes}` the impl translates to native consume options (`:threshold`
+     count->percent on the JVM). There is no `:slow-consumer` in pull: a slow
+     handler slows the pull, nothing overflows (ADR 0018)."))
