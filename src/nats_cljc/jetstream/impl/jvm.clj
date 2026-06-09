@@ -440,26 +440,47 @@
     (when max-bytes (.batchBytes b (long max-bytes)))
     (.build b)))
 
+;; jnats BaseConsumeOptions/DEFAULT_EXPIRES_IN_MILLIS — the consume pull window when a
+;; caller omits :expires-ms; the drain deadline falls back to it so a default-window
+;; consume's wind-down stays bounded. The grace covers the final buffered flush after the
+;; in-flight pull expires.
+(def ^:private consume-default-expires-ms 30000)
+(def ^:private drain-grace-ms 1000)
+
+(defn- ->drain-deadline-ms
+  "The bounded wind-down budget for a consume's drain: the pull window (jnats' 30s default
+   when :expires-ms is omitted) plus a flush grace, so the off-thread poll can never spin
+   past it when the consume never reports finished (ADR 0018)."
+  [{:keys [expires-ms]}]
+  (+ (or expires-ms consume-default-expires-ms) drain-grace-ms))
+
 ;; The consume handle (ADR 0018): wraps jnats' MessageConsumer in the same
 ;; Drainable/Sub shape core's JvmSubscription gives a Subscription, so the core
 ;; facade's drain/unsubscribe dispatch over it unchanged. There is no slow-consumer
 ;; registry to clean up — pull has no :slow-consumer (ADR 0018).
-(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor]
+(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor drain-deadline-ms]
   proto/Drainable
   ;; stop() ends new pulls but lets buffered messages deliver and the open pull
-  ;; wind down (bounded by the consume's :expires-ms window); jnats flags
-  ;; isFinished then, with no future to wait on, so the settle is an off-thread
-  ;; poll on the connection's IO pool — the pool built for long parks (ADR 0018).
+  ;; wind down; jnats flags isFinished then, with no future to wait on, so the
+  ;; settle is an off-thread poll on the connection's IO pool — the pool built for
+  ;; long parks, and off-thread maps a submit racing connection-close to a rejected
+  ;; :connection-closed rather than a synchronous RejectedExecutionException (ADR
+  ;; 0006/0018). The poll is bounded by drain-deadline-ms (the :expires-ms window
+  ;; plus a flush grace): a handler whose returned promise never settles parks the
+  ;; dispatcher so isFinished never flips, and without the deadline the loop would
+  ;; spin and leak the IO thread for the process lifetime; at the deadline it gives
+  ;; up (false) and releases the thread.
   (-drain [_]
     (.stop mc)
-    (CompletableFuture/supplyAsync
-     (reify Supplier
-       (get [_]
+    (off-thread
+     io-executor
+     (fn []
+       (let [deadline (+ (System/currentTimeMillis) drain-deadline-ms)]
          (loop []
-           (if (.isFinished mc)
-             true
-             (do (Thread/sleep 50) (recur))))))
-     io-executor))
+           (cond
+             (.isFinished mc)                         true
+             (>= (System/currentTimeMillis) deadline) false
+             :else                                    (do (Thread/sleep 50) (recur))))))))
   proto/Sub
   ;; Stopped covers the drain window too: a draining consume no longer delivers
   ;; new interest, matching "not yet drained, unsubscribed, or ended".
@@ -536,4 +557,5 @@
                      ;; continues.
                      (catch Exception _ nil))))]
         (->JvmConsumeHandle (.consume cctx (->consume-options opts) mh)
-                            (:io-executor ctx))))))
+                            (:io-executor ctx)
+                            (->drain-deadline-ms opts))))))

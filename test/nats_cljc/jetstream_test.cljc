@@ -20,7 +20,8 @@
             #?(:clj  [nats-cljc.jetstream.impl.jvm :as jet-jvm]
                :cljs [nats-cljc.jetstream.impl.js :as jet-js])
             #?(:cljs [promesa.core :as p]))
-  #?(:clj (:import [io.nats.client Connection$Status])))
+  #?(:clj (:import [io.nats.client Connection$Status MessageConsumer]
+                   [java.util.concurrent CompletableFuture Executors])))
 
 ;; The anonymous server (ci/nats.conf) is the only leg with a jetstream{} block
 ;; (ADR 0017): the JetStream context is obtained here. TCP on the JVM, ws on CLJS
@@ -1348,6 +1349,48 @@
                           (is (true? (proto/-active? handle)) "the handle is active while consuming")
                           (p/let [_ (nats/drain handle)]
                             (is (false? (proto/-active? handle)) "a drained handle is no longer active"))))))))))))
+
+;; JVM only, no server: a consume drain racing the connection's close must settle as a
+;; rejected :connection-closed future — the same normalization off-thread gives every
+;; other JVM JetStream verb — not throw RejectedExecutionException synchronously out of
+;; -drain. A fake MessageConsumer (stop a no-op, already finished) over a SHUT-DOWN
+;; io-executor stands in for the race: the supplyAsync submit hits the dead pool. Route
+;; the wind-down poll straight to the raw executor and the submit throws here instead.
+#?(:clj
+   (deftest jvm-consume-drain-racing-close-settles-rejected
+     (let [stopped? (atom false)
+           mc       (reify MessageConsumer
+                      (stop [_] (reset! stopped? true))
+                      (isFinished [_] true)
+                      (isStopped [_] false)
+                      (close [_] nil))
+           executor (doto (Executors/newSingleThreadExecutor) (.shutdown))
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 1000)
+           fut      (proto/-drain handle)]
+       (is (true? @stopped?) "-drain stops the underlying consumer")
+       (is (instance? CompletableFuture fut) "-drain returns a future, not a synchronous throw")
+       (is (= :connection-closed (:type (ex-data (reject-reason fut))))
+           "a drain racing connection-close settles as a rejected :connection-closed (bare ex-info)"))))
+
+;; JVM only, no server: a drain whose consume never reports finished — a handler whose
+;; returned promise never settles parks the dispatcher, so isFinished never flips — must
+;; settle at the wind-down deadline rather than spin the poll loop (and leak the io-executor
+;; thread) for the process lifetime. A fake MessageConsumer pinned isFinished=false with a
+;; short drain-deadline-ms stands in: the poll must give up at the deadline. Drop the
+;; deadline guard and the deref below times out — the leak this bounds.
+#?(:clj
+   (deftest jvm-consume-drain-bounded-when-never-finished
+     (let [mc       (reify MessageConsumer
+                      (stop [_] nil)
+                      (isFinished [_] false)
+                      (isStopped [_] false)
+                      (close [_] nil))
+           executor (Executors/newSingleThreadExecutor)
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 200)
+           settled  (deref (proto/-drain handle) 3000 ::timeout)]
+       (.shutdownNow executor)
+       (is (not= ::timeout settled)
+           "drain settles at the wind-down deadline when the consume never reports finished"))))
 
 ;; ADR 0007/0018, integration on the :4222 JetStream server: a slow
 ;; promise-returning handler measurably gates delivery — the consume twin of core's
