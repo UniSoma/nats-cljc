@@ -40,6 +40,12 @@
    JVM, where jnats would accept both as dual caps, rejects identically so the
    contract holds on both legs.
 
+   `:batch` (the max-messages pull size) must be a positive integer when present —
+   `0` is truthy, so it would otherwise slip past the `(or batch default-batch)`
+   fallback and reach the native client as a zero pull size; a negative or
+   non-integer does the same. Anything else throws `:type :invalid-batch` carrying
+   the offending `:batch`, identical on both legs.
+
    `:threshold` must be a positive integer no greater than `:batch` (defaulting to
    `pull/default-batch` when omitted) — anything else throws `:type
    :invalid-threshold` carrying the offending `:threshold`, identical on both legs,
@@ -51,6 +57,10 @@
     (throw (ex-info "Consume :max-bytes (a byte window) is mutually exclusive with the message-count :batch/:threshold"
                     {:type :exclusive-window :max-bytes (:max-bytes opts)
                      :batch (:batch opts) :threshold (:threshold opts)})))
+  (when-some [batch (:batch opts)]
+    (when-not (pos-int? batch)
+      (throw (ex-info "Consume :batch must be a positive integer"
+                      {:type :invalid-batch :batch batch}))))
   (when-some [threshold (:threshold opts)]
     (let [batch (:batch opts pull/default-batch)]
       (when-not (and (pos-int? threshold) (<= threshold batch))
