@@ -197,15 +197,9 @@
 (def ^:private a-config
   {:name "TRACER" :subjects ["tracer.>"] :storage :memory :retention :work-queue :max-age-ms 60000})
 
-;; A loose ISO-8601 matcher: a date, a `T`, and a time. The JVM formats its
-;; ZonedDateTime to this; nats.js hands back the server's RFC3339 string already in
-;; it — the cross-leg point is that `:created` is a normalized timestamp string,
-;; never a native ZonedDateTime/Date (ADR 0020).
-(def ^:private iso-re #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.*")
-
-;; The strict canonical `:timestamp` shape both legs emit (ADR 0019 pure-data parity):
-;; UTC, exactly three fractional digits, ending in `Z` — e.g. 2026-06-09T01:08:17.279Z.
-;; Tighter than `iso-re` on purpose: it rejects the JVM leg's old variable-digit,
+;; The strict canonical shape every portable wall-clock timestamp emits on both legs
+;; (ADR 0019 pure-data parity): UTC, exactly three fractional digits, ending in `Z` —
+;; e.g. 2026-06-09T01:08:17.279Z. Deliberately strict: it rejects the old variable-digit,
 ;; source-offset formatting, so a divergence there can't ship green over the live path.
 (def ^:private canonical-ts-re #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
 
@@ -286,6 +280,47 @@
                    (java.time.ZonedDateTime/parse "2026-06-09T01:08:17.279999999Z"))
             :cljs (#'jet-js/->canonical-timestamp "2026-06-09T01:08:17.279999999Z")))
       "a delivered :timestamp normalizes to UTC, exactly three fractional digits, truncated to millis"))
+
+;; Deep-module unit (ADR 0019/0020), no server: stream-info :created crosses the
+;; portable boundary, so it must route through the same canonical formatter as a
+;; delivered :timestamp — UTC, exactly three fractional digits, truncated. A known
+;; server instant carrying a non-UTC offset and nanosecond precision (the shapes the
+;; server actually hands back) must yield one byte-identical string on both legs.
+(deftest deep-module-stream-info-created-canonical
+  (is (= "2026-06-08T23:08:17.279Z"
+         (:created
+          #?(:clj  (jet-jvm/stream-info->map
+                    (io.nats.client.api.StreamInfo.
+                     (io.nats.client.support.JsonParser/parse
+                      "{\"config\":{\"name\":\"S\",\"subjects\":[\"s.>\"],\"retention\":\"limits\",\"storage\":\"file\",\"max_age\":0},\"created\":\"2026-06-09T01:08:17.279999999+02:00\",\"state\":{\"messages\":0,\"bytes\":0,\"first_seq\":0,\"last_seq\":0,\"consumer_count\":0}}")))
+             :cljs (jet-js/stream-info->map
+                    #js {:config  #js {:name "S" :subjects #js ["s.>"] :retention "limits"
+                                       :storage "file" :max_age 0}
+                         :created "2026-06-09T01:08:17.279999999+02:00"
+                         :state   #js {:messages 0 :bytes 0 :first_seq 0 :last_seq 0
+                                       :consumer_count 0}}))))
+      "stream-info :created normalizes to the canonical UTC-millis form, byte-identical across legs"))
+
+;; Deep-module unit (ADR 0019/0020), no server: consumer-info :created is the same
+;; portable-boundary timestamp as stream-info's — same canonical formatter, same
+;; known offset-bearing nanosecond instant, one byte-identical string on both legs.
+(deftest deep-module-consumer-info-created-canonical
+  (is (= "2026-06-08T23:08:17.279Z"
+         (:created
+          #?(:clj  (jet-jvm/consumer-info->map
+                    (io.nats.client.api.ConsumerInfo.
+                     (io.nats.client.support.JsonParser/parse
+                      "{\"stream_name\":\"S\",\"name\":\"C\",\"created\":\"2026-06-09T01:08:17.279999999+02:00\",\"config\":{\"durable_name\":\"C\",\"ack_policy\":\"explicit\",\"deliver_policy\":\"all\",\"ack_wait\":30000000000,\"max_deliver\":-1},\"delivered\":{\"consumer_seq\":0,\"stream_seq\":0},\"ack_floor\":{\"consumer_seq\":0,\"stream_seq\":0},\"num_pending\":0}")))
+             :cljs (jet-js/consumer-info->map
+                    #js {:stream_name "S" :name "C"
+                         :created     "2026-06-09T01:08:17.279999999+02:00"
+                         :config      #js {:durable_name "C" :ack_policy "explicit"
+                                           :deliver_policy "all" :ack_wait 30000000000
+                                           :max_deliver -1}
+                         :delivered   #js {:consumer_seq 0 :stream_seq 0}
+                         :ack_floor   #js {:consumer_seq 0 :stream_seq 0}
+                         :num_pending 0}))))
+      "consumer-info :created normalizes to the canonical UTC-millis form, byte-identical across legs"))
 
 ;; AC4, deep-module unit (ADR 0015/0020), no server: the reserved-header guard is the
 ;; portable pre-flight that keeps the Nats-* namespace sanctioned-only — :msg-id and
@@ -633,7 +668,7 @@
 
 ;; AC1 + AC2 (ADR 0017/0020), integration on the JetStream-enabled :4222 server:
 ;; create a Stream from the portable config and read its normalized info back (config
-;; round-trips, :created is an ISO-8601 string, a fresh stream has no messages), then
+;; round-trips, :created is the canonical timestamp string, a fresh stream has no messages), then
 ;; delete it and confirm a subsequent info surfaces the operational :stream-not-found.
 (deftest stream-create-info-delete
   #?(:clj
@@ -644,7 +679,7 @@
                info    (deref (jet/stream-info ctx "TRACER") 5000 ::timeout)]
            (is (= a-config (:config created)) "create-stream returns the normalized config")
            (is (= a-config (:config info)) "stream-info round-trips the normalized config")
-           (is (re-matches iso-re (:created info)) "stream-info :created is an ISO-8601 string")
+           (is (re-matches canonical-ts-re (:created info)) "stream-info :created is the canonical UTC-millis string")
            (is (= 0 (get-in info [:state :messages])) "a freshly created stream has no messages")
            (is (nil? (deref (jet/delete-stream ctx "TRACER") 5000 ::timeout)) "delete-stream resolves nil")
            (is (= :stream-not-found (:type (ex-data (reject-reason (jet/stream-info ctx "TRACER")))))
@@ -658,7 +693,7 @@
                         info    (jet/stream-info ctx "TRACER")]
                   (is (= a-config (:config created)) "create-stream returns the normalized config")
                   (is (= a-config (:config info)) "stream-info round-trips the normalized config")
-                  (is (re-matches iso-re (:created info)) "stream-info :created is an ISO-8601 string")
+                  (is (re-matches canonical-ts-re (:created info)) "stream-info :created is the canonical UTC-millis string")
                   (is (= 0 (get-in info [:state :messages])) "a freshly created stream has no messages")
                   (p/let [del (jet/delete-stream ctx "TRACER")]
                     (is (nil? del) "delete-stream resolves nil")
@@ -675,7 +710,7 @@
 
 ;; AC1 + AC2 (ADR 0020), integration on the JetStream-enabled :4222 server: create a
 ;; durable Consumer on a Stream from the portable config and read its normalized info
-;; back — the config round-trips, :created is an ISO-8601 string, and a fresh consumer
+;; back — the config round-trips, :created is the canonical timestamp string, and a fresh consumer
 ;; has delivered/ack-floor cursors at zero with nothing pending. Same on both legs;
 ;; creates its own stream fixture and cleans up.
 (deftest consumer-create-info
@@ -690,7 +725,7 @@
            (is (= "TRACER_C" (:name created)) "create-consumer returns the durable name")
            (is (= a-consumer-config (:config created)) "create-consumer returns the normalized config")
            (is (= a-consumer-config (:config info)) "consumer-info round-trips the normalized config")
-           (is (re-matches iso-re (:created info)) "consumer-info :created is an ISO-8601 string")
+           (is (re-matches canonical-ts-re (:created info)) "consumer-info :created is the canonical UTC-millis string")
            (is (= 0 (get-in info [:delivered :stream-seq])) "a fresh consumer has delivered nothing")
            (is (= 0 (get-in info [:ack-floor :stream-seq])) "a fresh consumer's ack floor is zero")
            (is (= 0 (:pending info)) "a fresh consumer has nothing pending")
@@ -707,7 +742,7 @@
                   (is (= "TRACER_C" (:name created)) "create-consumer returns the durable name")
                   (is (= a-consumer-config (:config created)) "create-consumer returns the normalized config")
                   (is (= a-consumer-config (:config info)) "consumer-info round-trips the normalized config")
-                  (is (re-matches iso-re (:created info)) "consumer-info :created is an ISO-8601 string")
+                  (is (re-matches canonical-ts-re (:created info)) "consumer-info :created is the canonical UTC-millis string")
                   (is (= 0 (get-in info [:delivered :stream-seq])) "a fresh consumer has delivered nothing")
                   (is (= 0 (get-in info [:ack-floor :stream-seq])) "a fresh consumer's ack floor is zero")
                   (is (= 0 (:pending info)) "a fresh consumer has nothing pending")

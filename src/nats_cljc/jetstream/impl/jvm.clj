@@ -255,31 +255,47 @@
    :max-deliver (.getMaxDeliver c)
    :filter-subjects (vec (.getFilterSubjects c))})
 
+;; The one canonical format every portable wall-clock timestamp emits (ADR 0019
+;; pure-data parity): ISO-8601 in UTC with exactly three fractional digits — e.g.
+;; 2026-06-09T01:08:17.279Z. `appendInstant(3)` truncates sub-millisecond precision
+;; (never rounds) and forces the `Z` offset, so the string is byte-identical to the
+;; Node leg's `Date#toISOString`. This is the single date seam on this leg — every
+;; surfaced timestamp (`:js :timestamp`, the `:created` fields) routes through it;
+;; nothing formats ad hoc via `ISO_OFFSET_DATE_TIME` (source offset, variable digits).
+(def ^:private ^DateTimeFormatter canonical-instant
+  (-> (DateTimeFormatterBuilder.) (.appendInstant 3) .toFormatter))
+
+(defn- ->canonical-timestamp
+  "Normalize a jnats ZonedDateTime to the canonical portable timestamp string."
+  [^ZonedDateTime zdt]
+  (.format canonical-instant (.toInstant zdt)))
+
 (defn consumer-info->map
   "Curate a jnats ConsumerInfo into the normalized portable map (ADR 0020): the active
-   `:config`, the `:created` timestamp as ISO-8601 (the same ZonedDateTime formatting
-   as `stream-info->map`), and the delivery cursors — `:delivered` and `:ack-floor`
-   each a `{:consumer-seq :stream-seq}` pair, plus the `:pending` count."
+   `:config`, the `:created` timestamp normalized to the canonical UTC-millis string
+   (`->canonical-timestamp`, same as `stream-info->map`), and the delivery cursors —
+   `:delivered` and `:ack-floor` each a `{:consumer-seq :stream-seq}` pair, plus the
+   `:pending` count."
   [^ConsumerInfo ci]
   (let [^SequenceInfo d  (.getDelivered ci)
         ^SequenceInfo af (.getAckFloor ci)]
     {:stream    (.getStreamName ci)
      :name      (.getName ci)
      :config    (consumer-config->map (.getConsumerConfiguration ci))
-     :created   (.format (.getCreationTime ci) DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+     :created   (->canonical-timestamp (.getCreationTime ci))
      :delivered {:consumer-seq (.getConsumerSequence d) :stream-seq (.getStreamSequence d)}
      :ack-floor {:consumer-seq (.getConsumerSequence af) :stream-seq (.getStreamSequence af)}
      :pending   (.getNumPending ci)}))
 
 (defn stream-info->map
   "Curate a jnats StreamInfo into the normalized portable map (ADR 0020): the active
-   `:config`, the `:created` timestamp as ISO-8601 (jnats hands back a
-   ZonedDateTime, whose `toString` carries a `[GMT]` zone-region suffix that
-   ISO_OFFSET_DATE_TIME drops), and a curated `:state`."
+   `:config`, the `:created` timestamp normalized to the canonical UTC-millis string
+   (`->canonical-timestamp` — jnats hands back a ZonedDateTime), and a curated
+   `:state`."
   [^StreamInfo si]
   (let [^StreamState st (.getStreamState si)]
     {:config (stream-config->map (.getConfiguration si))
-     :created (.format (.getCreateTime si) DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+     :created (->canonical-timestamp (.getCreateTime si))
      :state {:messages (.getMsgCount st)
              :bytes (.getByteCount st)
              :first-seq (.getFirstSequence st)
@@ -361,20 +377,6 @@
                   (throw (publish-ex->ex-info e))
                   (->pub-ack ack)))))
    identity))
-
-;; The one canonical `:timestamp` format both legs emit (ADR 0019 pure-data parity):
-;; ISO-8601 in UTC with exactly three fractional digits — e.g. 2026-06-09T01:08:17.279Z.
-;; `appendInstant(3)` truncates sub-millisecond precision (never rounds) and forces the
-;; `Z` offset, so a delivered message's `:timestamp` is byte-identical to the Node leg's
-;; `Date#toISOString`. This is NOT the `ISO_OFFSET_DATE_TIME` `:created` uses — that
-;; carries the source offset and variable fractional digits, which diverge across legs.
-(def ^:private ^DateTimeFormatter canonical-instant
-  (-> (DateTimeFormatterBuilder.) (.appendInstant 3) .toFormatter))
-
-(defn- ->canonical-timestamp
-  "Normalize a jnats metadata ZonedDateTime to the canonical `:timestamp` string."
-  [^ZonedDateTime zdt]
-  (.format canonical-instant (.toInstant zdt)))
 
 (defn js-msg->raw
   "Lift a delivered JetStream Message into the pure-data pull map (ADR 0019): the core

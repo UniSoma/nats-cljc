@@ -119,10 +119,20 @@
    :max-deliver     (.-max_deliver c)
    :filter-subjects (vec (.-filter_subjects c))})
 
+(defn- ->canonical-timestamp
+  "Normalize a server ISO-8601 timestamp string to the canonical portable form by
+   re-emitting through `Date#toISOString` — UTC, exactly three fractional digits,
+   truncated to millis. This is the single date seam on this leg — every surfaced
+   timestamp (`:js :timestamp`, the `:created` fields) routes through it rather than
+   passing the raw server string (full nanosecond precision, source offset) through,
+   so it is byte-identical to the JVM leg's `->canonical-timestamp`."
+  [s]
+  (.toISOString (js/Date. s)))
+
 (defn consumer-info->map
   "Curate a nats.js ConsumerInfo into the normalized portable map (ADR 0020): the
-   active `:config`, the `:created` timestamp (nats.js already hands back an ISO-8601
-   string, matching the JVM leg's formatted ZonedDateTime), and the delivery cursors —
+   active `:config`, the `:created` timestamp normalized to the canonical UTC-millis
+   string (`->canonical-timestamp`, matching the JVM leg), and the delivery cursors —
    `:delivered` and `:ack-floor` each a `{:consumer-seq :stream-seq}` pair, plus the
    `:pending` count."
   [^js ci]
@@ -131,20 +141,19 @@
     {:stream    (.-stream_name ci)
      :name      (.-name ci)
      :config    (consumer-config->map (.-config ci))
-     :created   (.-created ci)
+     :created   (->canonical-timestamp (.-created ci))
      :delivered {:consumer-seq (.-consumer_seq d) :stream-seq (.-stream_seq d)}
      :ack-floor {:consumer-seq (.-consumer_seq af) :stream-seq (.-stream_seq af)}
      :pending   (.-num_pending ci)}))
 
 (defn stream-info->map
   "Curate a nats.js StreamInfo into the normalized portable map (ADR 0020): the
-   active `:config`, the `:created` timestamp (nats.js already hands back an
-   ISO-8601 string, so no formatting — the JVM leg formats its ZonedDateTime to
-   match), and a curated `:state`."
+   active `:config`, the `:created` timestamp normalized to the canonical UTC-millis
+   string (`->canonical-timestamp`, matching the JVM leg), and a curated `:state`."
   [^js si]
   (let [st ^js (.-state si)]
     {:config  (stream-config->map (.-config si))
-     :created (.-created si)
+     :created (->canonical-timestamp (.-created si))
      :state   {:messages       (.-messages st)
                :bytes          (.-bytes st)
                :first-seq      (.-first_seq st)
@@ -271,14 +280,6 @@
     (let [consumers ^js (.-consumers ^js (:jsm ctx))]
       (-> (drain-lister (.list consumers stream) [])
           with-api-error))))
-
-(defn- ->canonical-timestamp
-  "Normalize JsMsg's ISO-8601 :timestamp to the canonical form by re-emitting through
-   `Date#toISOString` — UTC, exactly three fractional digits, truncated to millis. The
-   CLJS leg owns the canonical format rather than inheriting whatever nats.js happens to
-   format, so it is byte-identical to the JVM leg's `->canonical-timestamp`."
-  [s]
-  (.toISOString (js/Date. s)))
 
 (defn js-msg->raw
   "Lift a delivered JsMsg into the pure-data pull map (ADR 0019): the core `msg->raw`
