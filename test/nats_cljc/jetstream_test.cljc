@@ -882,7 +882,9 @@
 ;; (:max-deliver) takes the new value while the absent keys (:ack-wait-ms, :ack-policy)
 ;; keep their CURRENT values, the merge semantics both legs share (nats.js merges
 ;; natively; the JVM leg reproduces the read-merge-write) — verified through an
-;; independent consumer-info read-back. An update against a missing durable surfaces
+;; independent consumer-info read-back. The seeded :ack-wait-ms (45000) is deliberately
+;; NOT the server default (30000), so a non-merging update would revert it and fail
+;; the keep-assertion instead of passing vacuously. An update against a missing durable surfaces
 ;; the operational :consumer-not-found, same as info/delete. Cleans up.
 (deftest consumer-update-changes-config
   #?(:clj
@@ -893,12 +895,12 @@
            (with-stream ctx "UCTRACER"
              (fn []
                (deref (jet/create-consumer ctx "UCTRACER" {:name "UC_TRACER" :ack-policy :explicit
-                                                           :ack-wait-ms 30000 :max-deliver 5}) 5000 ::timeout)
+                                                           :ack-wait-ms 45000 :max-deliver 5}) 5000 ::timeout)
                (let [updated (deref (jet/update-consumer ctx "UCTRACER" {:name "UC_TRACER" :max-deliver 7}) 5000 ::timeout)
                      info    (deref (jet/consumer-info ctx "UCTRACER" "UC_TRACER") 5000 ::timeout)]
                  (is (= 7 (get-in updated [:config :max-deliver])) "update-consumer returns the new active config")
                  (is (= 7 (get-in info [:config :max-deliver])) "consumer-info confirms the changed key")
-                 (is (= 30000 (get-in info [:config :ack-wait-ms])) "a key absent from the update keeps its current value")
+                 (is (= 45000 (get-in info [:config :ack-wait-ms])) "a key absent from the update keeps its current value")
                  (is (= :explicit (get-in info [:config :ack-policy])) "the current ack policy survives the merge")
                  (is (= :consumer-not-found (:type (ex-data (reject-reason (jet/update-consumer ctx "UCTRACER" {:name "NO_SUCH_CONSUMER"})))))
                      "updating a missing consumer surfaces :consumer-not-found")))))))
@@ -911,12 +913,12 @@
                   (with-stream ctx "UCTRACER"
                     (fn []
                       (p/let [_       (jet/create-consumer ctx "UCTRACER" {:name "UC_TRACER" :ack-policy :explicit
-                                                                           :ack-wait-ms 30000 :max-deliver 5})
+                                                                           :ack-wait-ms 45000 :max-deliver 5})
                               updated (jet/update-consumer ctx "UCTRACER" {:name "UC_TRACER" :max-deliver 7})
                               info    (jet/consumer-info ctx "UCTRACER" "UC_TRACER")]
                         (is (= 7 (get-in updated [:config :max-deliver])) "update-consumer returns the new active config")
                         (is (= 7 (get-in info [:config :max-deliver])) "consumer-info confirms the changed key")
-                        (is (= 30000 (get-in info [:config :ack-wait-ms])) "a key absent from the update keeps its current value")
+                        (is (= 45000 (get-in info [:config :ack-wait-ms])) "a key absent from the update keeps its current value")
                         (is (= :explicit (get-in info [:config :ack-policy])) "the current ack policy survives the merge")
                         (-> (jet/update-consumer ctx "UCTRACER" {:name "NO_SUCH_CONSUMER"})
                             (p/then (fn [_] (is false "expected :consumer-not-found for a missing consumer")))
