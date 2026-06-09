@@ -38,7 +38,9 @@
 ;; `:data` with it unless a per-call `:codec` overrides (ADR 0011). `io-executor` is
 ;; the connection's per-connection IO pool, carried so every off-thread JetStream op
 ;; runs there instead of the shared commonPool (the connection owns its lifecycle).
-(defrecord JvmJetStreamContext [^JetStream js ^JetStreamManagement jsm codec ^ExecutorService io-executor])
+;; `client` is the owning jnats Connection, carried so consume handles can consult
+;; its status as a liveness input (ADR 0022's "connection ends it" clause).
+(defrecord JvmJetStreamContext [^JetStream js ^JetStreamManagement jsm codec ^ExecutorService io-executor ^Connection client])
 
 (defn verify-io-type
   "Classify the `IOException` jnats raises when the forced `$JS.API.INFO` round-trip
@@ -115,7 +117,7 @@
                                         "JetStream INFO request timed out"
                                         "JetStream is not enabled on the server or account")
                                       {:type (verify-io-type available?)} e)))))
-                (->JvmJetStreamContext js jsm (:codec conn) io-executor))
+                (->JvmJetStreamContext js jsm (:codec conn) io-executor client))
               (catch IOException e
                 ;; Reached ONLY from the construction above (ensureNotClosing on a
                 ;; non-open connection): the round-trip IOException is already
@@ -458,7 +460,7 @@
 ;; Drainable/Sub shape core's JvmSubscription gives a Subscription, so the core
 ;; facade's drain/unsubscribe dispatch over it unchanged. There is no slow-consumer
 ;; registry to clean up — pull has no :slow-consumer (ADR 0018).
-(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor drain-deadline-ms closed?]
+(defrecord JvmConsumeHandle [^MessageConsumer mc ^ExecutorService io-executor drain-deadline-ms closed? conn-closed?]
   proto/Drainable
   ;; stop() ends new pulls but lets buffered messages deliver and the open pull
   ;; wind down; jnats flags isFinished then, with no future to wait on, so the
@@ -488,8 +490,15 @@
   ;; completes. A gave-up drain (the bounded poll above settling false) therefore
   ;; leaves the handle active: the consumer genuinely never wound down. close()
   ;; sets only the stopped flag, never finished, so unsubscribe tracks its own
-  ;; `closed?` to flip the handle inactive.
-  (-active? [_] (not (or @closed? (.isFinished mc))))
+  ;; `closed?` to flip the handle inactive. `conn-closed?` adds the connection's
+  ;; own teardown as a third false-input (ADR 0022's "connection ends it"
+  ;; clause): jnats never touches the consumer's flags when the connection
+  ;; closes, so without it a handle on a closed connection would report active
+  ;; forever — where the CLJS leg flips for free when the iterator ends. Only
+  ;; the terminal CLOSED counts (the supplier built at -js-consume): a transient
+  ;; disconnect/reconnect keeps the handle active, matching nats.js consume
+  ;; iterators surviving reconnects.
+  (-active? [_] (not (or @closed? (.isFinished mc) (conn-closed?))))
   ;; close() unsubscribes the underlying pull subscription now, dropping buffered
   ;; messages (un-acked, so the server redelivers them) — the abrupt sibling of
   ;; stop(). jnats' lenientClose already swallows its own teardown errors; the
@@ -565,4 +574,6 @@
         (->JvmConsumeHandle (.consume cctx (->consume-options opts) mh)
                             (:io-executor ctx)
                             (->drain-deadline-ms opts)
-                            (atom false))))))
+                            (atom false)
+                            (let [^Connection client (:client ctx)]
+                              (fn [] (= Connection$Status/CLOSED (.getStatus client)))))))))

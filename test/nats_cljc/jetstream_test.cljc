@@ -1338,7 +1338,7 @@
                       (isStopped [_] false)
                       (close [_] nil))
            executor (doto (Executors/newSingleThreadExecutor) (.shutdown))
-           handle   (jet-jvm/->JvmConsumeHandle mc executor 1000 (atom false))
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 1000 (atom false) (constantly false))
            fut      (proto/-drain handle)]
        (is (true? @stopped?) "-drain stops the underlying consumer")
        (is (instance? CompletableFuture fut) "-drain returns a future, not a synchronous throw")
@@ -1359,7 +1359,7 @@
                       (isStopped [_] false)
                       (close [_] nil))
            executor (Executors/newSingleThreadExecutor)
-           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false))
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false) (constantly false))
            settled  (deref (proto/-drain handle) 3000 ::timeout)]
        (.shutdownNow executor)
        (is (not= ::timeout settled)
@@ -1380,7 +1380,7 @@
                       (isStopped [_] true)
                       (close [_] nil))
            executor (Executors/newSingleThreadExecutor)
-           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false))
+           handle   (jet-jvm/->JvmConsumeHandle mc executor 200 (atom false) (constantly false))
            settled  (deref (proto/-drain handle) 3000 ::timeout)]
        (.shutdownNow executor)
        (is (false? settled) "a wind-down that never finishes settles false at the deadline")
@@ -1512,6 +1512,56 @@
                             (p/let [settled drained]
                               (is (true? settled) "drain settles true once the wind-down completes")
                               (is (false? (proto/-active? handle)) "the handle flips inactive once the drain settles")))))))))))))
+
+;; ADR 0022, integration on the :4222 JetStream server: `-active?` flips false once
+;; the CONNECTION ends the consume — the "connection ends it" clause, the false-input
+;; connection teardown adds alongside wind-down and unsubscribe. A second connection
+;; owns the consume so closing it is the act under test while the outer envelope's
+;; connection still tears the stream down. Only a terminal close counts: a transient
+;; reconnect keeps the handle active on both legs (nats.js consume iterators survive
+;; reconnects; the JVM consults only CLOSED). The flip is async on CLJS (the drive
+;; loop sees the iterator end), so both legs observe it through wait-for. Memory
+;; stream, cleans up.
+(deftest consume-inactive-after-connection-close
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "CONSCLS" :subjects ["conscls.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "CONSCLS"
+             (fn []
+               (deref (jet/create-consumer ctx "CONSCLS" {:name "CONSCLS_C" :durable? true :ack-policy :explicit :filter-subjects ["conscls.a"]}) 5000 ::timeout)
+               (with-conn {:servers [server-url]}
+                 (fn [conn2]
+                   (let [ctx2   (deref (jet/jetstream conn2) 5000 ::timeout)
+                         handle (deref (jet/consume ctx2 "CONSCLS" "CONSCLS_C"
+                                                    (fn [_] (java.util.concurrent.CompletableFuture/completedFuture nil))
+                                                    {:expires-ms 2000})
+                                       5000 ::timeout)]
+                     (is (true? (proto/-active? handle)) "the handle is active while its connection is open")
+                     (deref (nats/close conn2) 5000 ::timeout)
+                     (is (wait-for #(false? (proto/-active? handle)) 5000)
+                         "the handle reports inactive after the owning connection closes")))))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "CONSCLS" :subjects ["conscls.>"] :storage :memory})]
+                  (with-stream ctx "CONSCLS"
+                    (fn []
+                      (p/let [_     (jet/create-consumer ctx "CONSCLS" {:name "CONSCLS_C" :durable? true :ack-policy :explicit :filter-subjects ["conscls.a"]})
+                              conn2 (nats/connect {:servers [server-url]})]
+                        ;; close! in a finally so an assertion failure before the
+                        ;; close under test can't leak conn2 past the test (close!
+                        ;; after nats/close is the envelope's idempotent double-close).
+                        (-> (p/let [ctx2   (jet/jetstream conn2)
+                                    handle (jet/consume ctx2 "CONSCLS" "CONSCLS_C" (fn [_] (p/resolved nil)) {:expires-ms 2000})]
+                              (is (true? (proto/-active? handle)) "the handle is active while its connection is open")
+                              (p/let [_    (nats/close conn2)
+                                      off? (wait-for #(false? (proto/-active? handle)) 5000)]
+                                (is off? "the handle reports inactive after the owning connection closes")))
+                            (p/finally (fn [_ _] (close! conn2)))))))))))))
 
 ;; ADR 0012/0015, integration on the :4222 JetStream server: the consume handle
 ;; unsubscribes exactly like a core Subscription. `core/unsubscribe` ends it abruptly —
