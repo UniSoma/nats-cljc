@@ -6,6 +6,7 @@
             [nats-cljc.codec :as codec]
             [nats-cljc.error :as error]
             [nats-cljc.protocol :as proto]
+            [nats-cljc.test-support :refer [wait-for]]
             ;; The server-driven status types (:lame-duck / :servers-changed) have
             ;; no portable client-side trigger, so they are asserted at the real
             ;; per-platform normalization seam (impl/deliver-status!) rather than
@@ -162,34 +163,6 @@
 (defn- force-drop! [conn]
   #?(:clj  (.forceReconnect (:client conn))
      :cljs (.reconnect ^js (:client conn))))
-
-;; Status events arrive on the native client's own schedule (a jnats listener
-;; thread; the CLJS status() loop turn). A status collector + a JVM poll-until
-;; helper let the assertions wait for a type rather than race it.
-#?(:clj
-   (defn- wait-for
-     "Poll `pred` until truthy or `timeout-ms` elapses; return the last value."
-     [pred timeout-ms]
-     (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
-       (loop []
-         (or (pred)
-             (when (< (System/currentTimeMillis) deadline)
-               (Thread/sleep 20)
-               (recur))))))
-   :cljs
-   (defn- wait-for
-     "Promise resolving to true once `pred` is truthy (polling every 25ms), or
-      false at `timeout-ms` — the async-friendly twin of the JVM poll."
-     [pred timeout-ms]
-     (p/create
-      (fn [resolve _reject]
-        (let [deadline (+ (js/Date.now) timeout-ms)]
-          (letfn [(check []
-                    (cond
-                      (pred)                     (resolve true)
-                      (< (js/Date.now) deadline) (js/setTimeout check 25)
-                      :else                      (resolve false)))]
-            (check)))))))
 
 ;; Capture the value the native promise REJECTS with at the non-blocking
 ;; async-reject seam — `.whenComplete`, the JVM analog of JS's `.then` reject arm —

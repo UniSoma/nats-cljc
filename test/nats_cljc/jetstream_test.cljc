@@ -17,6 +17,7 @@
             [nats-cljc.jetstream.pull :as pull]
             [nats-cljc.jetstream.refill :as refill]
             [nats-cljc.jetstream.acks :as acks]
+            [nats-cljc.test-support :refer [wait-for]]
             #?(:clj  [nats-cljc.jetstream.impl.jvm :as jet-jvm]
                :cljs [nats-cljc.jetstream.impl.js :as jet-js])
             #?(:cljs [promesa.core :as p]))
@@ -145,34 +146,6 @@
                (fn [v e]
                  (p/handle (jet/delete-stream ctx stream)
                            (fn [_ _] (if e (throw e) v)))))))
-
-;; Consume delivery arrives on the native client's own schedule, so the consume
-;; assertions wait for a state rather than race it — core-test's poll helper and
-;; its CLJS promise twin.
-#?(:clj
-   (defn- wait-for
-     "Poll `pred` until truthy or `timeout-ms` elapses; return the last value."
-     [pred timeout-ms]
-     (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
-       (loop []
-         (or (pred)
-             (when (< (System/currentTimeMillis) deadline)
-               (Thread/sleep 20)
-               (recur))))))
-   :cljs
-   (defn- wait-for
-     "Promise resolving to true once `pred` is truthy (polling every 25ms), or
-      false at `timeout-ms` — the async-friendly twin of the JVM poll."
-     [pred timeout-ms]
-     (p/create
-      (fn [resolve _reject]
-        (let [deadline (+ (js/Date.now) timeout-ms)]
-          (letfn [(check []
-                    (cond
-                      (pred)                     (resolve true)
-                      (< (js/Date.now) deadline) (js/setTimeout check 25)
-                      :else                      (resolve false)))]
-            (check)))))))
 
 ;; AC1 (ADR 0017): (jetstream conn) resolves to a single JetStream context against
 ;; a JetStream-enabled server, identically on both legs.
