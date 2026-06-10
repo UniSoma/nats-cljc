@@ -232,6 +232,46 @@
      EPHEMERAL with ack policy none; the native client recreates it on a sequence
      gap, which is what makes the replay gap-free."))
 
+(defprotocol KV
+  "Vends the KV context (ADR 0017's twin for the KV facade) — defined here so the
+   pure protocol lives in the core-reachable namespace, but EXTENDED onto each
+   platform's Connection record from the KV impl namespaces
+   (`nats-cljc.kv.impl.*`), never implemented inline on the record — so the
+   `@nats-io/kv` import stays out of a core-only CLJS bundle (ADR 0016)."
+  (-kv [conn]
+    "Return a native promise of a KV context — a platform record wrapping the
+     native KV management client every Bucket-lifecycle operation flows through
+     (ADR 0003: jnats KeyValueManagement on the JVM, @nats-io/kv's Kvm on CLJS).
+     Obtaining it verifies JetStream is enabled by forcing a JS-info round-trip on
+     both legs (KV is JetStream-backed), so the promise rejects with `:type
+     :jetstream-not-enabled` at the handle when it is not — never deferred to the
+     first operation, exactly like `-jetstream` (ADR 0017)."))
+
+(defprotocol BucketManager
+  "KV Bucket lifecycle (ADR 0017/0023) — EXTENDED onto each platform's KV context
+   record from the impl namespaces, never implemented inline, so the `@nats-io/kv`
+   import stays confined (ADR 0016). The facade owns the public arglists and the
+   pre-flight validation; these deal in the portable closed kebab config map and
+   speak KV vocabulary on rejection — `:bucket-not-found`, never the stream-layer
+   `:type` the native clients raise from the substrate (ADR 0023)."
+  (-create-bucket [ctx config]
+    "Create a Bucket from the portable closed kebab `config` (already validated by
+     the facade), returning a native promise of a Bucket handle — the platform
+     record carrying the native KV client bound to the Bucket plus the context's
+     codec, which the entry operations dispatch over. The promise rejects with an
+     operational `:jetstream-api-error` (carrying `{:code :description}`) when the
+     server rejects the config (ADR 0020).")
+  (-open-bucket [ctx bucket]
+    "Open the existing Bucket named `bucket`, returning a native promise of a
+     Bucket handle (as `-create-bucket`). Opening VERIFIES the Bucket exists —
+     forcing a status round-trip on the leg whose native open merely binds — so the
+     promise rejects with `:type :bucket-not-found` at the handle when it does not
+     (ADR 0023), never deferred to the first entry operation.")
+  (-delete-bucket [ctx bucket]
+    "Delete the Bucket named `bucket`, returning a native promise that resolves to
+     nil once it is gone and rejects with `:type :bucket-not-found` when no such
+     Bucket exists (ADR 0023)."))
+
 (defprotocol OrderedPull
   "The pull triad over an Ordered consumer handle (the value `-js-ordered-consumer`
    resolves) — EXTENDED onto each platform's ordered record from the impl

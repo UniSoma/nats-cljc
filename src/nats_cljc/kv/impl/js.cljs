@@ -1,0 +1,110 @@
+(ns ^:no-doc nats-cljc.kv.impl.js
+  "ClojureScript KV implementation (ADR 0003/0016/0017). This is the ONE namespace
+   that imports `@nats-io/kv`; it is required only by the KV facade, so a core-only
+   consumer who never touches the facade keeps a KV-free browser bundle —
+   shadow-cljs's module graph excludes the unreachable npm dep (ADR 0016). It
+   `extend`s the KV protocol onto the core `JsConnection` record (defined in
+   `nats-cljc.impl.js`), mirroring the JVM confinement.
+
+   Unlike the JetStream entry point, `new Kvm(nc)` is a cheap sync construction
+   that never touches the server — so verify-at-entry (ADR 0017) is FORCED here via
+   `jetstreamManager(nc)`'s native $JS.API.INFO round-trip, the inverse of the JVM
+   leg's relationship to its native client. Same inversion on open: `kvm.open`
+   merely binds, so the existence check is a forced status round-trip."
+  (:require [nats-cljc.impl.protocol :as proto]
+            [nats-cljc.impl.js :as core]
+            [nats-cljc.jetstream.impl.js :as jet-js]
+            [nats-cljc.kv.impl.bucket :as bucket]
+            [nats-cljc.kv.impl.error :as kv-err]
+            ["@nats-io/jetstream" :as jetstream]
+            ["@nats-io/kv" :as kv]))
+
+;; The KV context (ADR 0017's twin): the handle wrapping @nats-io/kv's
+;; management-plane `Kvm` object every Bucket-lifecycle operation flows through.
+;; `codec` is the connection's default (the resolved `Prepared`), captured at
+;; entry so each Bucket handle binds it (ADR 0011).
+(defrecord JsKvContext [kvm codec])
+
+;; The Bucket handle: the per-Bucket @nats-io/kv `KV` object the entry operations
+;; dispatch over, plus the codec the Bucket binds (the context's — i.e. the
+;; connection default). `bucket` is the Bucket's name, carried so KV-faced errors
+;; can name it (ADR 0023).
+(defrecord JsBucket [kv codec bucket])
+
+(extend-type core/JsConnection
+  proto/KV
+  (-kv [conn]
+    ;; Kvm(nc) is a cheap sync construction with NO native verify, so the
+    ;; $JS.API.INFO round-trip is forced through jetstreamManager(nc) — which
+    ;; rejects when JetStream is disabled — before the context resolves (ADR 0017).
+    ;; The rejection routes through the same verify normalization as the JetStream
+    ;; entry point: only the no-responder is :jetstream-not-enabled.
+    (let [client (:client conn)]
+      (-> (jetstream/jetstreamManager client)
+          (.then (fn [_] (->JsKvContext (kv/Kvm. client) (:codec conn))))
+          (.catch (fn [e] (throw (jet-js/verify-error e))))))))
+
+(defn kv-error
+  "Normalize a nats.js JetStreamApiError reaching the KV layer to the portable
+   operational ex-info, KV-faced: the err_code routes through the KV table — a
+   not-found Bucket is 10059 ⇒ `:bucket-not-found`, never the stream-layer `:type`
+   the substrate raises (ADR 0023) — and carries `{:code :description}`. Anything
+   that is not a JetStreamApiError passes through unchanged for the slice that
+   owns it."
+  [^js e]
+  (if (instance? jetstream/JetStreamApiError e)
+    (let [api ^js (.apiError e)]
+      (ex-info (.-message e)
+               (kv-err/api-error-data (.-err_code api) (.-description api))
+               e))
+    e))
+
+(defn- with-kv-error
+  "Attach the shared Bucket-verb rejection tail: normalize a nats.js error through
+   `kv-error` (ADR 0023) before it propagates — the KV twin of the JetStream
+   impl's `with-api-error`."
+  [p]
+  (.catch p (fn [e] (throw (kv-error e)))))
+
+(defn ->kv-opts
+  "Build the @nats-io/kv KvOptions object from the portable closed kebab `config`
+   (already validated by the facade). Only the keys present are set, so an absent
+   key takes the native default; `:storage` routes through the shared wire table,
+   `:ttl-ms` is the native `ttl` (already ms on this leg — the JVM uses a
+   Duration), `:max-bucket-size` the native `max_bytes`, and `clj->js` produces
+   the string-keyed object @nats-io/kv reads — surviving advanced compilation."
+  [config]
+  (clj->js
+   (cond-> {}
+     (:description config)             (assoc :description (:description config))
+     (:history config)                 (assoc :history (:history config))
+     (:ttl-ms config)                  (assoc :ttl (:ttl-ms config))
+     (:max-value-size config)          (assoc :maxValueSize (:max-value-size config))
+     (:max-bucket-size config)         (assoc :max_bytes (:max-bucket-size config))
+     (:storage config)                 (assoc :storage (bucket/storage->wire (:storage config)))
+     (:replicas config)                (assoc :replicas (:replicas config))
+     (some? (:compression? config))    (assoc :compression (boolean (:compression? config))))))
+
+(extend-type JsKvContext
+  proto/BucketManager
+  (-create-bucket [ctx config]
+    (-> (.create ^js (:kvm ctx) (:bucket config) (->kv-opts config))
+        (.then (fn [kv] (->JsBucket kv (:codec ctx) (:bucket config))))
+        with-kv-error))
+  (-open-bucket [ctx bucket]
+    ;; kvm.open binds WITHOUT a server round-trip, so the open contract's
+    ;; existence check is forced via status() — a stream-info round-trip whose
+    ;; not-found rejects re-faced :bucket-not-found (ADR 0023) — matching the JVM
+    ;; leg's getStatus, never deferred to the first entry operation.
+    (-> (.open ^js (:kvm ctx) bucket)
+        (.then (fn [kv] (-> (.status ^js kv)
+                            (.then (fn [_] (->JsBucket kv (:codec ctx) bucket))))))
+        with-kv-error))
+  (-delete-bucket [ctx bucket]
+    ;; @nats-io/kv has no delete-by-name on Kvm: bind (no round-trip), then
+    ;; destroy(). A missing Bucket rejects from the destroy itself, re-faced
+    ;; :bucket-not-found (ADR 0023).
+    (-> (.open ^js (:kvm ctx) bucket)
+        (.then (fn [kv] (.destroy ^js kv)))
+        (.then (fn [_] nil))
+        with-kv-error)))

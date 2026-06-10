@@ -26,9 +26,9 @@
   ;; compiles the whole public cljs surface under advanced purely to surface
   ;; shadow's infer-externs "Cannot infer target type" warning; the output bundle
   ;; is discarded. shadow exits 0 on that warning, so `bb externs:check` (and CI)
-  ;; grep for it and fail. :entries IS the coverage manifest — the two facades pull
-  ;; their impl/protocol/error/stream deps transitively (the jetstream facade
-  ;; side-effect-requires nats-cljc.jetstream.impl.js), and the opt-in codecs are
+  ;; grep for it and fail. :entries IS the coverage manifest — the facades pull
+  ;; their impl/protocol/error/stream deps transitively (each side-effect-requires
+  ;; its per-leg impl, e.g. nats-cljc.jetstream.impl.js), and the opt-in codecs are
   ;; listed explicitly since nothing on the core path reaches them (ADR 0004).
   :externs-check
   {:target     :browser
@@ -36,18 +36,20 @@
    :compiler-options {:infer-externs :auto}
    :modules {:main {:entries [nats-cljc.core
                               nats-cljc.jetstream
+                              nats-cljc.kv
                               nats-cljc.codec
                               nats-cljc.codec.json
                               nats-cljc.codec.transit]}}}
 
   ;; Bundle-isolation guard (ADR 0016): a core-only entry — nats-cljc.core and
   ;; nothing else — released to an optimized browser bundle. @nats-io/jetstream
-  ;; is declared unconditionally in src/deps.cljs, but shadow only bundles an
-  ;; npm package that a reachable namespace actually requires, so this bundle
-  ;; must contain zero JetStream bytes. `bb bundle:check` (and CI) compiles this
-  ;; and scans the output for JetStream markers; a hit means the
-  ;; ["@nats-io/jetstream"] import leaked into a core-reachable namespace
-  ;; (e.g. folded into nats-cljc.impl.js) and core-only consumers would ship it.
+  ;; and @nats-io/kv are declared unconditionally in src/deps.cljs, but shadow
+  ;; only bundles an npm package that a reachable namespace actually requires, so
+  ;; this bundle must contain zero JetStream or KV bytes. `bb bundle:check` (and
+  ;; CI) compiles this and scans the output for JetStream/KV markers; a hit means
+  ;; a ["@nats-io/jetstream"] or ["@nats-io/kv"] import leaked into a
+  ;; core-reachable namespace (e.g. folded into nats-cljc.impl.js) and core-only
+  ;; consumers would ship it.
   :core-bundle-check
   {:target     :browser
    :output-dir "target/core-bundle-check"

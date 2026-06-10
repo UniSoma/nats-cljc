@@ -111,19 +111,20 @@ jobs:
             exit 1
           fi
 
-      # Bundle-isolation guard (ADR 0016): @nats-io/jetstream is an
-      # unconditional npm dep, but it enters a consumer's bundle only when a
+      # Bundle-isolation guard (ADR 0016): @nats-io/jetstream and @nats-io/kv are
+      # unconditional npm deps, but each enters a consumer's bundle only when a
       # namespace they require imports it. Release the core-only build (its
       # single entry is nats-cljc.core) and fail if the optimized bundle
-      # contains any JetStream bytes — a hit means the ["@nats-io/jetstream"]
-      # import leaked into a core-reachable namespace.
+      # contains any JetStream or KV bytes ('$KV.' is @nats-io/kv's
+      # subject-prefix literal) — a hit means the ["@nats-io/jetstream"] or
+      # ["@nats-io/kv"] import leaked into a core-reachable namespace.
       - name: Bundle-isolation guard (core-only release)
         if: matrix.platform == 'node'
         run: |
           npx shadow-cljs release core-bundle-check
-          if grep -riq -e 'jetstream' -e '\$JS\.API' target/core-bundle-check/*.js; then
-            echo "::error::Bundle guard: the core-only bundle contains @nats-io/jetstream bytes — the import leaked into a core-reachable namespace (ADR 0016)."
-            grep -rioc -e 'jetstream' -e '\$JS\.API' target/core-bundle-check/*.js
+          if grep -riq -e 'jetstream' -e '\$JS\.API' -e '\$KV\.' target/core-bundle-check/*.js; then
+            echo "::error::Bundle guard: the core-only bundle contains @nats-io/jetstream or @nats-io/kv bytes — an import leaked into a core-reachable namespace (ADR 0016)."
+            grep -rioc -e 'jetstream' -e '\$JS\.API' -e '\$KV\.' target/core-bundle-check/*.js
             exit 1
           fi
 
