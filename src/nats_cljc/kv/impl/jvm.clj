@@ -99,26 +99,45 @@
            (kv-err/api-error-data (.getApiErrorCode e) (.getErrorDescription e))
            e))
 
-(defn- off-thread
+(defn- off-thread*
   "Run the blocking KV thunk `f` off the caller's thread (ADR 0002) on the
-   connection's IO `executor` — the KV twin of the JetStream impl's `off-thread`,
-   differing only in routing a server-issued JetStreamApiException through the
-   KV-faced normalization (ADR 0023). Delivers the BARE ex-info on rejection (ADR
-   0006); a submit racing the connection's close surfaces as the same retry-able
-   `:connection-closed` a closed connection's round-trip would."
-  [^ExecutorService executor f]
+   connection's IO `executor`, routing a server-issued JetStreamApiException
+   through `api-ex->info` — the per-verb-family normalization seam. Delivers the
+   BARE ex-info on rejection (ADR 0006); a submit racing the connection's close
+   surfaces as the same retry-able `:connection-closed` a closed connection's
+   round-trip would."
+  [^ExecutorService executor api-ex->info f]
   (core/then
    (try
      (CompletableFuture/supplyAsync
       (reify Supplier
         (get [_]
           (try (f)
-               (catch JetStreamApiException e (throw (api-ex->ex-info e))))))
+               (catch JetStreamApiException e (throw (api-ex->info e))))))
       executor)
      (catch RejectedExecutionException _
        (CompletableFuture/failedFuture
         (ex-info "Connection is closed" {:type :connection-closed}))))
    identity))
+
+(defn- off-thread
+  "The Bucket-verb `off-thread*`: the KV twin of the JetStream impl's
+   `off-thread`, differing only in routing a server-issued JetStreamApiException
+   through the KV-faced normalization (ADR 0023)."
+  [^ExecutorService executor f]
+  (off-thread* executor api-ex->ex-info f))
+
+(defn- cas-off-thread
+  "The compare-and-set `off-thread*` for a CAS verb over `key`: a lost race (the
+   substrate's wrong-last-sequence) is re-faced `:wrong-revision` carrying the
+   contested `:key` (ADR 0023); any other API error keeps its Bucket-verb face."
+  [^ExecutorService executor key f]
+  (off-thread* executor
+               (fn [^JetStreamApiException e]
+                 (ex-info (.getMessage e)
+                          (kv-err/cas-error-data (.getApiErrorCode e) (.getErrorDescription e) key)
+                          e))
+               f))
 
 (defn ->kv-config
   "Build a jnats KeyValueConfiguration from the portable closed kebab `config`
@@ -245,4 +264,16 @@
     ;; absent-is-nil contract, ADR 0023), so the lift is a plain when-let.
     (off-thread (:io-executor bucket)
                 #(when-let [e (.get ^KeyValue (:kv bucket) ^String key)]
-                   (entry->raw e)))))
+                   (entry->raw e))))
+  (-kv-create [bucket key bytes]
+    ;; jnats' create models first-writer-wins as an update expecting revision 0
+    ;; (retrying over a tombstone), raising wrong-last-sequence on a live key —
+    ;; re-faced :wrong-revision carrying the :key (ADR 0023).
+    (cas-off-thread (:io-executor bucket) key
+                    #(.create ^KeyValue (:kv bucket) ^String key ^bytes bytes)))
+  (-kv-update [bucket key bytes revision]
+    ;; jnats' update returns the new revision directly, raising
+    ;; wrong-last-sequence when the expected revision is stale — re-faced
+    ;; :wrong-revision carrying the :key (ADR 0023).
+    (cas-off-thread (:io-executor bucket) key
+                    #(.update ^KeyValue (:kv bucket) ^String key ^bytes bytes (long revision)))))

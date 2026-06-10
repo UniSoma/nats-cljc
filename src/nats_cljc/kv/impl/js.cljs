@@ -66,6 +66,26 @@
   [p]
   (.catch p (fn [e] (throw (kv-error e)))))
 
+(defn cas-error
+  "Normalize a nats.js JetStreamApiError reaching a compare-and-set verb over
+   `key`: a lost race (the substrate's wrong-last-sequence) is re-faced
+   `:wrong-revision` carrying the contested `:key` (ADR 0023); any other API
+   error keeps its Bucket-verb face. Anything that is not a JetStreamApiError
+   passes through unchanged for the slice that owns it."
+  [^js e key]
+  (if (instance? jetstream/JetStreamApiError e)
+    (let [api ^js (.apiError e)]
+      (ex-info (.-message e)
+               (kv-err/cas-error-data (.-err_code api) (.-description api) key)
+               e))
+    e))
+
+(defn- with-cas-error
+  "Attach the compare-and-set rejection tail for a CAS verb over `key`: normalize
+   a nats.js error through `cas-error` (ADR 0023) before it propagates."
+  [p key]
+  (.catch p (fn [e] (throw (cas-error e key)))))
+
 (defn ->kv-opts
   "Build the @nats-io/kv KvOptions object from the portable closed kebab `config`
    (already validated by the facade). Only the keys present are set, so an absent
@@ -181,4 +201,16 @@
         (.then (fn [^js e]
                  (when (and e (= "PUT" (.-operation e)))
                    (entry->raw e))))
-        with-kv-error)))
+        with-kv-error))
+  (-kv-create [bucket key bytes]
+    ;; nats.js' create models first-writer-wins as a put expecting revision 0
+    ;; (retrying over a tombstone), rejecting with wrong-last-sequence on a live
+    ;; key — re-faced :wrong-revision carrying the :key (ADR 0023).
+    (-> (.create ^js (:kv bucket) key bytes)
+        (with-cas-error key)))
+  (-kv-update [bucket key bytes revision]
+    ;; kv.update resolves the new revision directly, rejecting with
+    ;; wrong-last-sequence when the expected revision is stale — re-faced
+    ;; :wrong-revision carrying the :key (ADR 0023).
+    (-> (.update ^js (:kv bucket) key bytes revision)
+        (with-cas-error key))))

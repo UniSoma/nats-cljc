@@ -101,6 +101,24 @@
   (is (= :jetstream-api-error (:type (kv-err/api-error-data 99999 "anything")))
       "an unseeded code defaults to the operational catch-all :jetstream-api-error"))
 
+;; Deep-module unit (ADR 0023), no server: the compare-and-set classifier each
+;; leg's CAS verbs route their native failures through — the seam that re-faces
+;; the substrate's wrong-last-sequence condition as the KV-vocabulary
+;; :wrong-revision carrying the :key, shared by create and update (a create IS an
+;; update expecting revision 0). Codes without a CAS face fall through to the
+;; Bucket-verb normalization, so a CAS verb's other failures keep their faces.
+(deftest deep-module-cas-error-classifier
+  (is (= {:type :wrong-revision :key "config.app" :code 10071 :description "wrong last sequence: 3"}
+         (kv-err/cas-error-data 10071 "wrong last sequence: 3" "config.app"))
+      "the substrate's wrong-last-sequence 10071 is re-faced :wrong-revision carrying the :key")
+  (is (= {:type :wrong-revision :key "config.app" :code 10164 :description "wrong last sequence"}
+         (kv-err/cas-error-data 10164 "wrong last sequence" "config.app"))
+      "the unknown-last-sequence sibling 10164 wears the same :wrong-revision face")
+  (is (= :bucket-not-found (:type (kv-err/cas-error-data 10059 "stream not found" "k")))
+      "a code with no CAS face falls through to the KV Bucket-verb normalization")
+  (is (= :jetstream-api-error (:type (kv-err/cas-error-data 99999 "anything" "k")))
+      "an unseeded code defaults to the operational catch-all :jetstream-api-error"))
+
 ;; Test-only teardown, as in jetstream-test: close the native client directly so
 ;; its threads / ws socket don't outlive the test.
 (defn- close! [conn] (.close (:client conn)))
@@ -610,3 +628,168 @@
                                     (p/catch (fn [e]
                                                (is (= :bucket-not-found (:type (ex-data e)))
                                                    "bucket-status on a missing Bucket rejects with :bucket-not-found")))))))))))))
+
+;; Capture how a native promise SETTLES, either way — `[:resolved v]` or
+;; `[:rejected e]` with the BARE ex-info (ADR 0006) — so a race's two outcomes can
+;; be collected without knowing in advance which writer loses. The JVM helper
+;; blocks (the test thread is allowed to); the CLJS helper returns a promise of
+;; the outcome pair.
+#?(:clj
+   (defn- settle [^java.util.concurrent.CompletableFuture cf]
+     (let [a (promise)]
+       (.whenComplete cf (reify java.util.function.BiConsumer
+                           (accept [_ v e] (deliver a (if e [:rejected e] [:resolved v])))))
+       (deref a 5000 [:rejected ::timeout])))
+   :cljs
+   (defn- settle [p]
+     (p/handle p (fn [v e] (if e [:rejected e] [:resolved v])))))
+
+;; The shared race assertions both legs run over the two settled outcomes:
+;; exactly one winner resolving the new Revision, exactly one loser rejecting
+;; :wrong-revision with the contested :key (ADR 0023).
+(defn- assert-race [key o1 o2]
+  (let [{resolved :resolved rejected :rejected} (group-by first [o1 o2])]
+    (is (= 1 (count resolved)) "exactly one racing writer wins")
+    (is (= 1 (count rejected)) "exactly one racing writer loses")
+    (let [[_ rev] (first resolved)]
+      (is (number? rev) "the winner resolves to the new Revision as a bare number"))
+    (let [[_ e] (first rejected)]
+      (is (= :wrong-revision (:type (ex-data e)))
+          "the loser rejects with :wrong-revision")
+      (is (= key (:key (ex-data e)))
+          "the loser's rejection carries the contested :key"))))
+
+;; First-writer-wins: create resolves to the new Revision on an absent key —
+;; enabling initialization and locks — and rejects with :wrong-revision carrying
+;; the :key once the key exists (ADR 0023): KV vocabulary, never the substrate's
+;; :wrong-last-sequence, though the wire condition is the very same.
+(deftest create-wins-once-then-rejects-wrong-revision
+  (let [bucket "TRACER_KV_CAS_CREATE"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [rev (deref (kv/create handle "lock.owner" "writer-1") 5000 ::timeout)]
+                   (is (number? rev) "create on an absent key resolves to the new Revision as a bare number")
+                   (is (pos? rev) "the new Revision is positive"))
+                 (let [e (reject-reason (kv/create handle "lock.owner" "writer-2"))]
+                   (is (= :wrong-revision (:type (ex-data e)))
+                       "create on an existing key rejects with :wrong-revision")
+                   (is (= "lock.owner" (:key (ex-data e)))
+                       "the rejection carries the contested :key"))
+                 (is (= "writer-1" (:value (deref (kv/get handle "lock.owner") 5000 ::timeout)))
+                     "the first writer's value survives the lost create"))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/create handle "lock.owner" "writer-1")
+                                                      (p/then (fn [rev]
+                                                                (is (number? rev) "create on an absent key resolves to the new Revision as a bare number")
+                                                                (is (pos? rev) "the new Revision is positive")
+                                                                (-> (kv/create handle "lock.owner" "writer-2")
+                                                                    (p/then (fn [_] (is false "expected create on an existing key to reject with :wrong-revision")))
+                                                                    (p/catch (fn [e]
+                                                                               (is (= :wrong-revision (:type (ex-data e)))
+                                                                                   "create on an existing key rejects with :wrong-revision")
+                                                                               (is (= "lock.owner" (:key (ex-data e)))
+                                                                                   "the rejection carries the contested :key"))))))
+                                                      (p/then (fn [_] (kv/get handle "lock.owner")))
+                                                      (p/then (fn [entry]
+                                                                (is (= "writer-1" (:value entry))
+                                                                    "the first writer's value survives the lost create"))))))))))))))))))
+
+;; Revision-guarded update: update with the latest Revision resolves to the new
+;; Revision; update with a stale Revision rejects with :wrong-revision carrying
+;; the :key, leaving the guarded value untouched — concurrent writers cannot
+;; silently clobber each other (ADR 0023).
+(deftest update-guards-on-the-expected-revision
+  (let [bucket "TRACER_KV_CAS_UPDATE"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [rev1 (deref (kv/put handle "config.app" 1) 5000 ::timeout)
+                       rev2 (deref (kv/update handle "config.app" 2 rev1) 5000 ::timeout)]
+                   (is (number? rev2) "update with the latest Revision resolves to the new Revision as a bare number")
+                   (is (> rev2 rev1) "the new Revision succeeds the expected one")
+                   (let [e (reject-reason (kv/update handle "config.app" 3 rev1))]
+                     (is (= :wrong-revision (:type (ex-data e)))
+                         "update with a stale Revision rejects with :wrong-revision")
+                     (is (= "config.app" (:key (ex-data e)))
+                         "the rejection carries the contested :key"))
+                   (is (= 2 (:value (deref (kv/get handle "config.app") 5000 ::timeout)))
+                       "the guarded value is untouched by the lost update")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "config.app" 1)
+                                                      (p/then (fn [rev1]
+                                                                (-> (kv/update handle "config.app" 2 rev1)
+                                                                    (p/then (fn [rev2]
+                                                                              (is (number? rev2) "update with the latest Revision resolves to the new Revision as a bare number")
+                                                                              (is (> rev2 rev1) "the new Revision succeeds the expected one")
+                                                                              (-> (kv/update handle "config.app" 3 rev1)
+                                                                                  (p/then (fn [_] (is false "expected update with a stale Revision to reject with :wrong-revision")))
+                                                                                  (p/catch (fn [e]
+                                                                                             (is (= :wrong-revision (:type (ex-data e)))
+                                                                                                 "update with a stale Revision rejects with :wrong-revision")
+                                                                                             (is (= "config.app" (:key (ex-data e)))
+                                                                                                 "the rejection carries the contested :key")))))))))
+                                                      (p/then (fn [_] (kv/get handle "config.app")))
+                                                      (p/then (fn [entry]
+                                                                (is (= 2 (:value entry))
+                                                                    "the guarded value is untouched by the lost update"))))))))))))))))))
+
+;; A genuine two-writer race: both updates are in flight before either settles,
+;; each expecting the same base Revision — the server serializes them, so exactly
+;; one wins and exactly one rejects :wrong-revision (ADR 0023). Which one is
+;; nondeterministic; the assertions hold either way.
+(deftest racing-writers-yield-one-winner-and-one-wrong-revision
+  (let [bucket "TRACER_KV_CAS_RACE"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [rev (deref (kv/put handle "race.key" "base") 5000 ::timeout)
+                       p1  (kv/update handle "race.key" "writer-1" rev)
+                       p2  (kv/update handle "race.key" "writer-2" rev)]
+                   (assert-race "race.key" (settle p1) (settle p2))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "race.key" "base")
+                                                      (p/then (fn [rev]
+                                                                (p/all [(settle (kv/update handle "race.key" "writer-1" rev))
+                                                                        (settle (kv/update handle "race.key" "writer-2" rev))])))
+                                                      (p/then (fn [[o1 o2]]
+                                                                (assert-race "race.key" o1 o2))))))))))))))))))

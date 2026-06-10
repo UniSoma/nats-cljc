@@ -11,9 +11,9 @@
    (it `extend`s the KV protocol onto the platform Connection record); this facade
    calls the record through the protocol.
 
-   `get` (and, later, `keys`/`update`) shadows clojure.core — the jetstream `next`
+   `get`, `update` (and, later, `keys`) shadow clojure.core — the jetstream `next`
    precedent: the namespace-aliased call is the public name."
-  (:refer-clojure :exclude [get])
+  (:refer-clojure :exclude [get update])
   (:require [nats-cljc.codec :as codec]
             [nats-cljc.impl.protocol :as proto]
             [nats-cljc.kv.impl.bucket :as bucket]
@@ -156,6 +156,42 @@
                    (bucket/validate-key key)
                    (codec/encode (:codec handle) value)))
       (impl/bind (fn [bytes] (proto/-kv-put handle key bytes)))))
+
+(defn create
+  "Write `value` under `key` in the Bucket `handle` only when the key is ABSENT
+   — first-writer-wins, enabling initialization and locks — encoded through the
+   Bucket's one Codec, returning a platform-native promise that resolves to the
+   new Revision as a bare number. A key that already exists is a lost
+   compare-and-set race: the promise rejects with the operational
+   `:type :wrong-revision` carrying the contested `:key` (ADR 0023) — KV
+   vocabulary, never the stream substrate's. It also rejects pre-flight with a
+   validation `:type :invalid-key` (carrying `:key`) when `key` is malformed
+   (ADR 0015), and with `:type :codec-error` when the value does not encode
+   (ADR 0006)."
+  [handle key value]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_]
+                   (bucket/validate-key key)
+                   (codec/encode (:codec handle) value)))
+      (impl/bind (fn [bytes] (proto/-kv-create handle key bytes)))))
+
+(defn update
+  "Write `value` under `key` in the Bucket `handle` only when `revision` is
+   still the key's latest Revision — the revision-guarded write, so concurrent
+   writers cannot silently clobber each other — encoded through the Bucket's one
+   Codec, returning a platform-native promise that resolves to the new Revision
+   as a bare number. A stale expected Revision is a lost compare-and-set race:
+   the promise rejects with the operational `:type :wrong-revision` carrying the
+   contested `:key` (ADR 0023), sharing one canonical face with a lost `create`.
+   It also rejects pre-flight with a validation `:type :invalid-key` (carrying
+   `:key`) when `key` is malformed (ADR 0015), and with `:type :codec-error`
+   when the value does not encode (ADR 0006)."
+  [handle key value revision]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_]
+                   (bucket/validate-key key)
+                   (codec/encode (:codec handle) value)))
+      (impl/bind (fn [bytes] (proto/-kv-update handle key bytes revision)))))
 
 (defn get
   "Read the latest Entry for `key` from the Bucket `handle`, returning a

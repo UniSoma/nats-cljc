@@ -11,8 +11,14 @@
 
 (def ^:private err-code->type
   "JetStream API `err_code` → canonical KV `:type` (ADR 0023) — the codes whose KV
-   face differs from their stream-layer one. Later slices add the CAS row."
+   face differs from their stream-layer one."
   {10059 :bucket-not-found})
+
+(def ^:private cas-code?
+  "The JetStream API `err_code`s of the server's wrong-last-sequence condition —
+   the wire form of a lost compare-and-set race, the same pair the stream layer
+   re-faces `:wrong-last-sequence`."
+  #{10071 10164})
 
 (defn api-error-data
   "Build the portable ex-data for a server-issued API error reaching the KV layer
@@ -24,3 +30,16 @@
   (if-let [type (err-code->type code)]
     {:type type :code code :description description}
     (jet-err/api-error-data code description)))
+
+(defn cas-error-data
+  "Build the portable ex-data for a server-issued API error reaching a
+   compare-and-set verb (`create`/`update`) over `key`: a wrong-last-sequence
+   code is the lost race, re-faced as the KV-vocabulary `:type :wrong-revision`
+   carrying the contested `:key` (ADR 0023) — one face shared by both verbs,
+   since a create IS an update expecting revision 0 (which is how both native
+   clients model it). Any other code falls through to the Bucket-verb
+   normalization, so a CAS verb's non-race failures keep their usual faces."
+  [code description key]
+  (if (cas-code? code)
+    {:type :wrong-revision :key key :code code :description description}
+    (api-error-data code description)))

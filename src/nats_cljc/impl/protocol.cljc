@@ -307,6 +307,18 @@
   (-kv-put [bucket key bytes]
     "Write `bytes` under `key` in the Bucket, returning a native promise that
      resolves to the new Revision as a bare number.")
+  (-kv-create [bucket key bytes]
+    "First-writer-wins write: store `bytes` under `key` only when the key is
+     absent, returning a native promise that resolves to the new Revision as a
+     bare number and rejects with `:type :wrong-revision` carrying the contested
+     `:key` when the key already exists (ADR 0023) — never the substrate's
+     `:wrong-last-sequence`, though the wire condition is the same.")
+  (-kv-update [bucket key bytes revision]
+    "Revision-guarded write: store `bytes` under `key` only when `revision` is
+     still the key's latest Revision, returning a native promise that resolves
+     to the new Revision as a bare number and rejects with
+     `:type :wrong-revision` carrying the contested `:key` when the expected
+     Revision is stale (ADR 0023).")
   (-kv-get [bucket key]
     "Read the latest entry for `key`, returning a native promise of a RAW entry
      map `{:bucket :key :bytes :revision :created :operation}` — `:bytes` the
