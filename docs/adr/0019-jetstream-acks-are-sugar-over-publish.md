@@ -10,7 +10,7 @@ Why this over the obvious "just call `.ack()`":
 - **Portability.** The ack payloads are version-independent NATS protocol, so publishing them is identical on the JVM and CLJS. Delegating instead means two ack code paths (`jnats Message.ack` vs `nats.js JsMsg.ack`) and normalizing two native metadata shapes at the ack layer.
 - **Idempotency for free.** A redundant ack is a harmless publish the server ignores, so "ack is idempotent / no-throw" needs no mutable per-message state — which a pure-data map could not hold anyway. This dissolves the cross-leg question of whether the JVM client no-ops a second terminal ack.
 
-The ack address lives under `:js`, not as a top-level `:reply`, so a mistaken `(reply conn js-msg …)` raises `:no-reply-subject` rather than publishing garbage to the ack subject.
+The ack address lives under `:js`, not as a top-level `:reply`, so a mistaken `(reply conn js-msg …)` raises `:no-reply-subject` rather than publishing garbage to the ack subject. Symmetrically, an ack verb (`ack`/`nak`/`term`/`working`/`double-ack`) called on a message that carries no `:js :ack-subject` — one that never came off a JetStream pull — raises the validation `:type :no-ack-subject` (ADR 0015, ADR 0020) rather than publishing to a nil subject.
 
 double-ack returns a `Promise<bool>` and is sugar over `request` to the ack subject (the server replies to confirm). It is named `double-ack` (the NATS-community term), not `ack-sync` (jnats' name), because ours is asynchronous — calling it "sync" would be a portability lie.
 
