@@ -1,34 +1,35 @@
 ---
 id: nts-01ktdcwwhd76
 title: 'Phase 2: JetStream (nats-cljc.jetstream)'
-status: open
+status: closed
 type: epic
 priority: 1
 mode: afk
 created: '2026-06-06T02:41:21.453576294Z'
-updated: '2026-06-06T02:41:21.453576294Z'
+updated: '2026-06-10T00:06:24.416282880Z'
+closed: '2026-06-10T00:06:24.416282880Z'
 tags:
 - jetstream
 - phase-2
 acceptance:
 - title: Obtain a JetStream context from a Connection; it rejects with :jetstream-not-enabled when JS is disabled, identically on JVM and Node
-  done: false
+  done: true
 - title: Stream and Consumer CRUD (create/update/delete/purge/info/list) work via portable closed kebab-keyword config maps with keyword enums, ms-in-key durations, and ISO-8601 timestamps
-  done: false
+  done: true
 - title: Acked publish returns a PubAck {:stream :seq :duplicate :domain}; :msg-id dedup and :expect optimistic-concurrency (:wrong-last-sequence) work; reserved Nats-* headers are rejected as :reserved-header
-  done: false
+  done: true
 - title: Pull delivery via next (Promise<msg-or-nil>), fetch (Promise<vector>), and consume (promise-return handler that measurably gates pulls); consume returns a drainable handle
-  done: false
+  done: true
 - title: ack/nak(+delay)/term/working are sync-nil and idempotent; double-ack returns Promise<bool>; delivered messages are pure data {:subject :data :headers :js {…}}
-  done: false
+  done: true
 - title: New operational and validation :types normalize identically on both legs; server-rejected configs are operational :jetstream-api-error; side-band consume errors reach a per-consume :on-error
-  done: false
+  done: true
 - title: OrderedConsumer replays a Stream gap-free with no acks
-  done: false
+  done: true
 - title: ClojureScript gets @nats-io/jetstream unconditionally and lockstep-pinned; a core-only browser bundle ships zero JetStream bytes
-  done: false
+  done: true
 - title: Suite passes on JVM + Node against a JetStream-enabled nats-server >= 2.12 on the anon :4222 server, with unique-stream-per-test isolation
-  done: false
+  done: true
 ---
 
 ## Description
@@ -135,3 +136,9 @@ Delivered JetStream messages are plain data — `{:subject :data :headers :js {�
 - Amendments made while grilling: ADR 0002's pull consequence is corrected in place (→ ADR 0018); the README roadmap's Phase-2 line is updated; ADR 0006 gains a cross-ref (→ ADR 0020). CONTEXT.md gained the glossary terms *JetStream, Stream, Consumer, Ordered consumer, JetStream context, Acked publish, PubAck, Ack, Double-ack* and extended the *Error* and *Validation error* sets.
 - Impl-time known-unknowns to ground: jnats `publishAsync` in-flight cap (decides default publish path); the JVM JS-info round-trip used for verify-at-entry. The previously-flagged "JVM already-acked idempotency" question is dissolved by acks-over-publish (a redundant ack is a harmless publish the server ignores), and the `$JS.ACK.*` token-format/version risk is avoided by capturing the ack subject verbatim rather than parsing it.
 - Versioning (ADR 0009): adding these normalized vocabulary members is a minor bump.
+
+## Notes
+
+**2026-06-10T00:06:24.416282880Z**
+
+Phase 2 JetStream is complete: nats-cljc.jetstream ships the full pull-based surface portably on JVM and Node — verified-at-entry (jetstream conn) with :jetstream-not-enabled parity (ADR 0017), Stream and Consumer CRUD incl. update/purge/list/names via closed kebab config maps with keyword enums, ms-in-key durations, and canonical cross-leg timestamps, Acked publish with PubAck/:msg-id dedup/:expect/:reserved-header guard, the pull triad (next/fetch/consume) with promise-return backpressure and a drainable handle (ADR 0018), acks-over-publish incl. double-ack (ADR 0019), the normalized JetStream error model with side-band conditions routed to per-consume :on-error plus handler/decode throws (ADR 0020), the gap-free no-ack Ordered consumer, and the bb bundle:check + CI guard proving a core-only CLJS bundle ships zero @nats-io/jetstream bytes (ADR 0016). All 14 children closed; suite green on both local legs (171 JVM tests / 487 assertions, 142 Node tests / 399 assertions) against the JetStream-enabled :4222 server with unique-stream-per-test :memory isolation.
