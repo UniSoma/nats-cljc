@@ -1,4 +1,4 @@
-(ns ^:no-doc nats-cljc.error
+(ns ^:no-doc nats-cljc.impl.error
   "Shared, platform-neutral error classification (ADR 0006). The per-leg
    ErrorListener / status plumbing stays quarantined in `impl.jvm` / `impl.js`
    (ADR 0005); only the pure message → `:type` classifier is portable, so it lives

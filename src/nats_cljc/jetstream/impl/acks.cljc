@@ -1,4 +1,4 @@
-(ns ^:no-doc nats-cljc.jetstream.acks
+(ns ^:no-doc nats-cljc.jetstream.impl.acks
   "Ack-payload construction (ADR 0019): the pure msg+opts -> wire-bytes deep module
    behind the public ack family. The payloads are library-owned, version-independent
    NATS protocol constants, so building them is one portable code path — the bytes a

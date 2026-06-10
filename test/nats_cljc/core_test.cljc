@@ -4,8 +4,8 @@
             [clojure.string :as str]
             [nats-cljc.core :as nats]
             [nats-cljc.codec :as codec]
-            [nats-cljc.error :as error]
-            [nats-cljc.protocol :as proto]
+            [nats-cljc.impl.error :as error]
+            [nats-cljc.impl.protocol :as proto]
             [nats-cljc.test-support :refer [wait-for]]
             ;; The server-driven status types (:lame-duck / :servers-changed) have
             ;; no portable client-side trigger, so they are asserted at the real

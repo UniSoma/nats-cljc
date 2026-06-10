@@ -1,4 +1,4 @@
-(ns ^:no-doc nats-cljc.jetstream.pub
+(ns ^:no-doc nats-cljc.jetstream.impl.pub
   "Portable acked-publish pre-flight deep module (ADR 0015/0020). The pure,
    platform-neutral half of publishing into a Stream: the reserved-header guard that
    keeps the `Nats-*` header namespace sanctioned-only. `:msg-id` and `:expect` are
@@ -8,7 +8,7 @@
    than a silently-honored shadow of the sanctioned path. The per-leg impl
    namespaces build the native publish options and normalize the PubAck — the
    interop half — so this is the shared seam a single no-server unit test covers,
-   the publish sibling of `nats-cljc.jetstream.stream`.")
+   the publish sibling of `nats-cljc.jetstream.impl.stream`.")
 
 (defn reserved-header?
   "True when header `name` is in the reserved `Nats-*` namespace the server owns. The

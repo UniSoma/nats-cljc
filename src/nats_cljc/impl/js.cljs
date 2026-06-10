@@ -2,9 +2,9 @@
   "ClojureScript platform implementation: a Connection record wrapping
    @nats-io/nats-core over WebSocket (ADR 0001/0003), serving browser and Node
    from one package. All JS interop is quarantined here (ADR 0005)."
-  (:require [nats-cljc.auth :as auth]
-            [nats-cljc.error :as error]
-            [nats-cljc.protocol :as proto]
+  (:require [nats-cljc.impl.auth :as auth]
+            [nats-cljc.impl.error :as error]
+            [nats-cljc.impl.protocol :as proto]
             ["@nats-io/nats-core" :as nats-core]))
 
 (defn- no-responders?

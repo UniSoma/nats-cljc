@@ -1,4 +1,4 @@
-(ns ^:no-doc nats-cljc.jetstream.pull
+(ns ^:no-doc nats-cljc.jetstream.impl.pull
   "Portable pull-poll pre-flight deep module (ADR 0015/0018). The pure,
    platform-neutral half of the `fetch`/`next` poll verbs: the `:expires-ms` guard
    that keeps a sub-floor or non-integer poll window from reaching either leg as an
@@ -9,7 +9,7 @@
    raised pre-flight as `:invalid-expires` before any native call; an omitted window
    passes through to the native default. The per-leg impl namespaces build the native
    pull options — the interop half — so this is the shared seam a single no-server
-   unit covers, the pull sibling of `nats-cljc.jetstream.pub`.")
+   unit covers, the pull sibling of `nats-cljc.jetstream.impl.pub`.")
 
 ;; Both jnats (BaseConsumeOptions/MIN_EXPIRES_MILLS) and nats.js (PullConsumer fetch/next)
 ;; reject an expires window below 1000ms; pinned here so a sub-floor window is the same

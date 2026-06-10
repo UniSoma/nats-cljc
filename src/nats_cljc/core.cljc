@@ -10,7 +10,7 @@
   (:refer-clojure :exclude [flush])
   (:require [clojure.string :as str]
             [nats-cljc.codec :as codec]
-            [nats-cljc.protocol :as proto]
+            [nats-cljc.impl.protocol :as proto]
             #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])))
 
@@ -67,7 +67,7 @@
 
    Public (within this `^:no-doc` ns) so the JetStream facade reuses it, but it
    only enforces the `:invalid-header` shape rules above — NOT the reserved
-   `Nats-*` pre-flight, which lives separately in `nats-cljc.jetstream.pub`. A
+   `Nats-*` pre-flight, which lives separately in `nats-cljc.jetstream.impl.pub`. A
    JetStream-style caller must run `validate-headers` first (as the facade does);
    reaching this directly would let a reserved header through."
   [headers]

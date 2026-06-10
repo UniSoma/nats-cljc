@@ -9,6 +9,18 @@ bump, renaming or removing one is a major bump (see ADR 0009).
 
 ## [Unreleased]
 
+### Changed
+
+- **Internal namespaces moved under `impl`** — never-public (`^:no-doc`)
+  namespaces now live under their area's `impl` segment so editor autocomplete
+  distinguishes API from internals: `nats-cljc.{auth,error,protocol}` →
+  `nats-cljc.impl.{auth,error,protocol}`, and
+  `nats-cljc.jetstream.{acks,consumer,error,pub,pull,refill,stream}` →
+  `nats-cljc.jetstream.impl.{…}`. No deprecation shims (ADR 0005, amended).
+  The public surface — `nats-cljc.core`, `nats-cljc.codec`,
+  `nats-cljc.jetstream`, `nats-cljc.blocking.core`, and the opt-in
+  `nats-cljc.codec.<name>` namespaces — is unchanged.
+
 ## [0.2.0] - 2026-06-10
 
 Phase 2: JetStream, tested on the JVM and Node. One new portable namespace,

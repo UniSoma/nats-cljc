@@ -1,4 +1,4 @@
-(ns ^:no-doc nats-cljc.jetstream.refill
+(ns ^:no-doc nats-cljc.jetstream.impl.refill
   "Portable consume refill-decision deep module (ADR 0015/0018). The pure,
    platform-neutral half of the continuous `consume` verb: the refill knobs'
    pre-flight guard and the threshold-unit conversion the legs disagree on.
@@ -11,8 +11,8 @@
    the conversion the JVM leg feeds `thresholdPercent`, chosen so jnats' repull
    point lands exactly on the portable count. The per-leg impl namespaces build
    the native consume options — the interop half — so this is the shared seam a
-   single no-server unit covers, the consume sibling of `nats-cljc.jetstream.pull`."
-  (:require [nats-cljc.jetstream.pull :as pull]))
+   single no-server unit covers, the consume sibling of `nats-cljc.jetstream.impl.pull`."
+  (:require [nats-cljc.jetstream.impl.pull :as pull]))
 
 (defn threshold->percent
   "Convert the portable `:threshold` count into the jnats `thresholdPercent` whose

@@ -1,4 +1,4 @@
-(ns ^:no-doc nats-cljc.jetstream.stream
+(ns ^:no-doc nats-cljc.jetstream.impl.stream
   "Portable Stream config-translation + closed-key-validation deep module (ADR
    0015/0020). The pure, platform-neutral half of stream management: the closed set
    of recognized config keys, the keyword-enum ↔ wire-string tables, and the
@@ -6,7 +6,7 @@
    native call. The per-leg impl namespaces build the actual native config from
    these tables (Duration on the JVM, Nanos on CLJS) and read it back — the
    interop half — so this is the shared seam a single no-server unit test covers,
-   the stream sibling of `nats-cljc.jetstream.error`."
+   the stream sibling of `nats-cljc.jetstream.impl.error`."
   (:require [clojure.set :as set]))
 
 (def config-keys

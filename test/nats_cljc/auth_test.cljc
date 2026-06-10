@@ -6,7 +6,7 @@
    so the JVM and JS legs can't drift on which credentials an `:auth` map selects."
   (:require #?(:clj  [clojure.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is]])
-            [nats-cljc.auth :as auth]))
+            [nats-cljc.impl.auth :as auth]))
 
 (deftest auth-variant-classifies-each-shape
   (is (= :token (auth/auth-variant {:token "t"}))

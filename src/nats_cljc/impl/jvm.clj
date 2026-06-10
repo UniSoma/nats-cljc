@@ -1,9 +1,9 @@
 (ns ^:no-doc nats-cljc.impl.jvm
   "JVM platform implementation: a Connection record wrapping io.nats:jnats over
    TCP (ADR 0001/0003). All jnats interop is quarantined here (ADR 0005)."
-  (:require [nats-cljc.auth :as auth]
-            [nats-cljc.error :as error]
-            [nats-cljc.protocol :as proto])
+  (:require [nats-cljc.impl.auth :as auth]
+            [nats-cljc.impl.error :as error]
+            [nats-cljc.impl.protocol :as proto])
   (:import [io.nats.client Nats Options Options$Builder Connection Connection$Status Consumer Subscription Dispatcher MessageHandler Message AuthHandler NKey ConnectionListener ConnectionListener$Events ErrorListener JetStreamSubscription]
            [io.nats.client.impl Headers]
            [java.nio.charset StandardCharsets]

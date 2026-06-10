@@ -1,8 +1,8 @@
-(ns ^:no-doc nats-cljc.jetstream.error
+(ns ^:no-doc nats-cljc.jetstream.impl.error
   "Shared JetStream error normalization (ADR 0020): the JetStream API error codes
    are identical numbers on jnats and nats.js, so mapping an `err_code` to its
    canonical operational `:type` is a single portable lookup — the JetStream
-   sibling of `nats-cljc.error`'s server-error classifier. Seeded with the Phase-2
+   sibling of `nats-cljc.impl.error`'s server-error classifier. Seeded with the Phase-2
    entry point's code, the Stream/Consumer tracers' not-found codes, and acked
    publish's wrong-last-sequence; later slices add rows.
 

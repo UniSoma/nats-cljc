@@ -1,6 +1,6 @@
-(ns ^:no-doc nats-cljc.jetstream.consumer
+(ns ^:no-doc nats-cljc.jetstream.impl.consumer
   "Portable Consumer config-translation + closed-key-validation deep module (ADR
-   0015/0020), the consumer sibling of `nats-cljc.jetstream.stream`. The pure,
+   0015/0020), the consumer sibling of `nats-cljc.jetstream.impl.stream`. The pure,
    platform-neutral half of consumer management: the closed set of recognized config
    keys, the keyword-enum ↔ wire-string tables for the ack/deliver policies, and the
    pre-flight guards that raise `:unknown-config-key` / `:invalid-name` before any
@@ -9,7 +9,7 @@
    so this is the shared seam the no-server deep-module unit test covers. The Stream
    name constraint is identical, so the name guard reuses `stream/valid-name?`."
   (:require [clojure.set :as set]
-            [nats-cljc.jetstream.stream :as stream]))
+            [nats-cljc.jetstream.impl.stream :as stream]))
 
 (def config-keys
   "The CLOSED set of recognized portable Consumer config keys (ADR 0020). A key

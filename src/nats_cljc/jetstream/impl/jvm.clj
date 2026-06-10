@@ -13,13 +13,13 @@
    the JVM too — matching nats.js' native verify (ADR 0017)."
   ;; `nats-cljc.impl.jvm` (aliased `core`) is used for the promise helpers below;
   ;; the `:import` also reaches into it for the `JvmConnection` class to extend.
-  (:require [nats-cljc.protocol :as proto]
+  (:require [nats-cljc.impl.protocol :as proto]
             [nats-cljc.impl.jvm :as core]
-            [nats-cljc.jetstream.error :as jet-err]
-            [nats-cljc.jetstream.stream :as stream]
-            [nats-cljc.jetstream.consumer :as consumer]
-            [nats-cljc.jetstream.pull :as pull]
-            [nats-cljc.jetstream.refill :as refill])
+            [nats-cljc.jetstream.impl.error :as jet-err]
+            [nats-cljc.jetstream.impl.stream :as stream]
+            [nats-cljc.jetstream.impl.consumer :as consumer]
+            [nats-cljc.jetstream.impl.pull :as pull]
+            [nats-cljc.jetstream.impl.refill :as refill])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions BaseConsumerContext OrderedConsumerContext StreamContext FetchConsumer FetchConsumeOptions ConsumeOptions ConsumeOptions$Builder MessageConsumer MessageHandler Message]
            [io.nats.client.impl NatsJetStreamMetaData]

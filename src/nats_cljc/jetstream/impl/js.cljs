@@ -10,12 +10,12 @@
    nats.js' `jetstreamManager(nc)` natively round-trips ($JS.API.INFO) and rejects
    when JetStream is disabled, so verify-at-entry (ADR 0017) is native here — the
    JVM forces the equivalent round-trip to match."
-  (:require [nats-cljc.protocol :as proto]
+  (:require [nats-cljc.impl.protocol :as proto]
             [nats-cljc.impl.js :as core]
-            [nats-cljc.jetstream.error :as jet-err]
-            [nats-cljc.jetstream.stream :as stream]
-            [nats-cljc.jetstream.consumer :as consumer]
-            [nats-cljc.jetstream.pull :as pull]
+            [nats-cljc.jetstream.impl.error :as jet-err]
+            [nats-cljc.jetstream.impl.stream :as stream]
+            [nats-cljc.jetstream.impl.consumer :as consumer]
+            [nats-cljc.jetstream.impl.pull :as pull]
             ["@nats-io/jetstream" :as jetstream]))
 
 ;; The JetStream context (ADR 0017): one handle holding both nats.js' data-plane

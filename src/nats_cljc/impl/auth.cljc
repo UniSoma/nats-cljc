@@ -1,4 +1,4 @@
-(ns ^:no-doc nats-cljc.auth
+(ns ^:no-doc nats-cljc.impl.auth
   "Shared, platform-neutral `:auth` classification (ADR 0005). The per-leg
    credential wiring stays quarantined in `impl.jvm` / `impl.js` — each `with-auth`
    `case` dispatches native interop (jnats' Options builder / nats.js' options map)
