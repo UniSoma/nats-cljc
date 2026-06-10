@@ -340,6 +340,23 @@
                     :domain       (when (seq domain) domain)
                     :ack-subject  (.-reply m)}))))
 
+(defn- stored-msg->raw
+  "Lift a nats.js StoredMsg — what `streams.getMessage` resolves — into the raw
+   stored-message map the facade decodes: `{:subject :bytes :headers :seq :timestamp}`.
+   A read from the stream's storage, not a consumer delivery, so nothing nests under
+   `:js` (no consumer metadata, no ack-subject). `:headers` is the canonical portable
+   map `{name -> [str ...]}` or nil when the stored message carries none (nats.js
+   hands an EMPTY MsgHdrs in that case, coerced to nil); `:timestamp` is the raw
+   server receive time normalized to the canonical UTC-millis form, byte-identical
+   to the JVM leg."
+  [^js sm]
+  (let [r (js->clj (.toRecord ^js (.-header sm)))]
+    {:subject   (.-subject sm)
+     :bytes     (.-data sm)
+     :headers   (when (seq r) r)
+     :seq       (.-seq sm)
+     :timestamp (->canonical-timestamp (.-timestamp sm))}))
+
 (defn drain-fetch
   "Drain a nats.js ConsumerMessages — the async-iterable `fetch` resolves to — into a
    vector of lifted pull maps, lifting each JsMsg with `js-msg->raw` as it arrives. The
@@ -598,6 +615,22 @@
     (-> (.get ^js (.-consumers ^js (:js ctx)) stream consumer)
         (.then (fn [c] (start-consume c (assoc opts :abort-on-missing-resource true) handler)))
         (.catch (fn [e] (throw (api-error e))))))
+  (-js-get-message [ctx stream query]
+    ;; jsm.streams.getMessage resolves NULL for the server's 10037 no-message-found
+    ;; (nats.js absorbs that one code natively); re-raise it as the portable
+    ;; :no-message-found carrying the same {:code :description} shape the JVM leg's
+    ;; JetStreamApiException normalizes to, so the legs agree. Any other rejection
+    ;; (e.g. a missing stream's 10059) routes through the shared api-error tail.
+    (let [q (if-let [s (:seq query)]
+              #js {:seq s}
+              #js {:last_by_subj (:last-by-subject query)})]
+      (-> (.getMessage ^js (.-streams ^js (:jsm ctx)) stream q)
+          (.then (fn [sm]
+                   (if (some? sm)
+                     (stored-msg->raw sm)
+                     (throw (ex-info "no message found"
+                                     (jet-err/api-error-data 10037 "no message found"))))))
+          with-api-error)))
   (-js-ordered-consumer [ctx stream opts]
     ;; consumers.ordered round-trips stream info before building the ephemeral's
     ;; config (a missing stream rejects → :stream-not-found via api-error, the

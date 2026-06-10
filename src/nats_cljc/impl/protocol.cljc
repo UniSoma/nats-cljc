@@ -221,6 +221,18 @@
      :max-bytes}` the impl translates to native consume options (`:threshold`
      count->percent on the JVM). There is no `:slow-consumer` in pull: a slow
      handler slows the pull, nothing overflows (ADR 0018).")
+  (-js-get-message [ctx stream query]
+    "One-shot direct read of a stored message from the Stream `stream` through
+     `ctx`, selected by `{:seq n}` (a stream sequence) or `{:last-by-subject s}`
+     (the newest message stored on a subject) — already validated by the facade.
+     Returns a native promise of ONE raw stored-message map
+     `{:subject :bytes :headers :seq :timestamp}` (`:headers` nil when the message
+     carries none; `:timestamp` the canonical ISO-8601 receive time). A read from
+     the stream's storage, not a consumer delivery, so there is no `:js` consumer
+     metadata and no ack-subject. Rejects with `:type :no-message-found` (err
+     10037, carrying `{:code :description}`) when nothing matches — jnats raises
+     the 10037, nats.js absorbs it to null and the impl re-raises, so the legs
+     agree — and `:stream-not-found` when the Stream does not exist (ADR 0020).")
   (-js-ordered-consumer [ctx stream opts]
     "Create an Ordered consumer over the Stream `stream` through `ctx`, returning a
      native promise of the per-leg ordered pull handle (an `OrderedPull` record,

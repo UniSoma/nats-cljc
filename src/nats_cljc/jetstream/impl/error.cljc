@@ -17,6 +17,7 @@
   "JetStream API `err_code` → canonical operational `:type` (ADR 0020)."
   {10039 :jetstream-not-enabled
    10014 :consumer-not-found
+   10037 :no-message-found
    10059 :stream-not-found
    10071 :wrong-last-sequence
    10164 :wrong-last-sequence})

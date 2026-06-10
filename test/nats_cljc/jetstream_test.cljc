@@ -52,6 +52,8 @@
       "err_code 10071 (wrong last sequence) normalizes to :wrong-last-sequence")
   (is (= :wrong-last-sequence (jet-err/api-error-type 10164))
       "err_code 10164 (wrong last :msg-id) normalizes to :wrong-last-sequence")
+  (is (= :no-message-found (jet-err/api-error-type 10037))
+      "err_code 10037 (direct get matched nothing) normalizes to :no-message-found")
   (is (= :jetstream-api-error (jet-err/api-error-type 99999))
       "an unseeded code defaults to the operational catch-all :jetstream-api-error"))
 
@@ -2547,3 +2549,165 @@
                           (is (true? (proto/-active? handle)) "the consume handle is active while consuming")
                           (p/let [_ (nats/drain handle)]
                             (is (false? (proto/-active? handle)) "a drained handle is no longer active"))))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Direct get (get-message, :no-message-found)
+
+;; Deep-module unit (ADR 0015), no server: the get-message query guard is the
+;; portable pre-flight half — the map is closed, and it must select by exactly one
+;; well-formed selector (:seq a positive integer, :last-by-subject a non-empty
+;; string) — raising its validation :type before any native call.
+(deftest deep-module-get-query-validation
+  (is (= {:seq 3} (stream/validate-get-query {:seq 3}))
+      "a positive-integer :seq query passes validation unchanged")
+  (is (= {:last-by-subject "direct.a"} (stream/validate-get-query {:last-by-subject "direct.a"}))
+      "a non-empty :last-by-subject query passes validation unchanged")
+  (is (= :unknown-config-key (thrown-type #(stream/validate-get-query {:seq 3 :bogus 1})))
+      "an unrecognized key (the map is closed) is :unknown-config-key")
+  (is (= :invalid-query (thrown-type #(stream/validate-get-query {})))
+      "an empty query (no selector) is :invalid-query")
+  (is (= :invalid-query (thrown-type #(stream/validate-get-query {:seq 3 :last-by-subject "direct.a"})))
+      "both selectors at once is :invalid-query — the query selects by exactly one")
+  (is (= :invalid-query (thrown-type #(stream/validate-get-query {:seq 0})))
+      "a non-positive :seq is :invalid-query")
+  (is (= :invalid-query (thrown-type #(stream/validate-get-query {:seq "3"})))
+      "a non-integer :seq is :invalid-query")
+  (is (= :invalid-query (thrown-type #(stream/validate-get-query {:last-by-subject ""})))
+      "an empty :last-by-subject is :invalid-query"))
+
+;; ADR 0015: get-message's pre-flight guards reject ON THE PROMISE — a malformed
+;; stream name and a malformed query each surface their validation :type through
+;; the same channel as the operation's other failures, never a synchronous throw.
+(deftest get-message-rejects-validation-on-its-promise
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (is (= :invalid-name (:type (ex-data (reject-reason (jet/get-message ctx "bad.name" {:seq 1})))))
+               "a malformed stream name rejects the promise with :invalid-name")
+           (is (= :invalid-query (:type (ex-data (reject-reason (jet/get-message ctx "OK" {})))))
+               "a selector-less query rejects the promise with :invalid-query"))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)]
+                  (-> (jet/get-message ctx "bad.name" {:seq 1})
+                      (p/then (fn [_] (is false "expected an :invalid-name rejection")))
+                      (p/catch (fn [e] (is (= :invalid-name (:type (ex-data e)))
+                                           "a malformed stream name rejects the promise with :invalid-name")))
+                      (p/then (fn [_]
+                                (-> (jet/get-message ctx "OK" {})
+                                    (p/then (fn [_] (is false "expected an :invalid-query rejection")))
+                                    (p/catch (fn [e] (is (= :invalid-query (:type (ex-data e)))
+                                                         "a selector-less query rejects the promise with :invalid-query")))))))))))))
+
+;; Integration on the :4222 JetStream server: get-message reads a stored message
+;; directly off the stream — by stream sequence or newest-on-subject — resolving
+;; ONE pure-data stored message {:subject :data :seq :timestamp} (plus :headers
+;; when the message carries some): :data decoded with the context codec, :seq the
+;; stream sequence, :timestamp canonical ISO-8601, and NO :js consumer metadata —
+;; nothing was delivered, so there is nothing to ack. Same on both legs; memory
+;; stream, cleans up.
+(deftest direct-get-by-seq-and-last-by-subject
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "DIRECT" :subjects ["direct.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "DIRECT"
+             (fn []
+               (deref (jet/publish ctx "direct.a" {:n 1} {:headers {"My-Header" "h1"}}) 5000 ::timeout)
+               (deref (jet/publish ctx "direct.b" {:n 2}) 5000 ::timeout)
+               (deref (jet/publish ctx "direct.a" {:n 3}) 5000 ::timeout)
+               (let [m2   (deref (jet/get-message ctx "DIRECT" {:seq 2}) 5000 ::timeout)
+                     last (deref (jet/get-message ctx "DIRECT" {:last-by-subject "direct.a"}) 5000 ::timeout)
+                     m1   (deref (jet/get-message ctx "DIRECT" {:seq 1}) 5000 ::timeout)]
+                 (is (= #{:subject :data :seq :timestamp} (set (keys m2)))
+                     "a stored message is pure data — no :js consumer metadata, no :headers when none set")
+                 (is (= "direct.b" (:subject m2)) "a :seq get resolves the message at that stream sequence")
+                 (is (= {:n 2} (:data m2)) ":data is decoded with the context codec")
+                 (is (= 2 (:seq m2)) ":seq is the message's stream sequence")
+                 (is (re-matches canonical-ts-re (:timestamp m2))
+                     ":timestamp is canonical UTC millis (e.g. 2026-06-09T01:08:17.279Z)")
+                 (is (= {:n 3} (:data last)) "a :last-by-subject get resolves the NEWEST message on the subject")
+                 (is (= 3 (:seq last)) "the newest direct.a message is stream sequence 3")
+                 (is (= ["h1"] (get (:headers m1) "My-Header"))
+                     "a stored message that carries headers resolves with them")))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "DIRECT" :subjects ["direct.>"] :storage :memory})]
+                  (with-stream ctx "DIRECT"
+                    (fn []
+                      (p/let [_    (jet/publish ctx "direct.a" {:n 1} {:headers {"My-Header" "h1"}})
+                              _    (jet/publish ctx "direct.b" {:n 2})
+                              _    (jet/publish ctx "direct.a" {:n 3})
+                              m2   (jet/get-message ctx "DIRECT" {:seq 2})
+                              last (jet/get-message ctx "DIRECT" {:last-by-subject "direct.a"})
+                              m1   (jet/get-message ctx "DIRECT" {:seq 1})]
+                        (is (= #{:subject :data :seq :timestamp} (set (keys m2)))
+                            "a stored message is pure data — no :js consumer metadata, no :headers when none set")
+                        (is (= "direct.b" (:subject m2)) "a :seq get resolves the message at that stream sequence")
+                        (is (= {:n 2} (:data m2)) ":data is decoded with the context codec")
+                        (is (= 2 (:seq m2)) ":seq is the message's stream sequence")
+                        (is (re-matches canonical-ts-re (:timestamp m2))
+                            ":timestamp is canonical UTC millis (e.g. 2026-06-09T01:08:17.279Z)")
+                        (is (= {:n 3} (:data last)) "a :last-by-subject get resolves the NEWEST message on the subject")
+                        (is (= 3 (:seq last)) "the newest direct.a message is stream sequence 3")
+                        (is (= ["h1"] (get (:headers m1) "My-Header"))
+                            "a stored message that carries headers resolves with them"))))))))))
+
+;; ADR 0020, integration: a get that matches nothing — a sequence the stream never
+;; reached, or a subject with no stored message — rejects with the operational
+;; :type :no-message-found (err 10037, carrying {:code :description}), identically
+;; on both legs even though jnats raises the 10037 and nats.js absorbs it to null
+;; (the impl re-raises). A missing STREAM is the distinct :stream-not-found.
+(deftest direct-get-no-message-found-rejects
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [ctx (deref (jet/jetstream conn) 5000 ::timeout)]
+           (deref (jet/create-stream ctx {:name "NOMSG" :subjects ["nomsg.>"] :storage :memory}) 5000 ::timeout)
+           (with-stream ctx "NOMSG"
+             (fn []
+               (deref (jet/publish ctx "nomsg.a" {:n 1}) 5000 ::timeout)
+               (let [e (reject-reason (jet/get-message ctx "NOMSG" {:seq 999}))]
+                 (is (= :no-message-found (:type (ex-data e)))
+                     "a sequence the stream never reached rejects with :no-message-found")
+                 (is (= 10037 (:code (ex-data e)))
+                     "the rejection carries the server's err_code 10037"))
+               (is (= :no-message-found
+                      (:type (ex-data (reject-reason (jet/get-message ctx "NOMSG" {:last-by-subject "nomsg.none"})))))
+                   "a subject with no stored message rejects with :no-message-found")
+               (is (= :stream-not-found
+                      (:type (ex-data (reject-reason (jet/get-message ctx "NOSUCH" {:seq 1})))))
+                   "a missing stream is the distinct :stream-not-found"))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (p/let [ctx (jet/jetstream conn)
+                        _   (jet/create-stream ctx {:name "NOMSG" :subjects ["nomsg.>"] :storage :memory})]
+                  (with-stream ctx "NOMSG"
+                    (fn []
+                      (p/let [_ (jet/publish ctx "nomsg.a" {:n 1})]
+                        (-> (jet/get-message ctx "NOMSG" {:seq 999})
+                            (p/then (fn [_] (is false "expected a :no-message-found rejection")))
+                            (p/catch (fn [e]
+                                       (is (= :no-message-found (:type (ex-data e)))
+                                           "a sequence the stream never reached rejects with :no-message-found")
+                                       (is (= 10037 (:code (ex-data e)))
+                                           "the rejection carries the server's err_code 10037")))
+                            (p/then (fn [_]
+                                      (-> (jet/get-message ctx "NOMSG" {:last-by-subject "nomsg.none"})
+                                          (p/then (fn [_] (is false "expected a :no-message-found rejection")))
+                                          (p/catch (fn [e] (is (= :no-message-found (:type (ex-data e)))
+                                                               "a subject with no stored message rejects with :no-message-found"))))))
+                            (p/then (fn [_]
+                                      (-> (jet/get-message ctx "NOSUCH" {:seq 1})
+                                          (p/then (fn [_] (is false "expected a :stream-not-found rejection")))
+                                          (p/catch (fn [e] (is (= :stream-not-found (:type (ex-data e)))
+                                                               "a missing stream is the distinct :stream-not-found"))))))))))))))))

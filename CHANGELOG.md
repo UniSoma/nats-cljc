@@ -9,6 +9,17 @@ bump, renaming or removing one is a major bump (see ADR 0009).
 
 ## [Unreleased]
 
+### Added
+
+- **JetStream direct get** — `nats-cljc.jetstream/get-message`: a one-shot,
+  promise-returning read of a stored message straight off a Stream, by stream
+  sequence (`{:seq n}`) or newest-on-subject (`{:last-by-subject subj}`),
+  resolving a pure-data `{:subject :data :seq :timestamp}` (plus `:headers`
+  when present). Rejects with the new operational `:type :no-message-found`
+  (err 10037) when nothing matches; pre-flight, a malformed query rejects with
+  the new validation `:type :invalid-query`. Vocabulary additions ⇒ minor bump
+  (ADR 0009).
+
 ## [0.3.0] - 2026-06-10
 
 Internal-namespace housekeeping: the API/implementation boundary is now visible

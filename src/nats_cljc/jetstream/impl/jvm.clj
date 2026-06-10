@@ -22,9 +22,9 @@
             [nats-cljc.jetstream.impl.refill :as refill])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection Connection$Status JetStream JetStreamManagement JetStreamApiException PublishOptions BaseConsumerContext OrderedConsumerContext StreamContext FetchConsumer FetchConsumeOptions ConsumeOptions ConsumeOptions$Builder MessageConsumer MessageHandler Message]
-           [io.nats.client.impl NatsJetStreamMetaData]
+           [io.nats.client.impl Headers NatsJetStreamMetaData]
            [io.nats.client.support Status]
-           [io.nats.client.api ServerInfo StreamConfiguration StreamConfiguration$Builder StorageType RetentionPolicy StreamInfo StreamState PublishAck PurgeResponse ConsumerConfiguration ConsumerConfiguration$Builder AckPolicy DeliverPolicy ConsumerInfo SequenceInfo OrderedConsumerConfiguration]
+           [io.nats.client.api ServerInfo StreamConfiguration StreamConfiguration$Builder StorageType RetentionPolicy StreamInfo StreamState MessageInfo PublishAck PurgeResponse ConsumerConfiguration ConsumerConfiguration$Builder AckPolicy DeliverPolicy ConsumerInfo SequenceInfo OrderedConsumerConfiguration]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
            [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
@@ -466,6 +466,24 @@
                     :domain       (when (seq domain) domain)
                     :ack-subject  (.getReplyTo msg)}))))
 
+(defn- message-info->raw
+  "Lift a jnats MessageInfo — what the management message-get round-trip returns —
+   into the raw stored-message map the facade decodes:
+   `{:subject :bytes :headers :seq :timestamp}`. A read from the stream's storage,
+   not a consumer delivery, so nothing nests under `:js` (no consumer metadata, no
+   ack-subject). `:headers` is the canonical portable map `{name -> [str ...]}` or
+   nil when the stored message carries none; `:timestamp` is the receive time
+   normalized to the canonical UTC-millis form, byte-identical to the Node leg."
+  [^MessageInfo mi]
+  {:subject   (.getSubject mi)
+   :bytes     (.getData mi)
+   :headers   (let [^Headers h (.getHeaders mi)]
+                (when (and h (not (.isEmpty h)))
+                  (reduce (fn [m ^String k] (assoc m k (vec (.get h k))))
+                          {} (.keySet h))))
+   :seq       (.getSeq mi)
+   :timestamp (->canonical-timestamp (.getTime mi))})
+
 (defn- ->fetch-options
   "Build a jnats FetchConsumeOptions from the portable pull `opts` (ADR 0018): `:batch`
    is the max-messages ceiling — defaulting to `pull/default-batch`, the facade's chosen
@@ -735,6 +753,17 @@
      (:io-executor ctx)
      #(start-consume (.getConsumerContext ^JetStream (:js ctx) ^String stream ^String consumer)
                      opts handler (:io-executor ctx) (:client ctx) (:registry ctx) [stream consumer])))
+  (-js-get-message [ctx stream query]
+    ;; getMessage/getLastMessage are JetStreamManagement round-trips: a no-match
+    ;; raises a JetStreamApiException 10037 ⇒ :no-message-found and a missing
+    ;; stream a 10059 ⇒ :stream-not-found, both via off-thread's shared normalize.
+    (off-thread
+     (:io-executor ctx)
+     #(let [^JetStreamManagement jsm (:jsm ctx)]
+        (message-info->raw
+         (if-let [s (:seq query)]
+           (.getMessage jsm ^String stream (long s))
+           (.getLastMessage jsm ^String stream ^String (:last-by-subject query)))))))
   (-js-ordered-consumer [ctx stream opts]
     ;; getStreamContext round-trips stream info (a missing stream surfaces as a
     ;; JetStreamApiException → :stream-not-found via off-thread, matching the

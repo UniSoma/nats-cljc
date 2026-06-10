@@ -232,6 +232,40 @@
                     (proto/-js-publish ctx subject headers bytes
                                        (select-keys opts [:msg-id :expect :timeout-ms])))))))
 
+(defn get-message
+  "One-shot direct read of a stored message from the Stream `stream` on the
+   JetStream context `ctx` — a read from the stream's storage, not a consumer
+   delivery — returning a platform-native promise that resolves to ONE pure-data
+   stored message `{:subject :data :seq :timestamp}` (plus `:headers` when the
+   message carries some): `:data` decoded with the context codec, `:seq` the
+   message's stream sequence, `:timestamp` the canonical ISO-8601 receive time.
+   There is no `:js` consumer metadata and no ack-subject — nothing was delivered,
+   so there is nothing to ack.
+
+   `query` is the portable, CLOSED kebab map selecting the message, by EXACTLY one
+   of `:seq` (a positive integer stream sequence) or `:last-by-subject` (the newest
+   message stored on a subject). `opts`: `:codec` (a per-call decode override).
+
+   The promise rejects with an operational `:type :no-message-found` (err 10037,
+   carrying `{:code :description}`) when nothing matches — a sequence the stream
+   never reached or has purged, or a subject with no stored message — and
+   `:stream-not-found` when no such Stream exists (ADR 0020). Pre-flight, a
+   malformed `stream` rejects with a validation `:type :invalid-name`, an
+   unrecognized query key with `:unknown-config-key`, and a query that does not
+   select by exactly one well-formed selector with `:invalid-query` (ADR 0015)."
+  ([ctx stream query] (get-message ctx stream query {}))
+  ([ctx stream query opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (stream/validate-name stream)))
+       (impl/then (fn [_] (stream/validate-get-query query)))
+       (impl/bind (fn [_] (proto/-js-get-message ctx stream query)))
+       (impl/then (fn [{:keys [subject bytes headers] :as raw}]
+                    (cond-> {:subject   subject
+                             :data      (codec/decode (msg/effective-codec ctx opts) bytes)
+                             :seq       (:seq raw)
+                             :timestamp (:timestamp raw)}
+                      (seq headers) (assoc :headers (msg/trim-headers headers))))))))
+
 (defn- decode-js-msg
   "Decode a raw pull map `{:subject :bytes :headers :js}` (the per-leg `js-msg->raw`
    lift) into the public pure-data JetStream message `{:subject :data :headers :js}`,

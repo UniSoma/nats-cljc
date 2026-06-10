@@ -49,6 +49,32 @@
     (throw (ex-info "Invalid stream name" {:type :invalid-name :name name})))
   name)
 
+(def get-query-keys
+  "The CLOSED set of recognized get-message query keys. A key outside it is
+   caller misuse — `:unknown-config-key`, raised pre-flight — rather than
+   silently dropped, so a misspelling fails loudly instead of vanishing."
+  #{:seq :last-by-subject})
+
+(defn validate-get-query
+  "Guard a get-message `query` map pre-flight (ADR 0015), before any native call:
+   the map is CLOSED (an unrecognized key throws `:type :unknown-config-key`
+   carrying the offending `:keys`), and it must select by EXACTLY one of `:seq`
+   (a positive integer stream sequence) or `:last-by-subject` (a non-empty
+   subject string) — neither, both, or a malformed selector throws `:type
+   :invalid-query` carrying the offending `:query`. Returns `query` so it can
+   sit in a promise chain stage."
+  [query]
+  (let [unknown (remove get-query-keys (keys query))]
+    (when (seq unknown)
+      (throw (ex-info "Unknown get-message query key(s)"
+                      {:type :unknown-config-key :keys (vec unknown)}))))
+  (let [{s :seq sub :last-by-subject} query]
+    (when-not (or (and (integer? s) (pos? s) (nil? sub))
+                  (and (string? sub) (seq sub) (nil? s)))
+      (throw (ex-info "get-message query must select by exactly one of :seq (a positive integer) or :last-by-subject (a non-empty string)"
+                      {:type :invalid-query :query query}))))
+  query)
+
 (defn validate-config
   "Guard a portable Stream `config` map pre-flight (ADR 0015), before any native
    call: an unrecognized key (the map is closed) throws `:type :unknown-config-key`
