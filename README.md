@@ -5,7 +5,7 @@
 [![Clojars](https://img.shields.io/clojars/v/io.github.unisoma/nats-cljc.svg)](https://clojars.org/io.github.unisoma/nats-cljc)
 [![CI](https://github.com/unisoma/nats-cljc/actions/workflows/ci.yml/badge.svg)](https://github.com/unisoma/nats-cljc/actions/workflows/ci.yml)
 
-> **Status: `0.2.0`.** The Phase 1 core, the Phase 1.5 blocking layer, and Phase 2 JetStream (`nats-cljc.jetstream`) are implemented, tested on the JVM, Node, and the browser, and published to Clojars. Being pre-1.0, the API may still evolve as KV, Object Store, and the async adapters (Phases 3–5) land — but within [ADR 0009](./docs/adr/0009-project-foundations-and-versioning.md)'s stability discipline: adding a normalized vocabulary member is a minor bump, renaming or removing one is a major bump. The decisions behind every choice live in [`CONTEXT.md`](./CONTEXT.md) (glossary) and [`docs/adr/`](./docs/adr/) (architecture decision records).
+> **Status: `0.3.0`.** The Phase 1 core, the Phase 1.5 blocking layer, and Phase 2 JetStream (`nats-cljc.jetstream`) are implemented, tested on the JVM, Node, and the browser, and published to Clojars. Being pre-1.0, the API may still evolve as KV, Object Store, and the async adapters (Phases 3–5) land — but within [ADR 0009](./docs/adr/0009-project-foundations-and-versioning.md)'s stability discipline: adding a normalized vocabulary member is a minor bump, renaming or removing one is a major bump. The decisions behind every choice live in [`CONTEXT.md`](./CONTEXT.md) (glossary) and [`docs/adr/`](./docs/adr/) (architecture decision records).
 
 ---
 
@@ -25,7 +25,7 @@ There are good NATS wrappers for the JVM (e.g. [clj-nats](https://github.com/cjo
 
 ```clojure
 ;; deps.edn
-io.github.unisoma/nats-cljc {:mvn/version "0.2.0"}
+io.github.unisoma/nats-cljc {:mvn/version "0.3.0"}
 ```
 
 That coordinate pulls in only the JVM client **`io.nats:jnats`** transitively. It deliberately forces **no other runtime dependency** — no async library (one-shot operations return the platform-native promise; see [Composing results](#composing-results)) and no serialization library (the default `:edn` codec uses only Clojure core; see [Codecs](#codecs)). On ClojureScript you additionally install the JS client yourself (shadow-cljs reads it from our `deps.cljs`):

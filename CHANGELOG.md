@@ -9,6 +9,12 @@ bump, renaming or removing one is a major bump (see ADR 0009).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-10
+
+Internal-namespace housekeeping: the API/implementation boundary is now visible
+in the namespace names themselves. Breaking only for code that required
+never-public (`^:no-doc`) internals.
+
 ### Changed
 
 - **Internal namespaces moved under `impl`** — never-public (`^:no-doc`)
@@ -124,7 +130,8 @@ Node, and the browser.
 - **JVM-only blocking convenience layer** (`nats-cljc.blocking.core`) — the same
   verb names, synchronous, with a pull-based subscription model.
 
-[Unreleased]: https://github.com/unisoma/nats-cljc/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/unisoma/nats-cljc/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/unisoma/nats-cljc/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/unisoma/nats-cljc/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/unisoma/nats-cljc/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/unisoma/nats-cljc/releases/tag/v0.1.0
