@@ -282,6 +282,19 @@
   (-delete-bucket [ctx bucket]
     "Delete the Bucket named `bucket`, returning a native promise that resolves to
      nil once it is gone and rejects with `:type :bucket-not-found` when no such
+     Bucket exists (ADR 0023).")
+  (-bucket-names [ctx]
+    "Enumerate the Buckets on the server, returning a native promise of a vector
+     of Bucket name strings.")
+  (-list-buckets [ctx]
+    "Enumerate the Buckets on the server, returning a native promise of a vector
+     of normalized status maps — one per Bucket, the same shape `-bucket-status`
+     resolves with.")
+  (-bucket-status [ctx bucket]
+    "Read the status of the Bucket named `bucket`, returning a native promise of
+     the normalized portable status map — the bucket-config keys as the server
+     applied them, plus the observed `:values` / `:bytes` counters — identical in
+     shape on every leg. Rejects with `:type :bucket-not-found` when no such
      Bucket exists (ADR 0023)."))
 
 (defprotocol BucketEntries

@@ -112,6 +112,36 @@
       (impl/then (fn [_] (bucket/validate-name bucket)))
       (impl/bind (fn [_] (proto/-delete-bucket ctx bucket)))))
 
+(defn bucket-names
+  "Enumerate the Buckets on the KV context `ctx`, returning a platform-native
+   promise that resolves to a vector of Bucket name strings — the KV twin of
+   `stream-names`, fully realized rather than paged."
+  [ctx]
+  (proto/-bucket-names ctx))
+
+(defn list-buckets
+  "Enumerate the Buckets on the KV context `ctx`, returning a platform-native
+   promise that resolves to a vector of normalized status maps (see
+   `bucket-status`), one per Bucket — the KV twin of `list-streams`."
+  [ctx]
+  (proto/-list-buckets ctx))
+
+(defn bucket-status
+  "Read the status of the Bucket named `bucket` on the KV context `ctx`,
+   returning a platform-native promise that resolves to one normalized status
+   map, identical in shape on every leg: the bucket-config keys as the server
+   applied them — `:bucket`, `:description` (nil when none is set), `:history`,
+   `:ttl-ms` (0 when none), `:max-value-size` / `:max-bucket-size` (-1 when
+   unlimited), `:storage`, `:replicas`, and `:compression?` — plus the observed
+   counters `:values` (live entry count) and `:bytes` (stored size). The promise
+   rejects with an operational `:type :bucket-not-found` when no such Bucket
+   exists (ADR 0023), and pre-flight with a validation `:type :invalid-name`
+   when `bucket` is malformed (ADR 0015)."
+  [ctx bucket]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (bucket/validate-name bucket)))
+      (impl/bind (fn [_] (proto/-bucket-status ctx bucket)))))
+
 (defn put
   "Write `value` under `key` in the Bucket `handle`, encoded through the Bucket's
    one Codec, returning a platform-native promise that resolves to the new

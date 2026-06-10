@@ -85,6 +85,26 @@
      (:replicas config)                (assoc :replicas (:replicas config))
      (some? (:compression? config))    (assoc :compression (boolean (:compression? config))))))
 
+(defn- status->map
+  "Curate a @nats-io/kv KvStatus into the normalized portable status map: the
+   bucket-config keys as the server applied them — `:description` normalized to
+   nil when none is set (nats.js reads an absent description as \"\"; jnats as
+   null), `:ttl-ms` from the native ms `ttl`, `:storage` back through the shared
+   wire table — plus the observed `:values` / `:bytes` counters. One pinned
+   shape on every leg."
+  [^js s]
+  {:bucket          (.-bucket s)
+   :description     (let [d (.-description s)] (when (seq d) d))
+   :history         (.-history s)
+   :ttl-ms          (.-ttl s)
+   :max-value-size  (.-maxValueSize s)
+   :max-bucket-size (.-max_bytes s)
+   :storage         (bucket/wire->storage (.-storage s))
+   :replicas        (.-replicas s)
+   :compression?    (boolean (.-compression s))
+   :values          (.-values s)
+   :bytes           (.-size s)})
+
 (extend-type JsKvContext
   proto/BucketManager
   (-create-bucket [ctx config]
@@ -107,6 +127,23 @@
     (-> (.open ^js (:kvm ctx) bucket)
         (.then (fn [kv] (.destroy ^js kv)))
         (.then (fn [_] nil))
+        with-kv-error))
+  (-bucket-names [ctx]
+    ;; Kvm has no dedicated names endpoint (unlike jnats' getBucketNames), so the
+    ;; names derive from draining the same status Lister `-list-buckets` rides —
+    ;; shape parity, not cadence parity.
+    (-> (jet-js/drain-lister (.list ^js (:kvm ctx)) #(.-bucket ^js %) [])
+        with-kv-error))
+  (-list-buckets [ctx]
+    (-> (jet-js/drain-lister (.list ^js (:kvm ctx)) status->map [])
+        with-kv-error))
+  (-bucket-status [ctx bucket]
+    ;; kvm.open binds WITHOUT a server round-trip; status() is the stream-info
+    ;; round-trip whose not-found rejects re-faced :bucket-not-found (ADR 0023),
+    ;; matching the JVM leg's getStatus.
+    (-> (.open ^js (:kvm ctx) bucket)
+        (.then (fn [kv] (.status ^js kv)))
+        (.then status->map)
         with-kv-error)))
 
 ;; @nats-io/kv KvEntry `operation` string → the portable Entry `:operation`

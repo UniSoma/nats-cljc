@@ -516,3 +516,97 @@
                                                                     (p/catch (fn [e]
                                                                                (is (= :invalid-key (:type (ex-data e)))
                                                                                    "get with a malformed key rejects with :invalid-key")))))))))))))))))))))
+
+;; The exact normalized Bucket status a-config + one put should yield on EVERY
+;; leg, minus the observed :bytes (server-version-dependent overhead, asserted
+;; pos? separately): the config keys reuse the bucket-config names where they
+;; overlap, plus the observed :values entry count. `(dissoc status :bytes)`
+;; compared against this map pins both the exact key set and each value — the
+;; shape-parity contract (ADR 0006 spirit: shape parity, not cadence parity).
+(defn- expected-status [bucket]
+  {:bucket bucket :description "tracer bucket" :history 5 :ttl-ms 60000
+   :max-value-size 1024 :max-bucket-size 1048576 :storage :memory :replicas 1
+   :compression? false :values 1})
+
+;; The shared status-map assertions both legs run over a `bucket-status` /
+;; `list-buckets` element for the a-config Bucket holding one entry.
+(defn- assert-status [bucket status via]
+  (is (= (expected-status bucket) (dissoc status :bytes))
+      (str via " resolves to the pinned normalized status map (key set and values)"))
+  (is (pos? (:bytes status))
+      (str via "'s observed :bytes counter is positive with one entry stored")))
+
+;; The operator surface (the stream-names / list-streams precedent, lifted to
+;; Buckets): bucket-names resolves to a vector of name strings, list-buckets to a
+;; vector of normalized status maps, and bucket-status to the same map for one
+;; Bucket — pinned field-by-field against a fully-specified config plus one put,
+;; so both legs surface an identical shape (ADR 0023, KV vocabulary throughout).
+(deftest operator-surface-reports-bucket-topology
+  (let [bucket "TRACER_KV_STATUS"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx (a-config bucket)) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "k" "hello") 5000 ::timeout)
+                 (let [names (deref (kv/bucket-names ctx) 5000 ::timeout)]
+                   (is (vector? names) "bucket-names resolves to a vector")
+                   (is (every? string? names) "bucket-names holds name strings")
+                   (is (some #{bucket} names) "bucket-names names every Bucket, including this one"))
+                 (assert-status bucket (deref (kv/bucket-status ctx bucket) 5000 ::timeout)
+                                "bucket-status")
+                 (let [statuses (deref (kv/list-buckets ctx) 5000 ::timeout)]
+                   (is (vector? statuses) "list-buckets resolves to a vector")
+                   (assert-status bucket
+                                  (first (filter #(= bucket (:bucket %)) statuses))
+                                  "list-buckets' element")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx (a-config bucket))
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "k" "hello")
+                                                      (p/then (fn [_] (kv/bucket-names ctx)))
+                                                      (p/then (fn [names]
+                                                                (is (vector? names) "bucket-names resolves to a vector")
+                                                                (is (every? string? names) "bucket-names holds name strings")
+                                                                (is (some #{bucket} names) "bucket-names names every Bucket, including this one")
+                                                                (kv/bucket-status ctx bucket)))
+                                                      (p/then (fn [status]
+                                                                (assert-status bucket status "bucket-status")
+                                                                (kv/list-buckets ctx)))
+                                                      (p/then (fn [statuses]
+                                                                (is (vector? statuses) "list-buckets resolves to a vector")
+                                                                (assert-status bucket
+                                                                               (first (filter #(= bucket (:bucket %)) statuses))
+                                                                               "list-buckets' element"))))))))))))))))))
+
+;; bucket-status on a Bucket that was never created rejects with
+;; :bucket-not-found — the same KV face as open/delete (ADR 0023).
+(deftest bucket-status-missing-rejects-bucket-not-found
+  (let [bucket "TRACER_KV_STATUS_MISSING"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx (deref (kv/kv conn) 5000 ::timeout)
+                 e   (reject-reason (kv/bucket-status ctx bucket))]
+             (is (= :bucket-not-found (:type (ex-data e)))
+                 "bucket-status on a missing Bucket rejects with :bucket-not-found"))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/bucket-status ctx bucket)
+                                    (p/then (fn [_] (is false "expected bucket-status to reject with :bucket-not-found")))
+                                    (p/catch (fn [e]
+                                               (is (= :bucket-not-found (:type (ex-data e)))
+                                                   "bucket-status on a missing Bucket rejects with :bucket-not-found")))))))))))))

@@ -7,7 +7,8 @@
    actual native config from these tables (Duration on the JVM, ms options on
    CLJS) — the interop half — so this is the shared seam a single no-server unit
    test covers."
-  (:require [clojure.string :as str]))
+  (:require [clojure.set :as set]
+            [clojure.string :as str]))
 
 (def config-keys
   "The CLOSED set of recognized portable Bucket config keys. A key outside it is
@@ -23,6 +24,11 @@
    rather than borrowed from the stream tables so the KV deep module never names
    its substrate (ADR 0023)."
   {:file "file" :memory "memory"})
+
+(def wire->storage
+  "The inverse table, for reading a native status back into the portable
+   `:storage` keyword (the `nats-cljc.jetstream.impl.stream` precedent)."
+  (set/map-invert storage->wire))
 
 ;; A valid Bucket name is a non-empty run of alphanumerics, dash, and underscore —
 ;; the `[-\w]+` constraint both jnats (validateBucketName) and @nats-io/kv

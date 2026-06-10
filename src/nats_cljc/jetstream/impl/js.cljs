@@ -222,12 +222,13 @@
    :duplicate (.-duplicate a)
    :domain    (or (.-domain a) nil)})
 
-(defn- drain-lister
+(defn drain-lister
   "Drain a nats.js Lister — the async-paged iterator the list/names endpoints
    return — into a vector, calling `.next` for successive pages, normalizing each
    element through `f`, and accumulating until a page comes back empty (the
    Lister's end-of-pages signal). The JVM leg's `getConsumers`/`getStreams` hand
-   back the full list in one call; this loop is the CLJS analog."
+   back the full list in one call; this loop is the CLJS analog. Public so the KV
+   impl can drain `Kvm.list()` — the same Lister type — through it."
   [^js lister f acc]
   (-> (.next lister)
       (.then (fn [page]

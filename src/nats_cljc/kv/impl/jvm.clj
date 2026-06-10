@@ -19,7 +19,7 @@
             [nats-cljc.kv.impl.error :as kv-err])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection JetStreamApiException KeyValue KeyValueManagement]
-           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry StorageType]
+           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry KeyValueStatus StorageType]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
            [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
@@ -146,6 +146,25 @@
       (.compression b (boolean (:compression? config))))
     (.build b)))
 
+(defn- status->map
+  "Curate a jnats KeyValueStatus into the normalized portable status map: the
+   bucket-config keys as the server applied them — `:description` already nil
+   when none is set, `:ttl-ms` lifted from jnats' Duration (the CLJS leg reads
+   native ms), `:storage` back through the shared wire table — plus the observed
+   `:values` / `:bytes` counters. One pinned shape on every leg."
+  [^KeyValueStatus s]
+  {:bucket          (.getBucketName s)
+   :description     (.getDescription s)
+   :history         (.getMaxHistoryPerKey s)
+   :ttl-ms          (.toMillis (.getTtl s))
+   :max-value-size  (.getMaxValueSize s)
+   :max-bucket-size (.getMaxBucketSize s)
+   :storage         (bucket/wire->storage (str (.getStorageType s)))
+   :replicas        (.getReplicas s)
+   :compression?    (.isCompressed s)
+   :values          (.getEntryCount s)
+   :bytes           (.getByteCount s)})
+
 (defn- bucket-handle
   "Construct the Bucket handle for `bucket` on `ctx`. jnats' `keyValue(bucket)` is
    a cheap local construction (the existence check is the caller's — create's
@@ -199,7 +218,20 @@
                      (bucket-handle ctx bucket))))
   (-delete-bucket [ctx bucket]
     (off-thread (:io-executor ctx)
-                #(do (.delete ^KeyValueManagement (:kvm ctx) ^String bucket) nil))))
+                #(do (.delete ^KeyValueManagement (:kvm ctx) ^String bucket) nil)))
+  (-bucket-names [ctx]
+    ;; jnats' dedicated names endpoint — the stream-names precedent: never pays
+    ;; for full statuses.
+    (off-thread (:io-executor ctx)
+                #(vec (.getBucketNames ^KeyValueManagement (:kvm ctx)))))
+  (-list-buckets [ctx]
+    (off-thread (:io-executor ctx)
+                #(mapv status->map (.getStatuses ^KeyValueManagement (:kvm ctx)))))
+  (-bucket-status [ctx bucket]
+    ;; A missing Bucket raises the substrate's not-found 10059 from getStatus,
+    ;; re-faced :bucket-not-found by off-thread's normalization (ADR 0023).
+    (off-thread (:io-executor ctx)
+                #(status->map (.getStatus ^KeyValueManagement (:kvm ctx) ^String bucket)))))
 
 (extend-type JvmBucket
   proto/BucketEntries
