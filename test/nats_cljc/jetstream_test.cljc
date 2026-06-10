@@ -684,7 +684,7 @@
 ;; before any native call (nil ctx). Two sources, both typed :invalid-header: a non-map
 ;; :headers (e.g. a vector) caught by validate-headers' type guard instead of leaking a raw
 ;; ClassCastException from `keys`, and a malformed header (non-ASCII value here) caught by
-;; core/normalize-headers in the then stage.
+;; msg/normalize-headers in the then stage.
 (deftest publish-rejects-invalid-header-on-its-promise
   #?(:clj
      (do

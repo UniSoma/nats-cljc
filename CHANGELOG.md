@@ -20,6 +20,11 @@ bump, renaming or removing one is a major bump (see ADR 0009).
   The public surface — `nats-cljc.core`, `nats-cljc.codec`,
   `nats-cljc.jetstream`, `nats-cljc.blocking.core`, and the opt-in
   `nats-cljc.codec.<name>` namespaces — is unchanged.
+- **Cross-facade plumbing moved out of `nats-cljc.core`** — `normalize-headers`,
+  `trim-headers`, and `effective-codec` were public in `nats-cljc.core` only so
+  the JetStream facade could reuse them; they now live in the new
+  `nats-cljc.impl.msg`, so the public namespaces expose only API. This also
+  removes the JetStream facade's code dependency on `nats-cljc.core`.
 
 ## [0.2.0] - 2026-06-10
 

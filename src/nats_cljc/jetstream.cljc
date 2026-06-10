@@ -12,8 +12,8 @@
   ;; `next` is the pull poll-one verb (ADR 0018); the alias `jet/next` is the public
   ;; name, so clojure.core/next is excluded rather than shadowed in-ns.
   (:refer-clojure :exclude [next])
-  (:require [nats-cljc.core :as core]
-            [nats-cljc.codec :as codec]
+  (:require [nats-cljc.codec :as codec]
+            [nats-cljc.impl.msg :as msg]
             [nats-cljc.impl.protocol :as proto]
             [nats-cljc.jetstream.impl.stream :as stream]
             [nats-cljc.jetstream.impl.consumer :as consumer]
@@ -226,8 +226,8 @@
    (-> (impl/resolved nil)
        (impl/then (fn [_] (pub/validate-headers headers)))
        (impl/then (fn [hs]
-                    {:headers (core/normalize-headers hs)
-                     :bytes   (codec/encode (core/effective-codec ctx opts) data)}))
+                    {:headers (msg/normalize-headers hs)
+                     :bytes   (codec/encode (msg/effective-codec ctx opts) data)}))
        (impl/bind (fn [{:keys [headers bytes]}]
                     (proto/-js-publish ctx subject headers bytes
                                        (select-keys opts [:msg-id :expect :timeout-ms])))))))
@@ -237,14 +237,14 @@
    lift) into the public pure-data JetStream message `{:subject :data :headers :js}`,
    decoding `:bytes` with `codec` and carrying the `:js` metadata through untouched.
    The JetStream counterpart to core's `decode-msg`: same header contract via the
-   shared `core/trim-headers` (surrounding whitespace stripped, an empty map dropped
+   shared `msg/trim-headers` (surrounding whitespace stripped, an empty map dropped
    so `:headers` stays absent), but the ack address lives under `:js :ack-subject`,
    never as a top-level `:reply` (ADR 0019)."
   [codec {:keys [subject bytes headers js]}]
   (cond-> {:subject subject
            :data    (codec/decode codec bytes)
            :js      js}
-    (seq headers) (assoc :headers (core/trim-headers headers))))
+    (seq headers) (assoc :headers (msg/trim-headers headers))))
 
 (defn ordered-consumer
   "Create an Ordered consumer over the Stream `stream` through the JetStream context
@@ -301,7 +301,7 @@
        (impl/then (fn [_] (pull/validate-expires opts)))
        (impl/bind (fn [_] (proto/-oc-fetch ordered opts)))
        (impl/then (fn [raws]
-                    (let [codec (core/effective-codec ordered opts)]
+                    (let [codec (msg/effective-codec ordered opts)]
                       (mapv #(decode-js-msg codec %) raws))))))
   ([ctx stream consumer] (fetch ctx stream consumer {}))
   ([ctx stream consumer opts]
@@ -311,7 +311,7 @@
        (impl/then (fn [_] (pull/validate-expires opts)))
        (impl/bind (fn [_] (proto/-js-fetch ctx stream consumer opts)))
        (impl/then (fn [raws]
-                    (let [codec (core/effective-codec ctx opts)]
+                    (let [codec (msg/effective-codec ctx opts)]
                       (mapv #(decode-js-msg codec %) raws)))))))
 
 (defn next
@@ -335,7 +335,7 @@
    (-> (impl/resolved nil)
        (impl/then (fn [_] (pull/validate-expires opts)))
        (impl/bind (fn [_] (proto/-oc-next ordered opts)))
-       (impl/then (fn [raw] (when raw (decode-js-msg (core/effective-codec ordered opts) raw))))))
+       (impl/then (fn [raw] (when raw (decode-js-msg (msg/effective-codec ordered opts) raw))))))
   ([ctx stream consumer] (next ctx stream consumer {}))
   ([ctx stream consumer opts]
    (-> (impl/resolved nil)
@@ -343,7 +343,7 @@
        (impl/then (fn [_] (consumer/validate-name consumer)))
        (impl/then (fn [_] (pull/validate-expires opts)))
        (impl/bind (fn [_] (proto/-js-next ctx stream consumer opts)))
-       (impl/then (fn [raw] (when raw (decode-js-msg (core/effective-codec ctx opts) raw)))))))
+       (impl/then (fn [raw] (when raw (decode-js-msg (msg/effective-codec ctx opts) raw)))))))
 
 (defn consume
   "Continuously deliver from the durable Consumer `consumer` on Stream `stream`
@@ -400,7 +400,7 @@
    (-> (impl/resolved nil)
        (impl/then (fn [_] (refill/validate-opts opts)))
        (impl/bind (fn [_]
-                    (let [codec (core/effective-codec ordered opts)]
+                    (let [codec (msg/effective-codec ordered opts)]
                       (proto/-oc-consume ordered
                                          (select-keys opts [:batch :threshold :expires-ms :idle-heartbeat-ms :max-bytes])
                                          (fn [raw] (handler (decode-js-msg codec raw)))))))))
@@ -411,7 +411,7 @@
        (impl/then (fn [_] (consumer/validate-name consumer)))
        (impl/then (fn [_] (refill/validate-opts opts)))
        (impl/bind (fn [_]
-                    (let [codec (core/effective-codec ctx opts)]
+                    (let [codec (msg/effective-codec ctx opts)]
                       (proto/-js-consume ctx stream consumer
                                          (select-keys opts [:batch :threshold :expires-ms :idle-heartbeat-ms :max-bytes :on-error])
                                          (fn [raw] (handler (decode-js-msg codec raw))))))))))
