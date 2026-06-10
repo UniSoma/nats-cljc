@@ -2,7 +2,7 @@
 
 JetStream pull consumers deliver messages through the **same handler contract as core subscriptions** (ADR 0007): a `(fn [msg] …)` that may return a promise, where the runtime waits for that promise to settle before delivering the next message. That gives per-message backpressure with **no async dependency** — the client's own read rate gates how fast it pulls from the server. The continuous `consume` verb takes this handler and returns a drainable/unsubscribable handle; the bounded `fetch` returns a `Promise<vector>` of messages; the single-shot `next` returns a `Promise<msg-or-nil>`.
 
-This **amends a consequence of ADR 0002**, which predated ADR 0007 and specified that pull consumers would need a channel/missionary adapter "because a bare callback cannot carry backpressure." ADR 0007 then discovered that a *promise-returning* handler carries backpressure perfectly well, and chose it for core subscriptions as "a cheap, portable win available immediately." Phase 2 simply extends that same primitive to JetStream pull. The core.async and missionary adapters remain exactly what ADR 0002 always said they should be — **opt-in sugar layered on top, Phase 3** — never the Phase-2 delivery mechanism.
+This **amends a consequence of ADR 0002**, which predated ADR 0007 and specified that pull consumers would need a channel/missionary adapter "because a bare callback cannot carry backpressure." ADR 0007 then discovered that a *promise-returning* handler carries backpressure perfectly well, and chose it for core subscriptions as "a cheap, portable win available immediately." Phase 2 simply extends that same primitive to JetStream pull. The core.async and missionary adapters remain exactly what ADR 0002 always said they should be — **opt-in sugar layered on top, Phase 5** — never the Phase-2 delivery mechanism.
 
 Forcing the Phase-2 primitive to be a channel/missionary adapter would also contradict the dependency floor: core.async and missionary are non-NATS dependencies, the precise kind the library refuses to force (ADR 0002/0004).
 
@@ -29,4 +29,4 @@ On CLJS, consume-time runtime conditions (`heartbeats_missed`, `consumer_deleted
 - JetStream pull adds no async dependency; `consume` is the core handler contract with acks and refill knobs layered on.
 - ADR 0002's pull consequence is amended in place (with a pointer here); the README roadmap's Phase-2 line changes from "channel/missionary adapter" to the promise-return handler.
 - `:max-pending` / `:slow-consumer` are core-push concepts and do not appear in the pull surface.
-- The core.async / missionary adapters (Phase 3) are layered on the same handle and handler, not a parallel delivery path.
+- The core.async / missionary adapters (Phase 5) are layered on the same handle and handler, not a parallel delivery path.
