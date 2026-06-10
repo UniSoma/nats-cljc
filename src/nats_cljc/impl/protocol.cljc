@@ -284,6 +284,25 @@
      nil once it is gone and rejects with `:type :bucket-not-found` when no such
      Bucket exists (ADR 0023)."))
 
+(defprotocol BucketEntries
+  "KV entry operations over a Bucket handle (ADR 0023) — EXTENDED onto each
+   platform's Bucket record from the impl namespaces, never implemented inline, so
+   the `@nats-io/kv` import stays confined (ADR 0016). The facade owns the public
+   arglists, the pre-flight key validation, and the codec seam: these deal in WIRE
+   BYTES and raw entry maps, never decoded values, exactly like the JetStream pull
+   verbs."
+  (-kv-put [bucket key bytes]
+    "Write `bytes` under `key` in the Bucket, returning a native promise that
+     resolves to the new Revision as a bare number.")
+  (-kv-get [bucket key]
+    "Read the latest entry for `key`, returning a native promise of a RAW entry
+     map `{:bucket :key :bytes :revision :created :operation}` — `:bytes` the
+     undecoded wire value, `:created` the canonical ISO-8601 timestamp string,
+     `:operation` the keyword form of the entry's KV operation — or nil when the
+     key reads as absent: never written, deleted, or purged (ADR 0023). The leg
+     whose native get surfaces tombstones normalizes them to nil here, so absence
+     is one portable contract."))
+
 (defprotocol OrderedPull
   "The pull triad over an Ordered consumer handle (the value `-js-ordered-consumer`
    resolves) — EXTENDED onto each platform's ordered record from the impl

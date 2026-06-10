@@ -6,7 +6,8 @@
    / `:invalid-name` before any native call. The per-leg impl namespaces build the
    actual native config from these tables (Duration on the JVM, ms options on
    CLJS) — the interop half — so this is the shared seam a single no-server unit
-   test covers.")
+   test covers."
+  (:require [clojure.string :as str]))
 
 (def config-keys
   "The CLOSED set of recognized portable Bucket config keys. A key outside it is
@@ -42,6 +43,31 @@
   (when-not (valid-name? name)
     (throw (ex-info "Invalid bucket name" {:type :invalid-name :name name})))
   name)
+
+;; A valid KV key is a non-empty run of the charset both jnats (validateKvKey…)
+;; and @nats-io/kv (validKeyRe) reject outside of natively — `[-/_=.a-zA-Z0-9]` —
+;; with no leading or trailing `.`. The wildcards `*` and `>` fall outside the
+;; charset, so a wildcard key fails the same guard: a KV key addresses exactly one
+;; entry. Pinned here so a malformed key is the same portable `:invalid-key`
+;; pre-flight on every leg, before any wire call (ADR 0015).
+(def ^:private key-re #"[-/_=.a-zA-Z0-9]+")
+
+(defn valid-key?
+  "True when `key` is a string that is a well-formed KV key."
+  [key]
+  (and (string? key)
+       (boolean (re-matches key-re key))
+       (not (str/starts-with? key "."))
+       (not (str/ends-with? key "."))))
+
+(defn validate-key
+  "Guard a KV `key` pre-flight, throwing a `:type :invalid-key` ex-info carrying
+   the offending `:key` on caller misuse (ADR 0015); returns `key` so it can sit
+   in a promise chain stage."
+  [key]
+  (when-not (valid-key? key)
+    (throw (ex-info "Invalid key" {:type :invalid-key :key key})))
+  key)
 
 (defn validate-config
   "Guard a portable Bucket `config` map pre-flight (ADR 0015), before any native

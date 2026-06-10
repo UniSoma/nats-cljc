@@ -19,9 +19,10 @@
             [nats-cljc.kv.impl.error :as kv-err])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection JetStreamApiException KeyValue KeyValueManagement]
-           [io.nats.client.api ServerInfo KeyValueConfiguration StorageType]
+           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry StorageType]
            [java.io IOException]
-           [java.time Duration]
+           [java.time Duration ZonedDateTime]
+           [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
            [java.util.concurrent CompletableFuture ExecutorService RejectedExecutionException]
            [java.util.function Supplier]))
 
@@ -153,6 +154,36 @@
   (->JvmBucket (.keyValue ^Connection (:client ctx) bucket)
                (:codec ctx) (:io-executor ctx) bucket))
 
+;; The one canonical timestamp format on this leg (UTC, exactly three fractional
+;; digits) — the same formatter the JetStream impl pins, duplicated rather than
+;; exported from it so neither impl ns owns the other's date seam.
+(def ^:private ^DateTimeFormatter canonical-instant
+  (-> (DateTimeFormatterBuilder.) (.appendInstant 3) .toFormatter))
+
+(defn- ->canonical-timestamp
+  "Normalize a jnats ZonedDateTime to the canonical portable timestamp string."
+  [^ZonedDateTime zdt]
+  (.format canonical-instant (.toInstant zdt)))
+
+;; jnats KeyValueOperation enum name → the portable Entry `:operation` keyword
+;; (ADR 0023). Only :put is reachable through `-kv-get` (jnats' get already reads
+;; tombstones as absent); :delete/:purge are here for the history/watch lifts that
+;; reuse this raw shape.
+(def ^:private operation->kw
+  {"PUT" :put "DELETE" :delete "PURGE" :purge})
+
+(defn- entry->raw
+  "Lift a jnats KeyValueEntry to the raw portable entry map the facade decodes:
+   `{:bucket :key :bytes :revision :created :operation}`, `:bytes` the undecoded
+   wire value and `:created` the canonical timestamp string."
+  [^KeyValueEntry e]
+  {:bucket    (.getBucket e)
+   :key       (.getKey e)
+   :bytes     (.getValue e)
+   :revision  (.getRevision e)
+   :created   (->canonical-timestamp (.getCreated e))
+   :operation (operation->kw (.name (.getOperation e)))})
+
 (extend-type JvmKvContext
   proto/BucketManager
   (-create-bucket [ctx config]
@@ -169,3 +200,17 @@
   (-delete-bucket [ctx bucket]
     (off-thread (:io-executor ctx)
                 #(do (.delete ^KeyValueManagement (:kvm ctx) ^String bucket) nil))))
+
+(extend-type JvmBucket
+  proto/BucketEntries
+  (-kv-put [bucket key bytes]
+    ;; jnats' put returns the new revision directly — the bare number the facade
+    ;; resolves with.
+    (off-thread (:io-executor bucket)
+                #(.put ^KeyValue (:kv bucket) ^String key ^bytes bytes)))
+  (-kv-get [bucket key]
+    ;; jnats' get already reads an absent OR tombstoned key as null (the portable
+    ;; absent-is-nil contract, ADR 0023), so the lift is a plain when-let.
+    (off-thread (:io-executor bucket)
+                #(when-let [e (.get ^KeyValue (:kv bucket) ^String key)]
+                   (entry->raw e)))))

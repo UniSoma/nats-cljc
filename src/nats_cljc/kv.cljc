@@ -9,8 +9,13 @@
    `@nats-io/kv` bundle bytes — which a core-only consumer who never requires it
    does not pay for (ADR 0016). The impl require is for that load side-effect only
    (it `extend`s the KV protocol onto the platform Connection record); this facade
-   calls the record through the protocol."
-  (:require [nats-cljc.impl.protocol :as proto]
+   calls the record through the protocol.
+
+   `get` (and, later, `keys`/`update`) shadows clojure.core — the jetstream `next`
+   precedent: the namespace-aliased call is the public name."
+  (:refer-clojure :exclude [get])
+  (:require [nats-cljc.codec :as codec]
+            [nats-cljc.impl.protocol :as proto]
             [nats-cljc.kv.impl.bucket :as bucket]
             #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])
@@ -31,35 +36,69 @@
   [conn]
   (proto/-kv conn))
 
+(defn- codec-override
+  "Resolve an open/create `:codec` override once, into the `Prepared` the Bucket
+   handle binds for every read and write through it (per-Bucket only — a Bucket's
+   values are homogeneous, so there is no per-op override; ADR 0011's
+   resolve-once, applied per handle instead of per connection). Returns nil when
+   `opts` carries no override, leaving the connection default the impl bound; an
+   unresolvable reference throws — inside a chain stage, so it rejects pre-flight,
+   before any native call."
+  [opts]
+  (when (contains? opts :codec)
+    (codec/prepare (:codec opts))))
+
+(defn- bind-codec
+  "Bind `override` (a `Prepared`, or nil for the connection default) onto the
+   Bucket `handle` the impl resolved — the one place the per-Bucket codec choice
+   lands on the handle, shared by `create-bucket` and `open-bucket`."
+  [handle override]
+  (cond-> handle override (assoc :codec override)))
+
 (defn create-bucket
   "Create a Bucket on the KV context `ctx` from the portable, CLOSED kebab
    `config` map, returning a platform-native promise that resolves to a Bucket
-   handle — the value every entry operation takes, binding the connection's
-   codec. Config keys: `:bucket` (required, the Bucket's name), `:description`,
-   `:history` (revisions kept per key), `:ttl-ms` (integer milliseconds),
-   `:max-value-size`, `:max-bucket-size` (bytes), `:storage` (`:file` |
-   `:memory`), `:replicas`, and `:compression?`. The map is closed: an
-   unrecognized key rejects the promise with a validation `:type
-   :unknown-config-key`, an omitted `:bucket` with `:missing-required-key`, and a
-   malformed Bucket name with `:invalid-name`, all pre-flight before any native
-   call (ADR 0015). A config the SERVER rejects surfaces as an operational `:type
-   :jetstream-api-error` carrying `{:code :description}` (ADR 0020)."
-  [ctx config]
-  (-> (impl/resolved nil)
-      (impl/then (fn [_] (bucket/validate-config config)))
-      (impl/bind (fn [_] (proto/-create-bucket ctx config)))))
+   handle — the value every entry operation takes, binding the Bucket's one
+   Codec: the connection's default, unless `opts` carries a `:codec` override
+   (a registry keyword or `ICodec` instance), which then governs all reads and
+   writes through this handle (per-Bucket only — no per-op override). Config
+   keys: `:bucket` (required, the Bucket's name), `:description`, `:history`
+   (revisions kept per key), `:ttl-ms` (integer milliseconds), `:max-value-size`,
+   `:max-bucket-size` (bytes), `:storage` (`:file` | `:memory`), `:replicas`, and
+   `:compression?`. The map is closed: an unrecognized key rejects the promise
+   with a validation `:type :unknown-config-key`, an omitted `:bucket` with
+   `:missing-required-key`, and a malformed Bucket name with `:invalid-name`, all
+   pre-flight before any native call (ADR 0015). A config the SERVER rejects
+   surfaces as an operational `:type :jetstream-api-error` carrying
+   `{:code :description}` (ADR 0020)."
+  ([ctx config] (create-bucket ctx config {}))
+  ([ctx config opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_]
+                    (bucket/validate-config config)
+                    (codec-override opts)))
+       (impl/bind (fn [override]
+                    (impl/then (proto/-create-bucket ctx config)
+                               #(bind-codec % override)))))))
 
 (defn open-bucket
   "Open the existing Bucket named `bucket` on the KV context `ctx`, returning a
-   platform-native promise that resolves to a Bucket handle (see `create-bucket`).
-   Opening VERIFIES the Bucket exists, so the promise rejects with an operational
-   `:type :bucket-not-found` when it does not (ADR 0023) — at the handle, never
-   deferred to the first entry operation — and pre-flight with a validation
-   `:type :invalid-name` when `bucket` is malformed (ADR 0015)."
-  [ctx bucket]
-  (-> (impl/resolved nil)
-      (impl/then (fn [_] (bucket/validate-name bucket)))
-      (impl/bind (fn [_] (proto/-open-bucket ctx bucket)))))
+   platform-native promise that resolves to a Bucket handle (see `create-bucket`
+   — including the `opts` `:codec` override the handle binds in place of the
+   connection default). Opening VERIFIES the Bucket exists, so the promise
+   rejects with an operational `:type :bucket-not-found` when it does not (ADR
+   0023) — at the handle, never deferred to the first entry operation — and
+   pre-flight with a validation `:type :invalid-name` when `bucket` is malformed
+   (ADR 0015)."
+  ([ctx bucket] (open-bucket ctx bucket {}))
+  ([ctx bucket opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_]
+                    (bucket/validate-name bucket)
+                    (codec-override opts)))
+       (impl/bind (fn [override]
+                    (impl/then (proto/-open-bucket ctx bucket)
+                               #(bind-codec % override)))))))
 
 (defn delete-bucket
   "Delete the Bucket named `bucket` on the KV context `ctx` — decommissioning the
@@ -72,3 +111,42 @@
   (-> (impl/resolved nil)
       (impl/then (fn [_] (bucket/validate-name bucket)))
       (impl/bind (fn [_] (proto/-delete-bucket ctx bucket)))))
+
+(defn put
+  "Write `value` under `key` in the Bucket `handle`, encoded through the Bucket's
+   one Codec, returning a platform-native promise that resolves to the new
+   Revision as a bare number — immediately usable as the expected Revision of a
+   follow-up compare-and-set. The promise rejects pre-flight with a validation
+   `:type :invalid-key` (carrying `:key`) when `key` is malformed, before any
+   wire call (ADR 0015), and with `:type :codec-error` when the value does not
+   encode (ADR 0006)."
+  [handle key value]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_]
+                   (bucket/validate-key key)
+                   (codec/encode (:codec handle) value)))
+      (impl/bind (fn [bytes] (proto/-kv-put handle key bytes)))))
+
+(defn get
+  "Read the latest Entry for `key` from the Bucket `handle`, returning a
+   platform-native promise that resolves to an Entry — a plain map
+   `{:bucket :key :value :revision :created :operation}` whose `:value` is
+   decoded through the Bucket's one Codec — or to nil when the key is absent
+   (never written, deleted, or purged): absence is a normal domain outcome to
+   branch on with if-let, not an Error, and a STORED nil stays distinguishable as
+   `{:value nil ...}` (ADR 0023). The promise rejects pre-flight with a
+   validation `:type :invalid-key` (carrying `:key`) when `key` is malformed,
+   before any wire call (ADR 0015), and with `:type :codec-error` when the stored
+   bytes do not decode (ADR 0006)."
+  [handle key]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (bucket/validate-key key)))
+      (impl/bind (fn [_] (proto/-kv-get handle key)))
+      (impl/then (fn [raw]
+                   (when raw
+                     {:bucket    (:bucket raw)
+                      :key       (:key raw)
+                      :value     (codec/decode (:codec handle) (:bytes raw))
+                      :revision  (:revision raw)
+                      :created   (:created raw)
+                      :operation (:operation raw)})))))

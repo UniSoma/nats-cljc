@@ -161,13 +161,14 @@
     :else :custom))
 
 (defn ^:no-doc prepare
-  "Internal (called only by `nats-cljc.core/connect`; not codec extension API).
-   Resolve a connection's default codec reference `ref` (a keyword or `ICodec`)
-   once, into a `Prepared` the facade stores on the connection so steady-state
-   encode and decode skip the registry deref (ADR 0011). Captures the stable id
-   alongside the resolved record, so a failure on the default path still names
-   `:edn` (or `:custom`), never the record. An unresolvable `ref` throws here — at
-   connect — rather than lazily on first use."
+  "Internal (called by `nats-cljc.core/connect` and the KV facade's per-Bucket
+   `:codec` override; not codec extension API). Resolve a default codec reference
+   `ref` (a keyword or `ICodec`) once, into a `Prepared` the facade stores on the
+   connection (or Bucket handle) so steady-state encode and decode skip the
+   registry deref (ADR 0011). Captures the stable id alongside the resolved
+   record, so a failure on the default path still names `:edn` (or `:custom`),
+   never the record. An unresolvable `ref` throws here — at connect/open — rather
+   than lazily on first use."
   [ref]
   (->Prepared (resolve-codec ref) (codec-id ref)))
 

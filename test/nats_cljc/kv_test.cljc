@@ -62,6 +62,31 @@
   (is (= "ok-bucket_1" (bucket/validate-name "ok-bucket_1"))
       "a well-formed Bucket name (alphanumerics, dash, underscore) passes unchanged"))
 
+;; Deep-module unit (ADR 0015), no server: the key-syntax seam every entry op runs
+;; pre-flight, before any wire call — the charset both native clients enforce
+;; (`[-/_=.a-zA-Z0-9]`), no leading/trailing `.`, and no wildcards — raising the
+;; validation `:type :invalid-key` carrying the offending `:key`.
+(deftest deep-module-key-validation
+  (is (= "a.b-c_d/e=1" (bucket/validate-key "a.b-c_d/e=1"))
+      "a well-formed key (full charset, interior dots) passes unchanged")
+  (is (= :invalid-key (thrown-type #(bucket/validate-key "bad key")))
+      "a key outside the charset (whitespace) is :invalid-key")
+  (is (= :invalid-key (thrown-type #(bucket/validate-key ".lead")))
+      "a leading dot is :invalid-key")
+  (is (= :invalid-key (thrown-type #(bucket/validate-key "trail.")))
+      "a trailing dot is :invalid-key")
+  (is (= :invalid-key (thrown-type #(bucket/validate-key "wild.*")))
+      "the * wildcard is :invalid-key — a KV key addresses exactly one entry")
+  (is (= :invalid-key (thrown-type #(bucket/validate-key "wild.>")))
+      "the > wildcard is :invalid-key")
+  (is (= :invalid-key (thrown-type #(bucket/validate-key "")))
+      "an empty key is :invalid-key")
+  (is (= :invalid-key (thrown-type #(bucket/validate-key 42)))
+      "a non-string key is :invalid-key")
+  (is (= "bad key" (:key (ex-data (try (bucket/validate-key "bad key")
+                                       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))))
+      ":invalid-key carries the offending :key"))
+
 ;; Deep-module unit (ADR 0023), no server: the KV impl layer owns the mapping from
 ;; the substrate's stream-flavored failures to KV-flavored canonical `:type`s. The
 ;; shared err_code table re-faces only the codes with a KV face; everything else
@@ -309,3 +334,185 @@
                                                       (p/catch (fn [e]
                                                                  (is (= :bucket-not-found (:type (ex-data e)))
                                                                      "open-bucket after delete-bucket rejects with :bucket-not-found"))))))))))))))))))
+
+;; The first entry round trip: put resolves to the new Revision as a bare number,
+;; and get resolves to the full Entry map with :value decoded through the Bucket's
+;; Codec — the connection default (:edn) here, so a Clojure map survives the wire.
+(deftest put-then-get-round-trips-an-entry
+  (let [bucket "TRACER_KV_ENTRY_RT"
+        value  {:a 1 :b "two"}]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [rev (deref (kv/put handle "config.app" value) 5000 ::timeout)]
+                   (is (number? rev) "put resolves to the new Revision as a bare number")
+                   (is (pos? rev) "the new Revision is positive")
+                   (let [entry (deref (kv/get handle "config.app") 5000 ::timeout)]
+                     (is (= bucket (:bucket entry)) "the Entry names its Bucket")
+                     (is (= "config.app" (:key entry)) "the Entry names its key")
+                     (is (= value (:value entry)) ":value is decoded through the Bucket's Codec (connection default)")
+                     (is (= rev (:revision entry)) "the Entry's :revision is the Revision put resolved to")
+                     (is (= :put (:operation entry)) "a written Entry carries the :put :operation")
+                     (is (string? (:created entry)) ":created is the canonical timestamp string"))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "config.app" value)
+                                                      (p/then (fn [rev]
+                                                                (is (number? rev) "put resolves to the new Revision as a bare number")
+                                                                (is (pos? rev) "the new Revision is positive")
+                                                                (-> (kv/get handle "config.app")
+                                                                    (p/then (fn [entry]
+                                                                              (is (= bucket (:bucket entry)) "the Entry names its Bucket")
+                                                                              (is (= "config.app" (:key entry)) "the Entry names its key")
+                                                                              (is (= value (:value entry)) ":value is decoded through the Bucket's Codec (connection default)")
+                                                                              (is (= rev (:revision entry)) "the Entry's :revision is the Revision put resolved to")
+                                                                              (is (= :put (:operation entry)) "a written Entry carries the :put :operation")
+                                                                              (is (string? (:created entry)) ":created is the canonical timestamp string")))))))))))))))))))))
+
+;; Key absence is a normal domain outcome, not an Error (ADR 0023): get on a key
+;; never written resolves to nil, so callers branch with if-let — while a STORED
+;; nil stays a full Entry `{:value nil ...}`, distinguishable from absence.
+(deftest get-absent-resolves-nil-and-stored-nil-stays-an-entry
+  (let [bucket "TRACER_KV_ABSENT"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (is (nil? (deref (kv/get handle "never.written") 5000 ::timeout))
+                     "get on an absent key resolves to nil")
+                 (deref (kv/put handle "stored.nil" nil) 5000 ::timeout)
+                 (let [entry (deref (kv/get handle "stored.nil") 5000 ::timeout)]
+                   (is (some? entry) "a stored nil resolves to an Entry, not nil")
+                   (is (nil? (:value entry)) "the stored nil Entry carries :value nil")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/get handle "never.written")
+                                                      (p/then (fn [entry]
+                                                                (is (nil? entry) "get on an absent key resolves to nil")
+                                                                (kv/put handle "stored.nil" nil)))
+                                                      (p/then (fn [_] (kv/get handle "stored.nil")))
+                                                      (p/then (fn [entry]
+                                                                (is (some? entry) "a stored nil resolves to an Entry, not nil")
+                                                                (is (nil? (:value entry)) "the stored nil Entry carries :value nil"))))))))))))))))))
+
+;; The per-Bucket Codec seam: a :codec override at create/open governs every read
+;; and write through that handle (no per-op override), while a handle opened
+;; without one binds the connection default — whose decode failure on the raw
+;; bytes the override wrote rejects the one-shot get with :codec-error.
+(deftest codec-override-governs-the-bucket-handle
+  (let [bucket "TRACER_KV_CODEC"
+        raw    "{"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx      (deref (kv/kv conn) 5000 ::timeout)
+                 s-handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}
+                                                   {:codec :string})
+                                 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put s-handle "raw.key" raw) 5000 ::timeout)
+                 (is (= raw (:value (deref (kv/get s-handle "raw.key") 5000 ::timeout)))
+                     "a create-time :codec override governs the handle's writes and reads")
+                 (let [o-handle (deref (kv/open-bucket ctx bucket {:codec :string}) 5000 ::timeout)]
+                   (is (= raw (:value (deref (kv/get o-handle "raw.key") 5000 ::timeout)))
+                       "an open-time :codec override governs the handle's reads"))
+                 (let [d-handle (deref (kv/open-bucket ctx bucket) 5000 ::timeout)
+                       e        (reject-reason (kv/get d-handle "raw.key"))]
+                   (is (= :codec-error (:type (ex-data e)))
+                       "decode failure in a one-shot get rejects with :codec-error — the connection default applies absent an override")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory}
+                                                      {:codec :string})
+                                    (p/then (fn [s-handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put s-handle "raw.key" raw)
+                                                      (p/then (fn [_] (kv/get s-handle "raw.key")))
+                                                      (p/then (fn [entry]
+                                                                (is (= raw (:value entry))
+                                                                    "a create-time :codec override governs the handle's writes and reads")
+                                                                (kv/open-bucket ctx bucket {:codec :string})))
+                                                      (p/then (fn [o-handle] (kv/get o-handle "raw.key")))
+                                                      (p/then (fn [entry]
+                                                                (is (= raw (:value entry))
+                                                                    "an open-time :codec override governs the handle's reads")
+                                                                (kv/open-bucket ctx bucket)))
+                                                      (p/then (fn [d-handle]
+                                                                (-> (kv/get d-handle "raw.key")
+                                                                    (p/then (fn [_] (is false "expected the default-codec get to reject with :codec-error")))
+                                                                    (p/catch (fn [e]
+                                                                               (is (= :codec-error (:type (ex-data e)))
+                                                                                   "decode failure in a one-shot get rejects with :codec-error — the connection default applies absent an override")))))))))))))))))))))
+
+;; The facade rejects a malformed key pre-flight on every entry op that takes one
+;; (ADR 0015): the deep-module guard above pins the syntax rules; this proves both
+;; verbs route through it, rejecting with :invalid-key carrying :key.
+(deftest entry-ops-reject-malformed-keys
+  (let [bucket "TRACER_KV_BADKEY"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [e (reject-reason (kv/put handle "bad key" 1))]
+                   (is (= :invalid-key (:type (ex-data e)))
+                       "put with a malformed key rejects with :invalid-key")
+                   (is (= "bad key" (:key (ex-data e)))
+                       "the rejection carries the offending :key"))
+                 (let [e (reject-reason (kv/get handle ".bad"))]
+                   (is (= :invalid-key (:type (ex-data e)))
+                       "get with a malformed key rejects with :invalid-key")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "bad key" 1)
+                                                      (p/then (fn [_] (is false "expected put to reject with :invalid-key")))
+                                                      (p/catch (fn [e]
+                                                                 (is (= :invalid-key (:type (ex-data e)))
+                                                                     "put with a malformed key rejects with :invalid-key")
+                                                                 (is (= "bad key" (:key (ex-data e)))
+                                                                     "the rejection carries the offending :key")))
+                                                      (p/then (fn [_]
+                                                                (-> (kv/get handle ".bad")
+                                                                    (p/then (fn [_] (is false "expected get to reject with :invalid-key")))
+                                                                    (p/catch (fn [e]
+                                                                               (is (= :invalid-key (:type (ex-data e)))
+                                                                                   "get with a malformed key rejects with :invalid-key")))))))))))))))))))))

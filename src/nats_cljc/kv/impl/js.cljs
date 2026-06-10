@@ -108,3 +108,40 @@
         (.then (fn [kv] (.destroy ^js kv)))
         (.then (fn [_] nil))
         with-kv-error)))
+
+;; @nats-io/kv KvEntry `operation` string → the portable Entry `:operation`
+;; keyword (ADR 0023) — note nats.js says "DEL" where jnats says "DELETE".
+;; Only :put is reachable through `-kv-get` (tombstones normalize to nil below);
+;; :delete/:purge are here for the history/watch lifts that reuse this raw shape.
+(def ^:private operation->kw
+  {"PUT" :put "DEL" :delete "PURGE" :purge})
+
+(defn- entry->raw
+  "Lift a @nats-io/kv KvEntry to the raw portable entry map the facade decodes:
+   `{:bucket :key :bytes :revision :created :operation}`, `:bytes` the undecoded
+   Uint8Array and `:created` normalized to the canonical UTC-millis timestamp
+   string via `Date#toISOString`, byte-identical to the JVM leg."
+  [^js e]
+  {:bucket    (.-bucket e)
+   :key       (.-key e)
+   :bytes     (.-value e)
+   :revision  (.-revision e)
+   :created   (.toISOString (js/Date. (.-created e)))
+   :operation (operation->kw (.-operation e))})
+
+(extend-type JsBucket
+  proto/BucketEntries
+  (-kv-put [bucket key bytes]
+    ;; kv.put resolves the new revision directly — the bare number the facade
+    ;; resolves with.
+    (-> (.put ^js (:kv bucket) key bytes)
+        with-kv-error))
+  (-kv-get [bucket key]
+    ;; Unlike jnats, nats.js' get surfaces a tombstoned key as an entry with a
+    ;; DEL/PURGE operation; the portable contract reads it as absent (ADR 0023),
+    ;; so anything that is not a live PUT normalizes to nil here.
+    (-> (.get ^js (:kv bucket) key)
+        (.then (fn [^js e]
+                 (when (and e (= "PUT" (.-operation e)))
+                   (entry->raw e))))
+        with-kv-error)))
