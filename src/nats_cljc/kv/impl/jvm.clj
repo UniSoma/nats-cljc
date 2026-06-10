@@ -205,8 +205,8 @@
 
 ;; jnats KeyValueOperation enum name → the portable Entry `:operation` keyword
 ;; (ADR 0023). Only :put is reachable through `-kv-get` (jnats' get already reads
-;; tombstones as absent); :delete/:purge are here for the history/watch lifts that
-;; reuse this raw shape.
+;; tombstones as absent); :delete/:purge surface through `-kv-history`, whose
+;; lift reuses this raw shape.
 (def ^:private operation->kw
   {"PUT" :put "DELETE" :delete "PURGE" :purge})
 
@@ -276,4 +276,31 @@
     ;; wrong-last-sequence when the expected revision is stale — re-faced
     ;; :wrong-revision carrying the :key (ADR 0023).
     (cas-off-thread (:io-executor bucket) key
-                    #(.update ^KeyValue (:kv bucket) ^String key ^bytes bytes (long revision)))))
+                    #(.update ^KeyValue (:kv bucket) ^String key ^bytes bytes (long revision))))
+  (-kv-delete [bucket key revision]
+    ;; jnats' delete is void on both arities; a stale guard raises
+    ;; wrong-last-sequence — re-faced :wrong-revision carrying the :key (ADR
+    ;; 0023), the same CAS seam the writes route through. The unguarded arity
+    ;; cannot lose a race, so the CAS routing is inert there.
+    (cas-off-thread (:io-executor bucket) key
+                    #(do (if revision
+                           (.delete ^KeyValue (:kv bucket) ^String key (long revision))
+                           (.delete ^KeyValue (:kv bucket) ^String key))
+                         nil)))
+  (-kv-purge [bucket key revision]
+    ;; jnats' purge mirrors delete: void on both arities, wrong-last-sequence on
+    ;; a stale guard — re-faced :wrong-revision carrying the :key (ADR 0023).
+    (cas-off-thread (:io-executor bucket) key
+                    #(do (if revision
+                           (.purge ^KeyValue (:kv bucket) ^String key (long revision))
+                           (.purge ^KeyValue (:kv bucket) ^String key))
+                         nil)))
+  (-kv-history [bucket key]
+    ;; jnats' history hands back the full List<KeyValueEntry> oldest-to-newest
+    ;; in one call (an absent key is an empty list, never an error); the lift is
+    ;; the get raw shape plus :delta, which jnats populates on history entries
+    ;; (the distance from the key's newest revision) — verified, not inferred.
+    (off-thread (:io-executor bucket)
+                #(mapv (fn [^KeyValueEntry e]
+                         (assoc (entry->raw e) :delta (.getDelta e)))
+                       (.history ^KeyValue (:kv bucket) ^String key)))))

@@ -169,7 +169,7 @@
 ;; @nats-io/kv KvEntry `operation` string → the portable Entry `:operation`
 ;; keyword (ADR 0023) — note nats.js says "DEL" where jnats says "DELETE".
 ;; Only :put is reachable through `-kv-get` (tombstones normalize to nil below);
-;; :delete/:purge are here for the history/watch lifts that reuse this raw shape.
+;; :delete/:purge surface through `-kv-history`, whose lift reuses this raw shape.
 (def ^:private operation->kw
   {"PUT" :put "DEL" :delete "PURGE" :purge})
 
@@ -213,4 +213,42 @@
     ;; wrong-last-sequence when the expected revision is stale — re-faced
     ;; :wrong-revision carrying the :key (ADR 0023).
     (-> (.update ^js (:kv bucket) key bytes revision)
-        (with-cas-error key))))
+        (with-cas-error key)))
+  (-kv-delete [bucket key revision]
+    ;; kv.delete resolves void (pinned to nil here); a stale `previousSeq` guard
+    ;; rejects with wrong-last-sequence — re-faced :wrong-revision carrying the
+    ;; :key (ADR 0023), the same CAS seam the writes route through. The unguarded
+    ;; form cannot lose a race, so the CAS routing is inert there.
+    (-> (if revision
+          (.delete ^js (:kv bucket) key (clj->js {:previousSeq revision}))
+          (.delete ^js (:kv bucket) key))
+        (.then (fn [_] nil))
+        (with-cas-error key)))
+  (-kv-purge [bucket key revision]
+    ;; kv.purge mirrors delete: void, with the same stale-`previousSeq`
+    ;; wrong-last-sequence rejection re-faced :wrong-revision (ADR 0023).
+    (-> (if revision
+          (.purge ^js (:kv bucket) key (clj->js {:previousSeq revision}))
+          (.purge ^js (:kv bucket) key))
+        (.then (fn [_] nil))
+        (with-cas-error key)))
+  (-kv-history [bucket key]
+    ;; kv.history({key}) resolves to a QueuedIterator that completes once caught
+    ;; up (an absent key yields nothing, never an error); the drain accumulates
+    ;; oldest-to-newest into the fully-realized vector the portable contract
+    ;; pins, each lift the get raw shape plus :delta, which nats.js populates on
+    ;; history entries (the distance from the key's newest revision) — verified,
+    ;; not inferred. The key object is string-keyed via clj->js, surviving
+    ;; advanced compilation.
+    (-> (.history ^js (:kv bucket) (clj->js {:key key}))
+        (.then (fn [^js qi]
+                 (let [it (.call (unchecked-get qi (.-asyncIterator js/Symbol)) qi)]
+                   (letfn [(step [acc]
+                             (.then (.next it)
+                                    (fn [^js r]
+                                      (if (.-done r)
+                                        acc
+                                        (step (conj acc (let [^js e (.-value r)]
+                                                          (assoc (entry->raw e) :delta (.-delta e)))))))))]
+                     (step [])))))
+        with-kv-error)))

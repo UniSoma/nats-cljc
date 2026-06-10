@@ -793,3 +793,191 @@
                                                                         (settle (kv/update handle "race.key" "writer-2" rev))])))
                                                       (p/then (fn [[o1 o2]]
                                                                 (assert-race "race.key" o1 o2))))))))))))))))))
+
+;; The shared history assertions for two puts then a delete: history resolves to
+;; a fully-realized vector of Entries oldest-to-newest — the live puts with their
+;; decoded :values AND the Tombstone with its :operation visible (ADR 0023:
+;; deletion stays observable to history readers) — each Entry carrying :delta,
+;; the distance from the newest revision (verified meaningful on both natives).
+(defn- assert-delete-history [bucket rev1 rev2 entries]
+  (is (vector? entries) "history resolves to a fully-realized vector")
+  (is (= 3 (count entries)) "history retains both puts and the Tombstone")
+  (is (= [rev1 rev2] [(:revision (nth entries 0)) (:revision (nth entries 1))])
+      "history is ordered oldest-to-newest by Revision")
+  (is (= [:put :put :delete] (mapv :operation entries))
+      "the Tombstone's :operation is visible alongside the retained puts")
+  (is (= [{:v 1} {:v 2} nil] (mapv :value entries))
+      "live Entries decode through the Bucket's Codec; the Tombstone carries :value nil")
+  (is (= [2 1 0] (mapv :delta entries))
+      "each history Entry carries :delta, the distance from the newest revision")
+  (is (every? #(= bucket (:bucket %)) entries) "every history Entry names its Bucket")
+  (is (every? #(= "doc.k" (:key %)) entries) "every history Entry names its key")
+  (is (every? #(string? (:created %)) entries) ":created is the canonical timestamp string"))
+
+;; delete writes a Tombstone (ADR 0023): it resolves to nil, the key then reads
+;; as absent via get — while history retains every revision INCLUDING the
+;; Tombstone, so deletion stays observable to history readers.
+(deftest delete-tombstones-the-key-and-history-retains-it
+  (let [bucket "TRACER_KV_DELETE"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [rev1 (deref (kv/put handle "doc.k" {:v 1}) 5000 ::timeout)
+                       rev2 (deref (kv/put handle "doc.k" {:v 2}) 5000 ::timeout)]
+                   (is (nil? (deref (kv/delete handle "doc.k") 5000 ::timeout))
+                       "delete resolves to nil")
+                   (is (nil? (deref (kv/get handle "doc.k") 5000 ::timeout))
+                       "a deleted key reads as absent via get")
+                   (assert-delete-history bucket rev1 rev2
+                                          (deref (kv/history handle "doc.k") 5000 ::timeout))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "doc.k" {:v 1})
+                                                      (p/then (fn [rev1]
+                                                                (-> (kv/put handle "doc.k" {:v 2})
+                                                                    (p/then (fn [rev2]
+                                                                              (-> (kv/delete handle "doc.k")
+                                                                                  (p/then (fn [r]
+                                                                                            (is (nil? r) "delete resolves to nil")
+                                                                                            (kv/get handle "doc.k")))
+                                                                                  (p/then (fn [entry]
+                                                                                            (is (nil? entry) "a deleted key reads as absent via get")
+                                                                                            (kv/history handle "doc.k")))
+                                                                                  (p/then (fn [entries]
+                                                                                            (assert-delete-history bucket rev1 rev2 entries))))))))))))))))))))))))
+
+;; purge reclaims space for good (ADR 0023): it resolves to nil and erases the
+;; key's history down to a single purge marker — wearing its :operation :purge —
+;; so the key reads as absent and no prior revision survives.
+(deftest purge-erases-history-to-a-single-marker
+  (let [bucket "TRACER_KV_PURGE"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "doc.k" {:v 1}) 5000 ::timeout)
+                 (deref (kv/put handle "doc.k" {:v 2}) 5000 ::timeout)
+                 (deref (kv/delete handle "doc.k") 5000 ::timeout)
+                 (is (nil? (deref (kv/purge handle "doc.k") 5000 ::timeout))
+                     "purge resolves to nil")
+                 (is (nil? (deref (kv/get handle "doc.k") 5000 ::timeout))
+                     "a purged key reads as absent via get")
+                 (let [entries (deref (kv/history handle "doc.k") 5000 ::timeout)]
+                   (is (= 1 (count entries))
+                       "purge erases the key's history down to a single marker")
+                   (is (= :purge (:operation (first entries)))
+                       "the surviving marker wears :operation :purge")
+                   (is (nil? (:value (first entries)))
+                       "the purge marker carries :value nil")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "doc.k" {:v 1})
+                                                      (p/then (fn [_] (kv/put handle "doc.k" {:v 2})))
+                                                      (p/then (fn [_] (kv/delete handle "doc.k")))
+                                                      (p/then (fn [_] (kv/purge handle "doc.k")))
+                                                      (p/then (fn [r]
+                                                                (is (nil? r) "purge resolves to nil")
+                                                                (kv/get handle "doc.k")))
+                                                      (p/then (fn [entry]
+                                                                (is (nil? entry) "a purged key reads as absent via get")
+                                                                (kv/history handle "doc.k")))
+                                                      (p/then (fn [entries]
+                                                                (is (= 1 (count entries))
+                                                                    "purge erases the key's history down to a single marker")
+                                                                (is (= :purge (:operation (first entries)))
+                                                                    "the surviving marker wears :operation :purge")
+                                                                (is (nil? (:value (first entries)))
+                                                                    "the purge marker carries :value nil"))))))))))))))))))
+
+;; The destructive verbs take the optional :revision guard (ADR 0023): a stale
+;; guard rejects with :wrong-revision carrying the :key — operators only remove
+;; what they believe they are removing — while a current guard goes through and
+;; resolves to nil, exactly like the unguarded form.
+(deftest delete-and-purge-guard-on-the-expected-revision
+  (let [bucket "TRACER_KV_DESTRUCTIVE_CAS"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [rev1 (deref (kv/put handle "doc.k" 1) 5000 ::timeout)
+                       rev2 (deref (kv/put handle "doc.k" 2) 5000 ::timeout)]
+                   (let [e (reject-reason (kv/delete handle "doc.k" {:revision rev1}))]
+                     (is (= :wrong-revision (:type (ex-data e)))
+                         "delete with a stale :revision guard rejects with :wrong-revision")
+                     (is (= "doc.k" (:key (ex-data e)))
+                         "the rejection carries the contested :key"))
+                   (is (= 2 (:value (deref (kv/get handle "doc.k") 5000 ::timeout)))
+                       "the guarded value survives the lost delete")
+                   (is (nil? (deref (kv/delete handle "doc.k" {:revision rev2}) 5000 ::timeout))
+                       "delete with the latest Revision resolves to nil")
+                   (let [e (reject-reason (kv/purge handle "doc.k" {:revision rev2}))]
+                     (is (= :wrong-revision (:type (ex-data e)))
+                         "purge with a stale :revision guard rejects with :wrong-revision")
+                     (is (= "doc.k" (:key (ex-data e)))
+                         "the rejection carries the contested :key"))
+                   (is (nil? (deref (kv/purge handle "doc.k" {:revision (inc rev2)}) 5000 ::timeout))
+                       "purge with the latest Revision (the Tombstone's) resolves to nil")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "doc.k" 1)
+                                                      (p/then (fn [rev1]
+                                                                (-> (kv/put handle "doc.k" 2)
+                                                                    (p/then (fn [rev2]
+                                                                              (-> (kv/delete handle "doc.k" {:revision rev1})
+                                                                                  (p/then (fn [_] (is false "expected delete with a stale :revision to reject with :wrong-revision")))
+                                                                                  (p/catch (fn [e]
+                                                                                             (is (= :wrong-revision (:type (ex-data e)))
+                                                                                                 "delete with a stale :revision guard rejects with :wrong-revision")
+                                                                                             (is (= "doc.k" (:key (ex-data e)))
+                                                                                                 "the rejection carries the contested :key")))
+                                                                                  (p/then (fn [_] (kv/get handle "doc.k")))
+                                                                                  (p/then (fn [entry]
+                                                                                            (is (= 2 (:value entry))
+                                                                                                "the guarded value survives the lost delete")
+                                                                                            (kv/delete handle "doc.k" {:revision rev2})))
+                                                                                  (p/then (fn [r]
+                                                                                            (is (nil? r) "delete with the latest Revision resolves to nil")
+                                                                                            (-> (kv/purge handle "doc.k" {:revision rev2})
+                                                                                                (p/then (fn [_] (is false "expected purge with a stale :revision to reject with :wrong-revision")))
+                                                                                                (p/catch (fn [e]
+                                                                                                           (is (= :wrong-revision (:type (ex-data e)))
+                                                                                                               "purge with a stale :revision guard rejects with :wrong-revision")
+                                                                                                           (is (= "doc.k" (:key (ex-data e)))
+                                                                                                               "the rejection carries the contested :key"))))))
+                                                                                  (p/then (fn [_] (kv/purge handle "doc.k" {:revision (inc rev2)})))
+                                                                                  (p/then (fn [r]
+                                                                                            (is (nil? r) "purge with the latest Revision (the Tombstone's) resolves to nil"))))))))))))))))))))))))

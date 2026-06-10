@@ -326,7 +326,26 @@
      `:operation` the keyword form of the entry's KV operation — or nil when the
      key reads as absent: never written, deleted, or purged (ADR 0023). The leg
      whose native get surfaces tombstones normalizes them to nil here, so absence
-     is one portable contract."))
+     is one portable contract.")
+  (-kv-delete [bucket key revision]
+    "Write a Tombstone for `key` — the key subsequently reads as absent while its
+     history is retained — returning a native promise that resolves to nil.
+     `revision` is the optional guard (nil for unguarded): when non-nil the
+     Tombstone lands only if it is still the key's latest Revision, rejecting
+     with `:type :wrong-revision` carrying the contested `:key` when stale
+     (ADR 0023).")
+  (-kv-purge [bucket key revision]
+    "Erase the history of `key` down to a single purge marker, returning a
+     native promise that resolves to nil. `revision` is the optional guard (nil
+     for unguarded), rejecting with `:type :wrong-revision` carrying the
+     contested `:key` when stale (ADR 0023).")
+  (-kv-history [bucket key]
+    "Read the retained history of `key`, returning a native promise of a
+     fully-realized vector of RAW entry maps oldest-to-newest —
+     `{:bucket :key :bytes :revision :created :operation :delta}`, the `-kv-get`
+     shape plus `:delta` (the entry's distance from the key's newest revision,
+     populated by both natives) — INCLUDING Tombstones and purge markers, whose
+     `:operation` stays visible (ADR 0023). An absent key resolves to []."))
 
 (defprotocol OrderedPull
   "The pull triad over an Ordered consumer handle (the value `-js-ordered-consumer`

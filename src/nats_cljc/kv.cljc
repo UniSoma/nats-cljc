@@ -216,3 +216,63 @@
                       :revision  (:revision raw)
                       :created   (:created raw)
                       :operation (:operation raw)})))))
+
+(defn delete
+  "Write a Tombstone for `key` in the Bucket `handle`, returning a
+   platform-native promise that resolves to nil: the key subsequently reads as
+   absent via `get`, while `history` retains the Tombstone — so deletion stays
+   observable to history readers and watchers (ADR 0023). `opts` may carry the
+   optional `:revision` guard: when present the Tombstone lands only if it is
+   still the key's latest Revision, and a stale guard rejects with the
+   operational `:type :wrong-revision` carrying the contested `:key` — operators
+   only remove what they believe they are removing. The promise also rejects
+   pre-flight with a validation `:type :invalid-key` (carrying `:key`) when
+   `key` is malformed (ADR 0015)."
+  ([handle key] (delete handle key {}))
+  ([handle key opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (bucket/validate-key key)))
+       (impl/bind (fn [_] (proto/-kv-delete handle key (:revision opts)))))))
+
+(defn purge
+  "Erase the history of `key` in the Bucket `handle` down to a single purge
+   marker — reclaiming space for good, where `delete` keeps history readable —
+   returning a platform-native promise that resolves to nil (ADR 0023). `opts`
+   may carry the optional `:revision` guard, exactly as on `delete`: a stale
+   guard rejects with the operational `:type :wrong-revision` carrying the
+   contested `:key`. The promise also rejects pre-flight with a validation
+   `:type :invalid-key` (carrying `:key`) when `key` is malformed (ADR 0015)."
+  ([handle key] (purge handle key {}))
+  ([handle key opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (bucket/validate-key key)))
+       (impl/bind (fn [_] (proto/-kv-purge handle key (:revision opts)))))))
+
+(defn history
+  "Read the retained history of `key` from the Bucket `handle`, returning a
+   platform-native promise that resolves to a fully-realized vector of Entries
+   oldest-to-newest — INCLUDING Tombstones and purge markers, each marker's
+   `:operation` (`:delete` / `:purge`) visible (ADR 0023). Each Entry is the
+   `get` map plus `:delta`, the Entry's distance from the key's newest revision
+   (0 for the newest — both natives populate it on history reads); a live
+   Entry's `:value` is decoded through the Bucket's one Codec, while a marker
+   carries `:value` nil undecoded. An absent key resolves to [] (the server
+   bounds retained history per the Bucket's `:history`, 64 max per key). The
+   promise rejects pre-flight with a validation `:type :invalid-key` (carrying
+   `:key`) when `key` is malformed (ADR 0015), and with `:type :codec-error`
+   when a retained value does not decode (ADR 0006)."
+  [handle key]
+  (-> (impl/resolved nil)
+      (impl/then (fn [_] (bucket/validate-key key)))
+      (impl/bind (fn [_] (proto/-kv-history handle key)))
+      (impl/then (fn [raws]
+                   (mapv (fn [raw]
+                           {:bucket    (:bucket raw)
+                            :key       (:key raw)
+                            :value     (when (= :put (:operation raw))
+                                         (codec/decode (:codec handle) (:bytes raw)))
+                            :revision  (:revision raw)
+                            :created   (:created raw)
+                            :operation (:operation raw)
+                            :delta     (:delta raw)})
+                         raws)))))
