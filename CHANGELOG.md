@@ -9,6 +9,65 @@ bump, renaming or removing one is a major bump (see ADR 0009).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-10
+
+Phase 2: JetStream, tested on the JVM and Node. One new portable namespace,
+`nats-cljc.jetstream`, mirroring the shape of `nats-cljc.core`.
+
+### Added
+
+- **JetStream context** — `(jetstream conn)` returns one handle for the data
+  and management planes, verified at entry: a server round-trip on both
+  platforms so a server or account without JetStream fails fast with
+  `:jetstream-not-enabled` at the handle, not on the first operation (ADR 0017).
+- **Stream management** — `create-stream`, `update-stream`, `delete-stream`,
+  `purge-stream`, `stream-info`, `list-streams`, and `stream-names`, configured
+  by
+  portable closed kebab-keyword maps: keyword enums (`:storage`, `:retention`),
+  durations as integer milliseconds with the unit in the key (`:max-age-ms`),
+  and a validation error (`:unknown-config-key`) for any unrecognized key
+  instead of silent passthrough. Info maps come back normalized the same way,
+  with ISO-8601 timestamps on every platform.
+- **Consumer management** — `create-consumer`, `update-consumer`,
+  `delete-consumer`, `consumer-info`, `list-consumers`, and `consumer-names`,
+  with
+  the same closed config-map contract (`:ack-policy`, `:deliver-policy`,
+  `:ack-wait-ms`, `:filter-subjects`, …).
+- **Acked publish** — `publish` against the JetStream context resolves to a
+  PubAck `{:stream :seq :duplicate :domain}`. Supports `:msg-id` server-side
+  dedup, `:expect` optimistic concurrency (a mismatch surfaces as
+  `:wrong-last-sequence`), `:timeout-ms`, and per-publish `:codec`. A reserved
+  `Nats-*` key in user `:headers` is rejected pre-flight as `:reserved-header`.
+- **Pull delivery** — three verbs: `next` (promise of one message or nil),
+  `fetch` (promise of a bounded vector), and `consume` (continuous delivery
+  through the same promise-return handler contract as core subscriptions — the
+  runtime waits for the handler's returned promise before delivering more, so
+  a slow handler simply slows the pull; no `:slow-consumer`, no async-library
+  dependency). `consume` returns a drainable, unsubscribable handle (ADR 0018).
+- **Acknowledgements** — `ack`, `nak` (with optional `:delay-ms`), `term`,
+  and `working` are synchronous, idempotent, and
+  never throw; `double-ack` returns a promise of the server's confirmation for
+  exactly-once-adjacent processing (ADR 0019).
+- **Pure-data messages** — delivered JetStream messages are plain maps
+  `{:subject :data :headers :js {…}}`; `:js` carries normalized delivery
+  metadata (`:stream`, `:consumer`, `:stream-seq`, `:delivery-seq`,
+  `:delivered`, `:pending`, `:redelivered`, `:timestamp`, `:domain`).
+- **Ordered consumer** — `ordered-consumer` replays a Stream gap-free with no
+  acks, for simple single-reader stream reads.
+- **Normalized JetStream errors** — new operational `:type`s identical on
+  every platform: `:jetstream-not-enabled`, `:stream-not-found`,
+  `:consumer-not-found`, `:wrong-last-sequence`, and the catch-all
+  `:jetstream-api-error` carrying the server's `{:code :description}`.
+  Consume-time side-band conditions (`:heartbeats-missed`,
+  `:consumer-deleted`, `:exceeded-limits`) route to a per-consume `:on-error`.
+  New validation `:type`s for caller misuse: `:invalid-name`,
+  `:unknown-config-key`, `:reserved-header`, `:no-ack-subject` (ADR 0020).
+- **ClojureScript packaging** — `@nats-io/jetstream` is installed
+  automatically and version-pinned in lockstep with the core client, so the
+  duplicate-nats-core hazard cannot arise. The JetStream import is confined to
+  JetStream namespaces: a core-only browser bundle ships zero JetStream bytes,
+  enforced by a CI guard (ADR 0016).
+
 ## [0.1.1] - 2026-06-05
 
 ### Fixed
@@ -48,6 +107,7 @@ Node, and the browser.
 - **JVM-only blocking convenience layer** (`nats-cljc.blocking.core`) — the same
   verb names, synchronous, with a pull-based subscription model.
 
-[Unreleased]: https://github.com/unisoma/nats-cljc/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/unisoma/nats-cljc/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/unisoma/nats-cljc/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/unisoma/nats-cljc/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/unisoma/nats-cljc/releases/tag/v0.1.0
