@@ -50,6 +50,8 @@
       "err_code 10039 normalizes to :jetstream-not-enabled")
   (is (= :wrong-last-sequence (jet-err/api-error-type 10071))
       "err_code 10071 (wrong last sequence) normalizes to :wrong-last-sequence")
+  (is (= :wrong-last-sequence (jet-err/api-error-type 10164))
+      "err_code 10164 (wrong last :msg-id) normalizes to :wrong-last-sequence")
   (is (= :jetstream-api-error (jet-err/api-error-type 99999))
       "an unseeded code defaults to the operational catch-all :jetstream-api-error"))
 

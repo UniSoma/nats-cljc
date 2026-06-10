@@ -18,7 +18,8 @@
   {10039 :jetstream-not-enabled
    10014 :consumer-not-found
    10059 :stream-not-found
-   10071 :wrong-last-sequence})
+   10071 :wrong-last-sequence
+   10164 :wrong-last-sequence})
 
 (defn api-error-type
   "Normalize a JetStream API `code` to its canonical operational `:type`, defaulting
