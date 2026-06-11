@@ -66,15 +66,32 @@
            :data    (codec/decode codec bytes)}
     (seq headers) (assoc :headers (msg/trim-headers headers))))
 
+(defn- wire-metadata
+  "Normalize a portable `:metadata` map (service- or endpoint-level) to its wire
+   form — string keys and string values, a keyword contributing its NAME (no
+   leading-colon artifact), anything else its string form — so a Service hosted on
+   either leg serializes the same JSON object and discovery lifts it back
+   identically (ADR 0024). nil passes through (no metadata declared)."
+  [metadata]
+  (when metadata
+    (reduce-kv (fn [m k v]
+                 (assoc m
+                        (if (keyword? k) (name k) (str k))
+                        (if (keyword? v) (name v) (str v))))
+               {} metadata)))
+
 (defn- prepare-endpoint
   "Wrap one declared endpoint for the impl: default `:subject` to `:name`, and wrap
    the public ADR-0007 `:handler` in the low-level handler the impl subscribes —
    decoding the raw request with the Service's `codec` and presenting the public
    message (the handler's returned promise, if any, flows straight back out so the
-   impl's native backpressure engages, ADR 0007)."
-  [codec {:keys [name subject handler] :as endpoint}]
+   impl's native backpressure engages, ADR 0007). Endpoint `:metadata` is
+   normalized to its wire form here, so the impls only ever host string-keyed
+   string-valued maps."
+  [codec {:keys [name subject handler metadata] :as endpoint}]
   (assoc endpoint
          :subject (or subject name)
+         :metadata (wire-metadata metadata)
          :handler (fn [raw] (handler (decode-request codec raw)))))
 
 (defn create
@@ -102,6 +119,12 @@
    promise applies per-endpoint backpressure. There is no Group noun — a consumer
    composes a grouped subject directly (ADR 0024).
 
+   `:metadata` — at the service level and per endpoint — is a flat map serialized
+   onto the wire as a JSON object of STRING keys and STRING values, identically on
+   both legs: a keyword key or value contributes its name (no leading colon),
+   anything else its string form. Discovery (`ping`/`info`/`stats`) lifts it back
+   as that same string-keyed map of strings.
+
    The Service binds ONE codec at create — `conn`'s default codec, unless `:codec`
    in `config` (a registry keyword or `ICodec` instance) overrides it — used to
    decode every request and encode every reply across all the Service's endpoints
@@ -126,7 +149,9 @@
                      (:codec conn))))
       (impl/bind (fn [codec]
                    (proto/-create-service
-                    conn (assoc config :endpoints (mapv #(prepare-endpoint codec %) endpoints)))))))
+                    conn (assoc config
+                                :metadata (wire-metadata (:metadata config))
+                                :endpoints (mapv #(prepare-endpoint codec %) endpoints)))))))
 
 (defn- reply-codec
   "The codec a `respond` / `respond-error` reply encodes with: the per-call `:codec`
@@ -206,8 +231,9 @@
 
 (defn ping
   "Discover the running Services `conn` can reach, resolving a platform-native
-   promise of a VECTOR of identity maps `{:name :id :version}` (and `:metadata` when
-   a Service declared some) — the client side of the surface, hanging directly off
+   promise of a VECTOR of identity maps `{:name :id :version}` (and `:metadata` —
+   a string-keyed map of string values, the one portable metadata shape — when a
+   Service declared some) — the client side of the surface, hanging directly off
    the Connection (ADR 0024). There is no Discovery handle and no local introspection
    of a Service this same connection hosts: self-inspection is a wire request like
    any other, narrowed by `opts`.

@@ -94,9 +94,10 @@
    0007). Omitting the handler makes `.addEndpoint` hand back a QueuedIterator and the
    endpoint iterator-driven instead; `drive-endpoint!` loops it, awaiting the handler
    between pulls, so backpressure and awaited-duration stats both engage."
-  [^js svc {:keys [name subject handler queue-group]}]
+  [^js svc {:keys [name subject handler queue-group metadata]}]
   (let [opts #js {:subject subject}
         _    (when queue-group (set! (.-queue opts) queue-group))
+        _    (when metadata (set! (.-metadata opts) (clj->js metadata)))
         qi   (.addEndpoint svc name opts)]
     (drive-endpoint! (endpoint-stats svc qi) qi handler)))
 
@@ -179,23 +180,25 @@
 
 (defn- ping->edn
   "Lift a JSON-decoded $SRV.PING reply (a plain JS object) to the portable identity
-   map, dropping the wire `type` discriminator (ADR 0024)."
+   map, dropping the wire `type` discriminator (ADR 0024). `:metadata` lifts as a
+   STRING-keyed map — the wire JSON object's own keys, byte-identical with the JVM
+   leg's lift (unlike the stats `:data` blob, which keywordizes)."
   [^js p]
   (-> {:name (.-name p) :id (.-id p) :version (.-version p)}
-      (assoc-some :metadata (some-> (.-metadata p) (js->clj :keywordize-keys true)))))
+      (assoc-some :metadata (some-> (.-metadata p) js->clj))))
 
 (defn- info-endpoint->edn
   [^js e]
   (-> {:name (.-name e) :subject (.-subject e)}
       (assoc-some :queue-group (.-queue_group e))
-      (assoc-some :metadata (some-> (.-metadata e) (js->clj :keywordize-keys true)))))
+      (assoc-some :metadata (some-> (.-metadata e) js->clj))))
 
 (defn- info->edn
   [^js i]
   (-> {:name (.-name i) :id (.-id i) :version (.-version i)
        :description (.-description i)
        :endpoints (mapv info-endpoint->edn (.-endpoints i))}
-      (assoc-some :metadata (some-> (.-metadata i) (js->clj :keywordize-keys true)))))
+      (assoc-some :metadata (some-> (.-metadata i) js->clj))))
 
 (defn- stats-endpoint->edn
   [^js es]
@@ -219,7 +222,7 @@
        ;; `:started` is byte-identical with the JVM leg and KV's `:created` form.
        :started (.toISOString (js/Date. (.-started s)))
        :endpoints (mapv stats-endpoint->edn (.-endpoints s))}
-      (assoc-some :metadata (some-> (.-metadata s) (js->clj :keywordize-keys true)))))
+      (assoc-some :metadata (some-> (.-metadata s) js->clj))))
 
 (defn- narrow-id
   "Client-side `:id` narrowing for a broadcast discovery: the $SRV control subjects

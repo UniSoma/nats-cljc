@@ -782,6 +782,51 @@
                                       (check p i s))))))
                       (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
 
+;; Service and endpoint :metadata round-trip create → discovery with ONE key shape
+;; on both legs: keys and values serialize as wire strings (a keyword contributes
+;; its name, no leading colon), and ping/info/stats lift the wire JSON object back
+;; as a string-keyed map of strings — identical on the JVM and Node.
+(deftest metadata-round-trips-create-to-discovery
+  (let [config   {:name "disc_meta" :version "1.0.0"
+                  :metadata {:region "eu" "tier" "gold"}
+                  :endpoints [{:name "echo" :subject "disc.meta.echo"
+                               :metadata {:visibility "public"}
+                               :handler (fn [_] :placeholder)}]}
+        opts     {:name "disc_meta"}
+        svc-meta {"region" "eu" "tier" "gold"}
+        check    (fn [p i s]
+                   (is (= svc-meta (:metadata (first p)))
+                       "ping lifts the service :metadata as a string-keyed map")
+                   (is (= svc-meta (:metadata (first i)))
+                       "info lifts the service :metadata as a string-keyed map")
+                   (is (= svc-meta (:metadata (first s)))
+                       "stats lifts the service :metadata as a string-keyed map")
+                   (is (= {"visibility" "public"}
+                          (:metadata (first (:endpoints (first i)))))
+                       "info lifts the endpoint :metadata as a string-keyed map"))]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [svc (deref (service/create conn config) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (check (deref (service/ping conn opts) 10000 ::timeout)
+                        (deref (service/info conn opts) 10000 ::timeout)
+                        (deref (service/stats conn opts) 10000 ::timeout)))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (service/create conn config)
+                      (p/then (fn [svc]
+                                (with-service svc
+                                  (fn []
+                                    (p/let [p (service/ping conn opts)
+                                            i (service/info conn opts)
+                                            s (service/stats conn opts)]
+                                      (check p i s))))))
+                      (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
+
 ;; Discovery narrows by :name to a specific Service and by :id to a specific
 ;; instance: a matching :id resolves that one instance, a non-matching :id resolves
 ;; an empty vector. Identical on both legs.
