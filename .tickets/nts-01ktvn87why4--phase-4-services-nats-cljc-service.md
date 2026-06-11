@@ -6,13 +6,20 @@ type: epic
 priority: 2
 mode: afk
 created: '2026-06-11T15:36:44.177203849Z'
-updated: '2026-06-11T15:36:49.785503418Z'
+updated: '2026-06-11T19:16:56.408461582Z'
 tags:
 - services
 - prd
 - phase-4
 links:
 - nts-01ktvn3fy51e
+- nts-01ktw1t03s6y
+- nts-01ktw1tackm5
+- nts-01ktw1th72xx
+- nts-01ktw1tq610j
+- nts-01ktw1v1n20p
+- nts-01ktw1v8pb2h
+- nts-01ktw1vef0dp
 ---
 
 ## Description
@@ -96,3 +103,9 @@ Add `nats-cljc.service`: a portable facade over the services framework in both w
 - Follow-up ticket `nts-01ktvn3fy51e` tracks surveying what else the `3.4.0` floor unlocks, independent of shipping services.
 - The decision record: ADR 0024 (no context / no entry verification), ADR 0025 (service errors are reply payloads), ADR 0026 (services joins the unconditional family, 3.4.0 floor); glossary terms Service, Endpoint, Discovery, and validation `:type`s `:invalid-version` / `:duplicate-endpoint` are in CONTEXT.md.
 - Structure this as Phase 4, broken into tracer-bullet vertical slices via `knot:to-tickets`, mirroring how Phase 3 (KV) was sliced.
+
+## Notes
+
+**2026-06-11T18:59:34.215717466Z**
+
+All 9 implementation slices shipped and closed (commits bf78bfb..0c2042a on main, unpushed). nats-cljc.service is complete: create/respond/respond-error/error, validation pre-flights (:invalid-version, :duplicate-endpoint), stop+drain+:stopped, ping/info/stats discovery, codec bind+override, ADR-0007 serial delivery. Node serialization gate resolved by driving the endpoint async iterator (nats.js 3.4.0 does NOT await the callback — verified red-before-green); recorded in ADR 0007. 0.5.0 release prepped locally (README/CHANGELOG/version/glossary). Epic stays OPEN pending the manual Clojars deploy: git tag v0.5.0 && git push --tags && clojure -T:build jar && clojure -T:build deploy. Follow-up debt noted: docs/cljdoc.edn ADR sidebar stale past 0015 (pre-existing) — worth its own docs ticket.
