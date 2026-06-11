@@ -13,7 +13,7 @@
   (:require [nats-cljc.impl.protocol :as proto]
             [nats-cljc.impl.jvm :as core])
   (:import [nats_cljc.impl.jvm JvmConnection]
-           [io.nats.client Connection]
+           [io.nats.client Connection Connection$Status]
            [io.nats.client.impl Headers]
            [io.nats.client.support JsonValue JsonValue$Type]
            [io.nats.service Service ServiceEndpoint Endpoint ServiceMessage ServiceMessageHandler
@@ -232,36 +232,57 @@
               (long (or timeout-ms Discovery/DEFAULT_DISCOVERY_MAX_TIME_MILLIS))
               (int (or max-results Discovery/DEFAULT_DISCOVERY_MAX_RESULTS))))
 
+(defn- discovery-state-error
+  "Normalize the IllegalStateException jnats raises when Discovery's
+   subscribe/publish round-trip hits a non-open connection, by the client's
+   STRUCTURED state — the request path's idiom (ADR 0006): CLOSED →
+   `:connection-closed` (retry-able), CONNECTED uniquely selects the drain block →
+   `:drained`. Any other status returns the original exception so the caller
+   rethrows the raw ISE (the reconnect-buffer guard), matching request."
+  [^Connection client ^Throwable e]
+  (condp = (.getStatus client)
+    Connection$Status/CLOSED    (ex-info "Connection is closed" {:type :connection-closed} e)
+    Connection$Status/CONNECTED (ex-info "Connection is draining" {:type :drained} e)
+    e))
+
+(defn- discover
+  "Run the blocking Discovery fan-out `f` off the caller's thread (ADR 0002,
+   `off-thread`), normalizing a non-open-connection failure to its canonical
+   `:type` (ADR 0006) so a discovery rejection never leaks the raw jnats
+   IllegalStateException — the consumer branches on `(:type (ex-data e))`
+   identically with the JS leg's `gather`."
+  [^Connection client io-executor opts f]
+  (off-thread
+   io-executor
+   (fn []
+     (try
+       (f (discovery client opts))
+       (catch IllegalStateException e
+         (throw (discovery-state-error client e)))))))
+
 (extend-type JvmConnection
   proto/Discovery
   (-ping [{:keys [^Connection client io-executor]} {:keys [name id] :as opts}]
     ;; jnats' Discovery has no List-returning 2-arg ping; narrowing to a single
     ;; instance (name + id) returns one response (or null when absent), so wrap it
-    ;; into the same VECTOR the broadcast variants drain into (ADR 0024). The
-    ;; blocking fan-out gathers off the caller's thread (ADR 0002, `off-thread`).
-    (off-thread
-     io-executor
-     (fn []
-       (let [d (discovery client opts)]
-         (mapv ping->edn
-               (cond (and name id) (remove nil? [(.ping d ^String name ^String id)])
-                     name          (.ping d ^String name)
-                     :else         (.ping d)))))))
+    ;; into the same VECTOR the broadcast variants drain into (ADR 0024).
+    (discover client io-executor opts
+              (fn [^Discovery d]
+                (mapv ping->edn
+                      (cond (and name id) (remove nil? [(.ping d ^String name ^String id)])
+                            name          (.ping d ^String name)
+                            :else         (.ping d))))))
   (-info [{:keys [^Connection client io-executor]} {:keys [name id] :as opts}]
-    (off-thread
-     io-executor
-     (fn []
-       (let [d (discovery client opts)]
-         (mapv info->edn
-               (cond (and name id) (remove nil? [(.info d ^String name ^String id)])
-                     name          (.info d ^String name)
-                     :else         (.info d)))))))
+    (discover client io-executor opts
+              (fn [^Discovery d]
+                (mapv info->edn
+                      (cond (and name id) (remove nil? [(.info d ^String name ^String id)])
+                            name          (.info d ^String name)
+                            :else         (.info d))))))
   (-stats [{:keys [^Connection client io-executor]} {:keys [name id] :as opts}]
-    (off-thread
-     io-executor
-     (fn []
-       (let [d (discovery client opts)]
-         (mapv stats->edn
-               (cond (and name id) (remove nil? [(.stats d ^String name ^String id)])
-                     name          (.stats d ^String name)
-                     :else         (.stats d))))))))
+    (discover client io-executor opts
+              (fn [^Discovery d]
+                (mapv stats->edn
+                      (cond (and name id) (remove nil? [(.stats d ^String name ^String id)])
+                            name          (.stats d ^String name)
+                            :else         (.stats d)))))))

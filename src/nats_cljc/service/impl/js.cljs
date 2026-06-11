@@ -11,6 +11,7 @@
    is no server feature to round-trip against (ADR 0024)."
   (:require [nats-cljc.impl.protocol :as proto]
             [nats-cljc.impl.js :as core]
+            ["@nats-io/nats-core" :as nats-core]
             ["@nats-io/services" :as services]))
 
 ;; The Service handle the facade resolves to: a thin wrapper over the native
@@ -225,12 +226,25 @@
    (it resolves a QueuedIterator), drain it through `f`, and normalize a
    no-responders rejection — a narrowed fan-out that reached nobody — to an empty
    VECTOR, so the gather matches the JVM `Discovery` List that swallows the same
-   condition (ADR 0024)."
+   condition (ADR 0024). A fan-out on a non-open connection is normalized to its
+   canonical `:type` — the request path's idiom (ADR 0006): the drain window's
+   DrainingConnectionError → `:drained`, ClosedConnectionError → `:connection-closed`
+   except closed-after-drain, where the live `isDraining` still selects `:drained` —
+   so a discovery rejection never leaks the raw nats.js error."
   [client opts verb-fn f]
   (let [c (.client (services/Svcm. client) (->request-many-opts opts))]
     (-> (verb-fn c)
         (.then (fn [qi] (drain qi f)))
-        (.catch (fn [e] (if (core/no-responders? e) [] (throw e)))))))
+        (.catch (fn [e]
+                  (cond
+                    (core/no-responders? e) []
+                    (instance? nats-core/DrainingConnectionError e)
+                    (throw (ex-info "Connection is draining" {:type :drained}))
+                    (instance? nats-core/ClosedConnectionError e)
+                    (throw (if (.isDraining ^js client)
+                             (ex-info "Connection is draining" {:type :drained})
+                             (ex-info "Connection is closed" {:type :connection-closed})))
+                    :else (throw e)))))))
 
 (extend-type core/JsConnection
   proto/Discovery

@@ -876,6 +876,35 @@
                         (mapv :name (deref p 5000 ::timeout)))
                      "the off-thread gather still resolves the normalized vector")))))))))
 
+;; A discovery fan-out forced onto a CLOSED connection rejects with the normalized
+;; :connection-closed ex-info (ADR 0006) — never the raw host error (a bare jnats
+;; IllegalStateException / a nats.js ClosedConnectionError) — so a consumer
+;; branches on `(:type (ex-data e))` identically across legs.
+(deftest discovery-on-a-closed-connection-rejects-connection-closed
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (close! conn)
+         (doseq [[verb f] [["ping" service/ping] ["info" service/info] ["stats" service/stats]]]
+           (let [e (reject-reason (f conn {:timeout-ms 500}))]
+             (is (= :connection-closed (:type (ex-data e)))
+                 (str verb " on a closed connection rejects the normalized :connection-closed"))))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (let [check (fn [verb f]
+                              (-> (f conn {:timeout-ms 500})
+                                  (p/then (fn [v] (is false (str verb " resolved unexpectedly: " v))))
+                                  (p/catch (fn [e]
+                                             (is (= :connection-closed (:type (ex-data e)))
+                                                 (str verb " on a closed connection rejects the normalized :connection-closed"))))))]
+                  (-> (p/do (close! conn))
+                      (p/then (fn [_]
+                                (p/do (check "ping" service/ping)
+                                      (check "info" service/info)
+                                      (check "stats" service/stats)))))))))))
+
 ;; Stats counters MOVE: a handled request increments the endpoint's request count,
 ;; and an UNCAUGHT handler failure — a throw or a rejected promise — increments its
 ;; error count. An explicit `respond-error` does NOT: it is an ordinary reply
