@@ -35,8 +35,10 @@
 ;; per-connection IO pool, carried so every off-thread KV op runs there instead of
 ;; the shared commonPool (the connection owns its lifecycle). `client` is the
 ;; owning jnats Connection, carried so opening a Bucket can construct its
-;; per-Bucket `KeyValue` object.
-(defrecord JvmKvContext [^KeyValueManagement kvm codec ^ExecutorService io-executor ^Connection client])
+;; per-Bucket `KeyValue` object. `on-status` is the connection's status handler,
+;; carried onto each Bucket handle so a Watch with no `:on-error` can fall back to
+;; it (ADR 0006/0007).
+(defrecord JvmKvContext [^KeyValueManagement kvm codec ^ExecutorService io-executor ^Connection client on-status])
 
 ;; The Bucket handle: the per-Bucket jnats `KeyValue` object the entry operations
 ;; dispatch over, plus the codec the Bucket binds (the context's — i.e. the
@@ -44,8 +46,10 @@
 ;; Bucket's name, carried so KV-faced errors can name it (ADR 0023). `jsm` is the
 ;; substrate read seam the revision-pinned get needs: jnats' own revision get
 ;; hides delete/purge markers behind null, so the marker entry is reconstructed
-;; from the backing stream's message (see `-kv-get`).
-(defrecord JvmBucket [^KeyValue kv codec ^ExecutorService io-executor bucket ^JetStreamManagement jsm])
+;; from the backing stream's message (see `-kv-get`). `on-status` is the
+;; connection's status handler, the fallback sink a Watch with no `:on-error`
+;; routes async failures to (ADR 0006/0007).
+(defrecord JvmBucket [^KeyValue kv codec ^ExecutorService io-executor bucket ^JetStreamManagement jsm on-status])
 
 (extend-type JvmConnection
   proto/KV
@@ -84,7 +88,7 @@
                                         "JetStream INFO request timed out"
                                         "JetStream is not enabled on the server or account")
                                       {:type (jet-jvm/verify-io-type available?)} e)))))
-                (->JvmKvContext kvm (:codec conn) io-executor client))
+                (->JvmKvContext kvm (:codec conn) io-executor client (:on-status conn)))
               (catch IOException e
                 ;; Reached ONLY from the constructions above (ensureNotClosing on a
                 ;; non-open connection); keyed on connection status, not message
@@ -198,7 +202,8 @@
   [ctx ^String bucket]
   (->JvmBucket (.keyValue ^Connection (:client ctx) bucket)
                (:codec ctx) (:io-executor ctx) bucket
-               (.jetStreamManagement ^Connection (:client ctx))))
+               (.jetStreamManagement ^Connection (:client ctx))
+               (:on-status ctx)))
 
 ;; The one canonical timestamp format on this leg (UTC, exactly three fractional
 ;; digits) — the same formatter the JetStream impl pins, duplicated rather than
@@ -250,6 +255,29 @@
   {:latest  []
    :history [KeyValueWatchOption/INCLUDE_HISTORY]
    :updates [KeyValueWatchOption/UPDATES_ONLY]})
+
+(defn- route-watch-error!
+  "Route a Watch delivery failure to its sink (ADR 0006/0007, the core
+   subscription semantics): the Watch's `on-error` if set (the bare value), else
+   the connection `on-status` as a `{:type :error :error e}` event — never both.
+   A throwing sink is SWALLOWED: this runs inside jnats' watch dispatcher
+   callback, where a rethrow would hit the native machinery, not the consumer."
+  [on-error on-status e]
+  (try
+    (if on-error
+      (on-error e)
+      (when on-status (on-status {:type :error :error e})))
+    (catch Throwable _ nil)))
+
+(defn- bare-watch-failure
+  "Unwrap a Watch delivery failure to the bare value the sink contract pins (ADR
+   0006): a rejected handler promise surfaces from `.join` as a
+   CompletionException wrapping the real reason; a synchronous throw (the
+   facade's decode seam, or the consumer's own handler) is already bare."
+  [^Throwable t]
+  (if (instance? java.util.concurrent.CompletionException t)
+    (or (.getCause t) t)
+    t))
 
 (extend-type JvmKvContext
   proto/BucketManager
@@ -376,25 +404,42 @@
 
 (extend-type JvmBucket
   proto/BucketWatch
-  (-kv-watch [bucket deliver raw-handler]
-    ;; jnats' watchAll drives the Watch natively: a dedicated dispatcher delivers
-    ;; serially to the KeyValueWatcher, whose endOfData IS the initialized signal
-    ;; — jnats fires it immediately for UPDATES_ONLY, at subscribe time when
-    ;; there is nothing to replay, else after the delta-0 entry. Blocking the
-    ;; watch callback on a returned CompletionStage is road 2 again (ADR 0007):
-    ;; per-Watch backpressure rides jnats' own dispatcher queue, exactly like the
-    ;; core subscription leg. watchAll's construction round-trips the consumer
-    ;; subscribe, hence off-thread (ADR 0002).
-    (off-thread (:io-executor bucket)
-                #(let [initialized (CompletableFuture.)
-                       watcher     (reify KeyValueWatcher
-                                     (watch [_ e]
-                                       (let [r (raw-handler (assoc (entry->raw e) :delta (.getDelta ^KeyValueEntry e)))]
-                                         (when (instance? CompletionStage r)
-                                           (-> ^CompletionStage r .toCompletableFuture .join))))
-                                     (endOfData [_]
-                                       (.complete initialized nil)))
-                       sub         (.watchAll ^KeyValue (:kv bucket) watcher
-                                              ^"[Lio.nats.client.api.KeyValueWatchOption;"
-                                              (into-array KeyValueWatchOption (deliver->watch-options deliver)))]
-                   (->JvmWatch sub initialized (atom false))))))
+  (-kv-watch [bucket opts raw-handler]
+    ;; jnats' watch/watchAll drives the Watch natively: a dedicated dispatcher
+    ;; delivers serially to the KeyValueWatcher, whose endOfData IS the
+    ;; initialized signal — jnats fires it immediately for UPDATES_ONLY, at
+    ;; subscribe time when there is nothing to replay (a :keys filter matching
+    ;; nothing included), else after the delta-0 entry (which it observes even
+    ;; when IGNORE_DELETE suppresses that entry's delivery — verified in jnats'
+    ;; WatchMessageHandler, not inferred). IGNORE_DELETE suppresses Tombstones
+    ;; AND purge markers (every non-PUT operation). Blocking the watch callback
+    ;; on a returned CompletionStage is road 2 again (ADR 0007): per-Watch
+    ;; backpressure rides jnats' own dispatcher queue, exactly like the core
+    ;; subscription leg; a delivery failure — the facade's decode throw, a
+    ;; throwing handler, or a rejecting handler promise — routes to the Watch's
+    ;; :on-error, else the connection's :on-status, and the Watch survives.
+    ;; watch/watchAll's construction round-trips the consumer subscribe, hence
+    ;; off-thread (ADR 0002).
+    (let [{:keys [deliver keys ignore-deletes? on-error]} opts
+          on-status (:on-status bucket)]
+      (off-thread (:io-executor bucket)
+                  #(let [initialized (CompletableFuture.)
+                         watcher     (reify KeyValueWatcher
+                                       (watch [_ e]
+                                         (try
+                                           (let [r (raw-handler (assoc (entry->raw e) :delta (.getDelta ^KeyValueEntry e)))]
+                                             (when (instance? CompletionStage r)
+                                               (-> ^CompletionStage r .toCompletableFuture .join)))
+                                           (catch Throwable t
+                                             (route-watch-error! on-error on-status (bare-watch-failure t)))))
+                                       (endOfData [_]
+                                         (.complete initialized nil)))
+                         options     (cond-> (deliver->watch-options deliver)
+                                       ignore-deletes? (conj KeyValueWatchOption/IGNORE_DELETE))
+                         opt-array   (into-array KeyValueWatchOption options)
+                         sub         (if keys
+                                       (.watch ^KeyValue (:kv bucket) ^java.util.List keys watcher
+                                               ^"[Lio.nats.client.api.KeyValueWatchOption;" opt-array)
+                                       (.watchAll ^KeyValue (:kv bucket) watcher
+                                                  ^"[Lio.nats.client.api.KeyValueWatchOption;" opt-array))]
+                     (->JvmWatch sub initialized (atom false)))))))

@@ -22,14 +22,18 @@
 ;; The KV context (ADR 0017's twin): the handle wrapping @nats-io/kv's
 ;; management-plane `Kvm` object every Bucket-lifecycle operation flows through.
 ;; `codec` is the connection's default (the resolved `Prepared`), captured at
-;; entry so each Bucket handle binds it (ADR 0011).
-(defrecord JsKvContext [kvm codec])
+;; entry so each Bucket handle binds it (ADR 0011). `on-status` is the
+;; connection's status handler, carried onto each Bucket handle so a Watch with
+;; no `:on-error` can fall back to it (ADR 0006/0007).
+(defrecord JsKvContext [kvm codec on-status])
 
 ;; The Bucket handle: the per-Bucket @nats-io/kv `KV` object the entry operations
 ;; dispatch over, plus the codec the Bucket binds (the context's — i.e. the
 ;; connection default). `bucket` is the Bucket's name, carried so KV-faced errors
-;; can name it (ADR 0023).
-(defrecord JsBucket [kv codec bucket])
+;; can name it (ADR 0023). `on-status` is the connection's status handler, the
+;; fallback sink a Watch with no `:on-error` routes async failures to (ADR
+;; 0006/0007).
+(defrecord JsBucket [kv codec bucket on-status])
 
 (extend-type core/JsConnection
   proto/KV
@@ -41,7 +45,7 @@
     ;; entry point: only the no-responder is :jetstream-not-enabled.
     (let [client (:client conn)]
       (-> (jetstream/jetstreamManager client)
-          (.then (fn [_] (->JsKvContext (kv/Kvm. client) (:codec conn))))
+          (.then (fn [_] (->JsKvContext (kv/Kvm. client) (:codec conn) (:on-status conn))))
           (.catch (fn [e] (throw (jet-js/verify-error e))))))))
 
 (defn kv-error
@@ -129,7 +133,7 @@
   proto/BucketManager
   (-create-bucket [ctx config]
     (-> (.create ^js (:kvm ctx) (:bucket config) (->kv-opts config))
-        (.then (fn [kv] (->JsBucket kv (:codec ctx) (:bucket config))))
+        (.then (fn [kv] (->JsBucket kv (:codec ctx) (:bucket config) (:on-status ctx))))
         with-kv-error))
   (-open-bucket [ctx bucket]
     ;; kvm.open binds WITHOUT a server round-trip, so the open contract's
@@ -138,7 +142,7 @@
     ;; leg's getStatus, never deferred to the first entry operation.
     (-> (.open ^js (:kvm ctx) bucket)
         (.then (fn [kv] (-> (.status ^js kv)
-                            (.then (fn [_] (->JsBucket kv (:codec ctx) bucket))))))
+                            (.then (fn [_] (->JsBucket kv (:codec ctx) bucket (:on-status ctx)))))))
         with-kv-error))
   (-delete-bucket [ctx bucket]
     ;; @nats-io/kv has no delete-by-name on Kvm: bind (no round-trip), then
@@ -307,17 +311,31 @@
       (.stop ^js iter))
     nil))
 
+(defn- route-watch-error!
+  "Route a Watch delivery failure to its sink (ADR 0006/0007, the core
+   subscription semantics): the Watch's `on-error` if set (the bare value), else
+   the connection `on-status` as a `{:type :error :error e}` event — never both.
+   A throwing sink is SWALLOWED: this runs inside the detached watch loop, where
+   a rethrow would kill delivery, not inform the consumer."
+  [on-error on-status e]
+  (try
+    (if on-error
+      (on-error e)
+      (when on-status (on-status {:type :error :error e})))
+    (catch :default _ nil)))
+
 (defn- watch-loop!
   "Drive a watch QueuedIterator as an async-iterable — the `consume!` detached
    loop (road 2, ADR 0007), watch-flavored: each entry is lifted and handed to
    `raw-handler`, and the loop awaits a returned promise before pulling the next
    entry (per-Watch backpressure, the backlog filling nats.js' own buffer). A
-   rejecting handler promise just continues — the Watch survives; `:on-error`
-   routing is the refinements slice's seam. An entry arriving with delta 0 means
-   the Watch has caught up, so `initialized!` fires once that entry's delivery
-   settles — the same boundary jnats' endOfData marks. The iterable completing
-   (stop/close) ends the loop; the `.next` `.catch` swallows that close-race."
-  [^js qi raw-handler initialized!]
+   delivery failure — a synchronous raw-handler throw (the facade's decode seam)
+   or a rejecting handler promise — routes to `route!` and the loop CONTINUES:
+   the Watch survives. An entry arriving with delta 0 means the Watch has caught
+   up, so `initialized!` fires once that entry's delivery settles — the same
+   boundary jnats' endOfData marks. The iterable completing (stop/close) ends
+   the loop; the `.next` `.catch` swallows that close-race."
+  [^js qi raw-handler initialized! route!]
   (let [it (.call (unchecked-get qi (.-asyncIterator js/Symbol)) qi)]
     (letfn [(step []
               (-> (.next it)
@@ -330,33 +348,62 @@
                                              (step))]
                                (-> (js/Promise. (fn [resolve _]
                                                   (resolve (raw-handler (assoc (entry->raw e) :delta (.-delta e))))))
-                                   (.then settle settle))))))
+                                   (.then settle (fn [err] (route! err) (settle nil))))))))
                   (.catch (fn [_] nil))))]
       (step))))
 
 (extend-type JsBucket
   proto/BucketWatch
-  (-kv-watch [bucket deliver raw-handler]
+  (-kv-watch [bucket opts raw-handler]
     ;; @nats-io/kv 3.x exposes no initializedFn, so the initialized signal is
     ;; derived to match jnats' endOfData semantics: immediately for :updates
     ;; (nothing replays); when an entry lands with delta 0 (the caught-up
     ;; boundary, fired from watch-loop!); and — the empty-replay edge neither of
-    ;; those reaches — when a status round-trip AFTER the watch is live shows
-    ;; zero stored messages, so there was nothing to replay (any later write is
-    ;; an update, which the delta-0 path would also catch — resolution is
-    ;; idempotent). The opts object is string-keyed via clj->js, surviving
-    ;; advanced compilation.
-    (let [resolve!    (atom nil)
+    ;; those reaches — when a round-trip AFTER the watch is live shows there was
+    ;; nothing to replay: without :keys, a status read with zero stored
+    ;; messages; with :keys, a filtered live-key enumeration matching nothing
+    ;; (status counts the whole Bucket, so it cannot see a filter; the keys
+    ;; probe trades the tombstone-only-match edge — markers still replay after
+    ;; an early resolve — for never leaving :initialized unresolved). Any later
+    ;; write is an update the delta-0 path also catches — resolution is
+    ;; idempotent.
+    ;;
+    ;; :ignore-deletes? is OURS, not the native flag: nats.js' ignoreDeletes
+    ;; skips only "DEL" (a purge marker still delivers, diverging from jnats'
+    ;; every-non-PUT) and skips it BEFORE the queue, so a suppressed delta-0
+    ;; marker would never reach the loop's initialized boundary. Filtering in
+    ;; the wrapped raw-handler pins both: markers (delete AND purge) are
+    ;; suppressed portably, and the delta-0 entry is still observed.
+    ;;
+    ;; The opts object is string-keyed via clj->js, surviving advanced
+    ;; compilation; `key` takes the pattern vector as a string[].
+    (let [{:keys [deliver keys ignore-deletes? on-error]} opts
+          route!      (fn [e] (route-watch-error! on-error (:on-status bucket) e))
+          deliver-raw (if ignore-deletes?
+                        (fn [raw] (when (= :put (:operation raw)) (raw-handler raw)))
+                        raw-handler)
+          resolve!    (atom nil)
           initialized (js/Promise. (fn [res _] (reset! resolve! res)))
           init!       #(@resolve! nil)]
       (-> (.watch ^js (:kv bucket)
                   (clj->js (cond-> {}
-                             (deliver->include deliver) (assoc :include (deliver->include deliver)))))
+                             (deliver->include deliver) (assoc :include (deliver->include deliver))
+                             keys (assoc :key keys))))
           (.then (fn [^js qi]
-                   (watch-loop! qi raw-handler init!)
-                   (if (= :updates deliver)
+                   (watch-loop! qi deliver-raw init! route!)
+                   (cond
+                     (= :updates deliver)
                      (do (init!)
                          (->JsWatch qi initialized (atom false)))
+
+                     keys
+                     (-> (.keys ^js (:kv bucket) (clj->js keys))
+                         (.then (fn [^js ks-qi] (drain-qi ks-qi identity)))
+                         (.then (fn [ks]
+                                  (when (empty? ks) (init!))
+                                  (->JsWatch qi initialized (atom false)))))
+
+                     :else
                      (-> (.status ^js (:kv bucket))
                          (.then (fn [^js s]
                                   (when (zero? (.-values s)) (init!))

@@ -370,19 +370,26 @@
    `@nats-io/kv` import stays confined (ADR 0016). The facade owns the public
    arglists, the `:deliver` pre-flight validation, and the codec seam: the
    raw-handler it passes down receives RAW entry maps, never decoded values."
-  (-kv-watch [bucket deliver raw-handler]
-    "Open a Watch over every key in the Bucket, returning a native promise of a
-     watch handle — a platform record satisfying `Watch`, whose `:initialized`
-     key holds a native promise that resolves when the initial replay completes
-     (immediately when there is nothing to replay). `deliver` is the validated
-     mode: `:latest` replays each key's current value then streams updates,
+  (-kv-watch [bucket opts raw-handler]
+    "Open a Watch, returning a native promise of a watch handle — a platform
+     record satisfying `Watch`, whose `:initialized` key holds a native promise
+     that resolves when the initial replay completes (immediately when there is
+     nothing to replay). `opts` is the facade-normalized map
+     `{:deliver :keys :ignore-deletes? :on-error}`: `:deliver` is the validated
+     mode — `:latest` replays each key's current value then streams updates,
      `:history` replays the full retained history first, `:updates` streams only
-     new changes (its `:initialized` resolves at once). `raw-handler` is invoked
-     per matching entry — including Tombstones and purge markers — with one raw
-     entry map (the `-kv-history` shape: `{:bucket :key :bytes :revision
-     :created :operation :delta}`); deliveries are serial within one Watch, and
-     a returned promise suspends the next delivery until it settles (the ADR
-     0007 contract)."))
+     new changes (its `:initialized` resolves at once); `:keys` is nil (every
+     key) or a non-empty vector of subject-style key patterns restricting the
+     Watch to their union; `:ignore-deletes?` true suppresses Tombstone and
+     purge-marker deliveries; `:on-error` is the per-Watch async-failure sink —
+     a raw-handler throw (the facade's decode seam) or a rejecting returned
+     promise routes there when set, else to the connection's `:on-status` as an
+     `:error` event, never both (ADR 0006/0007). `raw-handler` is invoked per
+     matching entry — including Tombstones and purge markers, unless ignored —
+     with one raw entry map (the `-kv-history` shape: `{:bucket :key :bytes
+     :revision :created :operation :delta}`); deliveries are serial within one
+     Watch, and a returned promise suspends the next delivery until it settles
+     (the ADR 0007 contract)."))
 
 (defprotocol Watch
   "A single Watch's lifecycle — implemented by the per-leg watch handle records

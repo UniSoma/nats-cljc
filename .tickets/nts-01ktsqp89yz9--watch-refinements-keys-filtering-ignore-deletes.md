@@ -1,12 +1,12 @@
 ---
 id: nts-01ktsqp89yz9
 title: 'Watch refinements: :keys filtering, :ignore-deletes?, :on-error routing'
-status: open
+status: in_progress
 type: feature
 priority: 1
 mode: afk
 created: '2026-06-10T21:40:51.636126494Z'
-updated: '2026-06-10T21:40:51.636126494Z'
+updated: '2026-06-11T01:03:35.428203550Z'
 parent: nts-01ktsner23xc
 tags:
 - kv

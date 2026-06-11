@@ -1482,3 +1482,245 @@
                               (is (not hit?)
                                   "stop ends delivery — a write after stop never reaches the Handler")
                               (is (nil? (kv/stop w)) "a second stop is a safe no-op")))))))))))))
+
+;; :keys restricts a Watch to subject-style key patterns: a single pattern
+;; delivers only matching keys (replay AND stream alike), a vector of patterns
+;; delivers their union, and a pattern matching nothing still resolves
+;; :initialized — there is just nothing to replay.
+(deftest watch-keys-filters-deliveries
+  (let [bucket "TRACER_KV_WATCH_KEYS"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "user.1" {:v 1}) 5000 ::timeout)
+                 (deref (kv/put handle "user.2" {:v 2}) 5000 ::timeout)
+                 (deref (kv/put handle "other.1" {:v 3}) 5000 ::timeout)
+                 (let [one  (atom [])
+                       many (atom [])
+                       none (atom [])
+                       w1   (deref (kv/watch handle #(swap! one conj %) {:keys "user.>"}) 5000 ::timeout)
+                       w2   (deref (kv/watch handle #(swap! many conj %) {:keys ["user.>" "other.1"]}) 5000 ::timeout)
+                       w3   (deref (kv/watch handle #(swap! none conj %) {:keys "absent.>"}) 5000 ::timeout)]
+                   (try
+                     (is (wait-for #(= 2 (count @one)) 5000)
+                         "a single pattern replays only its matching keys")
+                     (is (= ["user.1" "user.2"] (mapv :key @one))
+                         "the non-matching key never reaches the single-pattern Watch")
+                     (is (wait-for #(= 3 (count @many)) 5000)
+                         "multiple patterns deliver their union")
+                     (is (= ["user.1" "user.2" "other.1"] (mapv :key @many))
+                         "the union covers every pattern's matches, in stream order")
+                     (is (not= ::timeout (deref (:initialized w3) 5000 ::timeout))
+                         "a pattern matching nothing still resolves :initialized")
+                     (deref (kv/put handle "user.3" {:v 4}) 5000 ::timeout)
+                     (is (wait-for #(= 3 (count @one)) 5000)
+                         "a streamed write matching the pattern is delivered")
+                     (is (= "user.3" (:key (last @one)))
+                         "the streamed delivery is the matching new write")
+                     (is (not (wait-for #(pos? (count @none)) 800))
+                         "a Watch whose pattern matches nothing receives no deliveries")
+                     (finally (kv/stop w1) (kv/stop w2) (kv/stop w3)))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx    (kv/kv conn)
+                          handle (kv/create-bucket ctx {:bucket bucket :storage :memory})]
+                    (with-bucket ctx bucket
+                      (fn []
+                        (let [one  (atom [])
+                              many (atom [])
+                              none (atom [])]
+                          (p/let [_     (kv/put handle "user.1" {:v 1})
+                                  _     (kv/put handle "user.2" {:v 2})
+                                  _     (kv/put handle "other.1" {:v 3})
+                                  w1    (kv/watch handle #(swap! one conj %) {:keys "user.>"})
+                                  w2    (kv/watch handle #(swap! many conj %) {:keys ["user.>" "other.1"]})
+                                  w3    (kv/watch handle #(swap! none conj %) {:keys "absent.>"})
+                                  init3 (p/race [(:initialized w3) (p/delay 5000 ::timeout)])
+                                  hit1? (wait-for #(= 2 (count @one)) 5000)
+                                  hit2? (wait-for #(= 3 (count @many)) 5000)]
+                            (-> (p/do
+                                  (is hit1? "a single pattern replays only its matching keys")
+                                  (is (= ["user.1" "user.2"] (mapv :key @one))
+                                      "the non-matching key never reaches the single-pattern Watch")
+                                  (is hit2? "multiple patterns deliver their union")
+                                  (is (= ["user.1" "user.2" "other.1"] (mapv :key @many))
+                                      "the union covers every pattern's matches, in stream order")
+                                  (is (not= ::timeout init3)
+                                      "a pattern matching nothing still resolves :initialized")
+                                  (p/let [_     (kv/put handle "user.3" {:v 4})
+                                          hit?  (wait-for #(= 3 (count @one)) 5000)
+                                          miss? (wait-for #(pos? (count @none)) 800)]
+                                    (is hit? "a streamed write matching the pattern is delivered")
+                                    (is (= "user.3" (:key (last @one)))
+                                        "the streamed delivery is the matching new write")
+                                    (is (not miss?)
+                                        "a Watch whose pattern matches nothing receives no deliveries")))
+                                (p/finally (fn [_ _] (kv/stop w1) (kv/stop w2) (kv/stop w3)))))))))))))))
+
+;; :ignore-deletes? true suppresses Tombstone AND purge-marker deliveries —
+;; replay and stream alike — while the default delivers them with :operation
+;; visible (ADR 0023): cache-maintenance consumers skip markers, event-log
+;; consumers observe them.
+(deftest watch-ignore-deletes-suppresses-markers
+  (let [bucket "TRACER_KV_WATCH_IGNORE_DELETES"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "k.a" {:v 1}) 5000 ::timeout)
+                 (deref (kv/delete handle "k.a") 5000 ::timeout)
+                 (deref (kv/put handle "k.b" {:v 2}) 5000 ::timeout)
+                 (deref (kv/put handle "k.c" {:v 3}) 5000 ::timeout)
+                 (deref (kv/purge handle "k.c") 5000 ::timeout)
+                 (let [all  (atom [])
+                       live (atom [])
+                       wa   (deref (kv/watch handle #(swap! all conj %) {:deliver :history}) 5000 ::timeout)
+                       wl   (deref (kv/watch handle #(swap! live conj %) {:deliver :history :ignore-deletes? true}) 5000 ::timeout)]
+                   (try
+                     (is (wait-for #(= 4 (count @all)) 5000)
+                         "the default delivers delete and purge Entries")
+                     (is (= [["k.a" :put] ["k.a" :delete] ["k.b" :put] ["k.c" :purge]]
+                            (mapv (juxt :key :operation) @all))
+                         "the default keeps each marker's :operation visible")
+                     (is (wait-for #(= 2 (count @live)) 5000)
+                         ":ignore-deletes? true replays only live writes")
+                     (is (= [["k.a" :put] ["k.b" :put]] (mapv (juxt :key :operation) @live))
+                         "Tombstones and purge markers never reach the ignoring Watch")
+                     (is (not= ::timeout (deref (:initialized wl) 5000 ::timeout))
+                         ":initialized still resolves when markers are suppressed")
+                     (deref (kv/delete handle "k.b") 5000 ::timeout)
+                     (is (wait-for #(= 5 (count @all)) 5000)
+                         "a streamed Tombstone reaches the default Watch")
+                     (is (= :delete (:operation (last @all)))
+                         "the streamed Tombstone carries its :operation")
+                     (deref (kv/put handle "k.d" {:v 4}) 5000 ::timeout)
+                     (is (wait-for #(= 3 (count @live)) 5000)
+                         "the ignoring Watch stays live for subsequent writes")
+                     (is (= ["k.a" "k.b" "k.d"] (mapv :key @live))
+                         "the streamed Tombstone was suppressed; only the new write arrived")
+                     (finally (kv/stop wa) (kv/stop wl)))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx    (kv/kv conn)
+                          handle (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})]
+                    (with-bucket ctx bucket
+                      (fn []
+                        (let [all  (atom [])
+                              live (atom [])]
+                          (p/let [_     (kv/put handle "k.a" {:v 1})
+                                  _     (kv/delete handle "k.a")
+                                  _     (kv/put handle "k.b" {:v 2})
+                                  _     (kv/put handle "k.c" {:v 3})
+                                  _     (kv/purge handle "k.c")
+                                  wa    (kv/watch handle #(swap! all conj %) {:deliver :history})
+                                  wl    (kv/watch handle #(swap! live conj %) {:deliver :history :ignore-deletes? true})
+                                  init  (p/race [(:initialized wl) (p/delay 5000 ::timeout)])
+                                  hita? (wait-for #(= 4 (count @all)) 5000)
+                                  hitl? (wait-for #(= 2 (count @live)) 5000)]
+                            (-> (p/do
+                                  (is hita? "the default delivers delete and purge Entries")
+                                  (is (= [["k.a" :put] ["k.a" :delete] ["k.b" :put] ["k.c" :purge]]
+                                         (mapv (juxt :key :operation) @all))
+                                      "the default keeps each marker's :operation visible")
+                                  (is hitl? ":ignore-deletes? true replays only live writes")
+                                  (is (= [["k.a" :put] ["k.b" :put]] (mapv (juxt :key :operation) @live))
+                                      "Tombstones and purge markers never reach the ignoring Watch")
+                                  (is (not= ::timeout init)
+                                      ":initialized still resolves when markers are suppressed")
+                                  (p/let [_    (kv/delete handle "k.b")
+                                          hit? (wait-for #(= 5 (count @all)) 5000)]
+                                    (is hit? "a streamed Tombstone reaches the default Watch")
+                                    (is (= :delete (:operation (last @all)))
+                                        "the streamed Tombstone carries its :operation")
+                                    (p/let [_    (kv/put handle "k.d" {:v 4})
+                                            hit? (wait-for #(= 3 (count @live)) 5000)]
+                                      (is hit? "the ignoring Watch stays live for subsequent writes")
+                                      (is (= ["k.a" "k.b" "k.d"] (mapv :key @live))
+                                          "the streamed Tombstone was suppressed; only the new write arrived"))))
+                                (p/finally (fn [_ _] (kv/stop wa) (kv/stop wl)))))))))))))))
+
+;; A watch decode failure routes to the watch's :on-error when set — the bare
+;; ex-info, the Watch surviving to deliver the next Entry — else to the
+;; connection's :on-status as an :error event (ADR 0006/0007): the established
+;; sink semantics, identical to core subscriptions. The override is strict:
+;; with :on-error set, nothing reaches :on-status.
+(deftest watch-decode-failure-routes-to-sink
+  (let [bucket "TRACER_KV_WATCH_DECODE"]
+    #?(:clj
+       (let [statuses (atom [])]
+         (with-conn {:servers [server-url] :on-status #(swap! statuses conj %)}
+           (fn [conn]
+             (let [ctx     (deref (kv/kv conn) 5000 ::timeout)
+                   handle  (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)
+                   strings (deref (kv/open-bucket ctx bucket {:codec :string}) 5000 ::timeout)]
+               (with-bucket ctx bucket
+                 (fn []
+                   (deref (kv/put strings "k.bad" "#unreadable{") 5000 ::timeout)
+                   (deref (kv/put strings "k.good" "{:v 1}") 5000 ::timeout)
+                   (let [errs (atom [])
+                         seen (atom [])
+                         w1   (deref (kv/watch handle #(swap! seen conj %) {:on-error #(swap! errs conj %)}) 5000 ::timeout)]
+                     (try
+                       (is (wait-for #(and (pos? (count @errs)) (pos? (count @seen))) 5000)
+                           "the decode failure reaches :on-error while the Watch survives to deliver the next Entry")
+                       (is (= :codec-error (:type (ex-data (first @errs))))
+                           ":on-error receives the bare ex-info carrying the canonical :codec-error")
+                       (is (= [["k.good" {:v 1}]] (mapv (juxt :key :value) @seen))
+                           "the undecodable Entry is skipped; the decodable one still delivers")
+                       (is (empty? (filterv #(= :error (:type %)) @statuses))
+                           "with :on-error set, nothing reaches :on-status — the override is strict")
+                       (finally (kv/stop w1)))
+                     (let [w2 (deref (kv/watch handle (fn [_] nil)) 5000 ::timeout)]
+                       (try
+                         (is (wait-for #(some (fn [ev] (= :error (:type ev))) @statuses) 5000)
+                             "with no :on-error the decode failure reaches :on-status as an :error event")
+                         (let [ev (first (filterv #(= :error (:type %)) @statuses))]
+                           (is (= :codec-error (:type (ex-data (:error ev))))
+                               "the :error event wraps the bare ex-info under :error"))
+                         (finally (kv/stop w2)))))))))))
+       :cljs
+       (let [statuses (atom [])]
+         (async done
+                (with-conn {:servers [server-url] :on-status #(swap! statuses conj %)} done
+                  (fn [conn]
+                    (p/let [ctx     (kv/kv conn)
+                            handle  (kv/create-bucket ctx {:bucket bucket :storage :memory})
+                            strings (kv/open-bucket ctx bucket {:codec :string})]
+                      (with-bucket ctx bucket
+                        (fn []
+                          (let [errs (atom [])
+                                seen (atom [])]
+                            (p/let [_    (kv/put strings "k.bad" "#unreadable{")
+                                    _    (kv/put strings "k.good" "{:v 1}")
+                                    w1   (kv/watch handle #(swap! seen conj %) {:on-error #(swap! errs conj %)})
+                                    hit? (wait-for #(and (pos? (count @errs)) (pos? (count @seen))) 5000)]
+                              (-> (p/do
+                                    (is hit? "the decode failure reaches :on-error while the Watch survives to deliver the next Entry")
+                                    (is (= :codec-error (:type (ex-data (first @errs))))
+                                        ":on-error receives the bare ex-info carrying the canonical :codec-error")
+                                    (is (= [["k.good" {:v 1}]] (mapv (juxt :key :value) @seen))
+                                        "the undecodable Entry is skipped; the decodable one still delivers")
+                                    (is (empty? (filterv #(= :error (:type %)) @statuses))
+                                        "with :on-error set, nothing reaches :on-status — the override is strict"))
+                                  (p/finally (fn [_ _] (kv/stop w1)))
+                                  (p/then
+                                   (fn [_]
+                                     (p/let [w2   (kv/watch handle (fn [_] nil))
+                                             hit? (wait-for #(some (fn [ev] (= :error (:type ev))) @statuses) 5000)]
+                                       (-> (p/do
+                                             (is hit? "with no :on-error the decode failure reaches :on-status as an :error event")
+                                             (let [ev (first (filterv #(= :error (:type %)) @statuses))]
+                                               (is (= :codec-error (:type (ex-data (:error ev))))
+                                                   "the :error event wraps the bare ex-info under :error")))
+                                           (p/finally (fn [_ _] (kv/stop w2))))))))))))))))))))

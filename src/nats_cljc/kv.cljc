@@ -287,6 +287,17 @@
    :operation (:operation raw)
    :delta     (:delta raw)})
 
+(defn- watch-keys
+  "Normalize a watch `:keys` option — one subject-style key pattern or a sequence
+   of them — to nil (every key) or a non-empty vector of pattern strings, the one
+   shape the impls take. Patterns are subject-style (wildcards welcome), so they
+   are deliberately NOT `validate-key`-guarded — the `keys` filter precedent."
+  [ks]
+  (cond
+    (nil? ks)    nil
+    (string? ks) [ks]
+    :else        (when (seq ks) (vec ks))))
+
 (defn watch
   "Watch the Bucket `handle` for changes — the open-ended observation that feels
    exactly like a core subscription: each matching Entry (the `history` shape,
@@ -305,13 +316,28 @@
    streams only new changes (its `:initialized` resolves immediately — nothing
    replays). Any other value rejects pre-flight with a validation
    `:type :invalid-deliver` carrying the offending `:deliver`, before any native
-   call (ADR 0015)."
+   call (ADR 0015).
+
+   `:keys` restricts the Watch to one subject-style key pattern (e.g.
+   `\"user.>\"`) or a vector of patterns, delivering their union — replay and
+   stream alike; without it every key is watched. `:ignore-deletes?` true
+   suppresses Tombstone and purge-marker deliveries (the default delivers them,
+   `:operation` visible) — cache maintainers skip markers, event-log consumers
+   observe them. `:on-error` is this Watch's async-failure sink (ADR 0006/0007,
+   the core-subscription semantics): a decode failure, a throwing `handler`, or
+   a rejecting handler promise reaches it as the bare value when set, else the
+   connection's `:on-status` as an `:error` event — never both — and the Watch
+   survives to deliver the next Entry."
   ([handle handler] (watch handle handler {}))
   ([handle handler opts]
    (-> (impl/resolved nil)
        (impl/then (fn [_] (bucket/validate-deliver (:deliver opts :latest))))
        (impl/bind (fn [deliver]
-                    (proto/-kv-watch handle deliver
+                    (proto/-kv-watch handle
+                                     {:deliver         deliver
+                                      :keys            (watch-keys (:keys opts))
+                                      :ignore-deletes? (boolean (:ignore-deletes? opts))
+                                      :on-error        (:on-error opts)}
                                      (fn [raw] (handler (watch-entry handle raw)))))))))
 
 (defn stop
