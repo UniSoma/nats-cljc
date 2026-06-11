@@ -32,6 +32,16 @@
 ;; this key directly, exactly as `core/reply` threads `:reply`.
 (def ^:private ^:no-doc native-key ::native)
 
+;; The private key the handler-delivered message carries the Service's bound codec
+;; under (ADR 0011): `create` binds one codec — the connection default unless
+;; `:codec` in the create config overrides it — used to decode every request and
+;; encode every reply. `respond` / `respond-error` read it back off the `msg` the
+;; handler threads through, so a reply encodes in the Service's codec, not the bare
+;; connection default — exactly as `decode-request` decoded the request with it. A
+;; per-call `:codec` in `respond` opts still overrides this (the polyglot reply).
+;; Namespaced and undocumented, threaded only via the whole `msg`, like `::native`.
+(def ^:private ^:no-doc codec-key ::codec)
+
 ;; The two wire headers a service error reply carries — the same case-sensitive
 ;; names on both legs (jnats `ServiceMessage.NATS_SERVICE_ERROR*`, nats.js
 ;; `ServiceErrorHeader*`): the description and the integer code (carried as its
@@ -45,11 +55,14 @@
    public message the endpoint handler sees: `{:subject :data :reply ::native}`,
    `:data` decoded with the Service's bound `codec`. Mirrors core's `decode-msg`,
    but keeps the native service message under `::native` so `respond` can route
-   through it (ADR 0024); `:headers` is added only when the request carried some."
+   through it (ADR 0024) and the Service's bound `codec` under `::codec` so
+   `respond` / `respond-error` encode the reply with it (ADR 0011); `:headers` is
+   added only when the request carried some."
   [codec {:keys [subject bytes reply headers] :as raw}]
   (cond-> {:subject subject
            :reply   reply
            native-key (get raw native-key)
+           codec-key  codec
            :data    (codec/decode codec bytes)}
     (seq headers) (assoc :headers (msg/trim-headers headers))))
 
@@ -89,38 +102,58 @@
    promise applies per-endpoint backpressure. There is no Group noun — a consumer
    composes a grouped subject directly (ADR 0024).
 
-   The Service binds `conn`'s default codec at create, used to decode every request
-   and encode every reply (the `:codec` create override is the codec slice).
+   The Service binds ONE codec at create — `conn`'s default codec, unless `:codec`
+   in `config` (a registry keyword or `ICodec` instance) overrides it — used to
+   decode every request and encode every reply across all the Service's endpoints
+   (ADR 0011). A single `respond` / `respond-error` may still override the codec
+   per call. An unresolvable `:codec` rejects the create promise pre-flight.
 
    The resolved Service handle carries a `:stopped` key holding a platform-native
    promise that resolves to nil once the Service stops for any reason — the
    react-to-shutdown signal the lifecycle parallel of the Watch handle's
    `:initialized` (ADR 0024), so a consumer awaits it instead of polling."
   [conn {:keys [endpoints] :as config}]
-  (let [codec (:codec conn)]
-    (-> (impl/resolved nil)
-        (impl/then (fn [_] (config/validate-config config)))
-        (impl/bind (fn [_]
-                     (proto/-create-service
-                      conn (assoc config :endpoints (mapv #(prepare-endpoint codec %) endpoints))))))))
+  (-> (impl/resolved nil)
+      ;; Resolve the bound codec in a chain stage alongside validation, so an
+      ;; unresolvable `:codec` rejects the create promise pre-flight (ADR 0011/0015)
+      ;; rather than throwing synchronously: the create `:codec` override, resolved
+      ;; once into a `Prepared` (as `connect` does for the default), else the
+      ;; connection's already-resolved default.
+      (impl/then (fn [_]
+                   (config/validate-config config)
+                   (if (contains? config :codec)
+                     (codec/prepare (:codec config))
+                     (:codec conn))))
+      (impl/bind (fn [codec]
+                   (proto/-create-service
+                    conn (assoc config :endpoints (mapv #(prepare-endpoint codec %) endpoints)))))))
+
+(defn- reply-codec
+  "The codec a `respond` / `respond-error` reply encodes with: the per-call `:codec`
+   in `opts` overrides everything, else the Service's bound codec the handler's `msg`
+   carries under `::codec` (the create default or its `:codec` override), else — for
+   a `msg` not from a Service handler — the connection default (ADR 0011)."
+  [conn msg opts]
+  (or (:codec opts) (get msg codec-key) (:codec conn)))
 
 (defn respond
   "Reply to a request message `msg` (the one an endpoint handler received) with
-   `data`, encoding it with `conn`'s codec and answering through the request's
-   native service message so the owning endpoint's native stats stay correct (ADR
-   0024). Sugar over the native respond, the service analog of `core/reply`;
-   returns nil. `opts` may set `:codec` to override the connection default, so a
-   polyglot reply can match the request's codec (ADR 0011)."
+   `data`, encoding it with the Service's bound codec and answering through the
+   request's native service message so the owning endpoint's native stats stay
+   correct (ADR 0024). Sugar over the native respond, the service analog of
+   `core/reply`; returns nil. `opts` may set `:codec` to override the Service's
+   codec for this single reply, so a polyglot reply can match the request's codec
+   (ADR 0011)."
   ([conn msg data] (respond conn msg data {}))
   ([conn msg data opts]
    (proto/-respond conn (get msg native-key)
-                   (codec/encode (msg/effective-codec conn opts) data))
+                   (codec/encode (reply-codec conn msg opts) data))
    nil))
 
 (defn respond-error
   "Reply to a request message `msg` with a first-class service error (ADR 0025):
    an integer `code` and a string `description`, optionally carrying `data` as the
-   reply body (encoded with `conn`'s codec, as `respond`), routed through the
+   reply body (encoded with the Service's bound codec, as `respond`), routed through the
    request's native service message so the owning endpoint's native error stats
    stay correct. Sets the `Nats-Service-Error` / `Nats-Service-Error-Code` headers
    the caller reads back with `error`; conn is threaded as in `respond`. Returns nil.
@@ -130,7 +163,7 @@
    `(service/error reply)`, which is `{:code … :description …}` here (ADR 0025). A
    handler that throws or returns a rejected promise auto-replies the same shape
    with code 500; this is the explicit form. `opts` may set `:codec` to override the
-   connection default for the `data` encode (ADR 0011).
+   Service's codec for this single reply's `data` encode (ADR 0011).
 
    TERMINAL like a thrown handler: after sending the reply this THROWS to end the
    handler, so the native framework counts the request in the endpoint's `num_errors`
@@ -145,7 +178,7 @@
   ([conn msg code description data] (respond-error conn msg code description data {}))
   ([conn msg code description data opts]
    (proto/-respond-error conn (get msg native-key) code description
-                         (some->> data (codec/encode (msg/effective-codec conn opts))))
+                         (some->> data (codec/encode (reply-codec conn msg opts))))
    ;; End the handler so the native dispatch counts the endpoint error (see docstring).
    ;; A bare runtime exception on both legs: the JVM dispatcher's catch counts it and
    ;; sends a redundant auto-500 the single-reply caller never sees (it already has

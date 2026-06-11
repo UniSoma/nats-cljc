@@ -1,12 +1,12 @@
 ---
 id: nts-01ktvp1hsxc7
 title: 'Codec: bind at create, override per respond'
-status: open
+status: in_progress
 type: feature
 priority: 2
 mode: afk
 created: '2026-06-11T15:50:33.527082532Z'
-updated: '2026-06-11T15:50:33.527082532Z'
+updated: '2026-06-11T17:46:20.299142519Z'
 parent: nts-01ktvn87why4
 tags:
 - services

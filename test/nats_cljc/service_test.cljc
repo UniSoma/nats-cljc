@@ -151,6 +151,102 @@
                         (p/catch (fn [e]
                                    (is false (str "request rejected unexpectedly: " e))))))))))))
 
+;; The Service binds ONE codec at create — the connection default unless `:codec` in
+;; the create config overrides it — applied to BOTH request decode and response
+;; encode on every endpoint (ADR 0011). A single respond / respond-error may override
+;; the codec per call. Connection default is :edn; the Service overrides to :string.
+;;
+;; The :string / :edn round-trip is the discriminator. The caller sends the map
+;; {:n 7} with the connection default :edn, so the request bytes are the EDN text
+;; "{:n 7}". If the Service decoded with :string it sees the raw STRING "{:n 7}" (not
+;; the map), echoes it, and :string-encodes it back to the raw bytes `{:n 7}`. The
+;; caller then reads the reply two ways: decoding with :string yields the string
+;; "{:n 7}" (proving the Service's bound :string decoded the request — it echoed a
+;; string, not a map), and decoding with :edn yields the MAP {:n 7} (proving the
+;; Service's bound :string ENCODED the reply — had it wrongly used the :edn default,
+;; the bytes would be the quoted "\"{:n 7}\"" and the :edn decode would give the
+;; string, not the map). That :edn-decode = map assertion is the red-before-green
+;; lever: the pre-slice respond, encoding with the connection :edn default, fails it.
+;;
+;; The override endpoint flips it back per call: the Service is :string, but its
+;; handler responds the string "hi" with a per-call {:codec :edn} override, so the
+;; reply bytes are the EDN text "\"hi\"". The caller :edn-decodes that to the string
+;; "hi"; had the override been ignored and the Service's :string used, the bytes
+;; would be the bare `hi` and the :edn decode would give the SYMBOL hi — so the
+;; string "hi" proves just that one reply honored the override. respond-error does
+;; the same for its data? body.
+(deftest codec-binds-at-create-and-overrides-per-respond
+  (let [config {:name "codec_svc" :version "0.1.0"
+                :codec :string
+                :endpoints [{:name "echo" :subject "codec.svc.echo"     :handler (fn [_] :placeholder)}
+                            {:name "ovr"  :subject "codec.svc.ovr"      :handler (fn [_] :placeholder)}
+                            {:name "ovre" :subject "codec.svc.ovre"     :handler (fn [_] :placeholder)}]}]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           ;; conn default codec is :edn (no :codec on connect).
+           (let [cfg (-> config
+                         ;; Service codec :string: echo back the decoded request as the Service saw it.
+                         (assoc-in [:endpoints 0 :handler]
+                                   (fn [msg] (service/respond conn msg (:data msg))))
+                         ;; Per-call :edn override on respond.
+                         (assoc-in [:endpoints 1 :handler]
+                                   (fn [msg] (service/respond conn msg "hi" {:codec :edn})))
+                         ;; Per-call :edn override on respond-error's data.
+                         (assoc-in [:endpoints 2 :handler]
+                                   (fn [msg] (service/respond-error conn msg 400 "nope" "bad" {:codec :edn}))))
+                 svc (deref (service/create conn cfg) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 ;; echo: caller sends the map {:n 7} with the connection :edn default.
+                 (let [as-string (deref (nats/request conn "codec.svc.echo" {:n 7} {:timeout-ms 5000 :codec :string}) 5000 ::timeout)
+                       as-edn    (deref (nats/request conn "codec.svc.echo" {:n 7} {:timeout-ms 5000}) 5000 ::timeout)]
+                   (is (= "{:n 7}" (:data as-string))
+                       "request decode honored the Service's bound :string (it echoed the raw string, not the map)")
+                   (is (= {:n 7} (:data as-edn))
+                       "response encode honored the Service's bound :string (the reply bytes :edn-decode to the map)"))
+                 ;; ovr: per-call :edn override on respond, read back with the connection :edn default.
+                 (let [reply (deref (nats/request conn "codec.svc.ovr" {} {:timeout-ms 5000}) 5000 ::timeout)]
+                   (is (= "hi" (:data reply))
+                       "respond's per-call :codec override encoded just this reply in :edn"))
+                 ;; ovre: per-call :edn override on respond-error's data.
+                 (let [err (deref (nats/request conn "codec.svc.ovre" {} {:timeout-ms 5000}) 5000 ::timeout)]
+                   (is (= {:code 400 :description "nope"} (service/error err))
+                       "the error reply reads back its {:code :description}")
+                   (is (= "bad" (:data err))
+                       "respond-error's per-call :codec override encoded the error reply's data in :edn")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [cfg (-> config
+                                (assoc-in [:endpoints 0 :handler]
+                                          (fn [msg] (service/respond conn msg (:data msg))))
+                                (assoc-in [:endpoints 1 :handler]
+                                          (fn [msg] (service/respond conn msg "hi" {:codec :edn})))
+                                (assoc-in [:endpoints 2 :handler]
+                                          (fn [msg] (service/respond-error conn msg 400 "nope" "bad" {:codec :edn}))))]
+                    (-> (service/create conn cfg)
+                        (p/then (fn [svc]
+                                  (with-service svc
+                                    (fn []
+                                      (p/let [as-string (nats/request conn "codec.svc.echo" {:n 7} {:timeout-ms 5000 :codec :string})
+                                              as-edn    (nats/request conn "codec.svc.echo" {:n 7} {:timeout-ms 5000})
+                                              reply     (nats/request conn "codec.svc.ovr" {} {:timeout-ms 5000})
+                                              err       (nats/request conn "codec.svc.ovre" {} {:timeout-ms 5000})]
+                                        (is (= "{:n 7}" (:data as-string))
+                                            "request decode honored the Service's bound :string (it echoed the raw string, not the map)")
+                                        (is (= {:n 7} (:data as-edn))
+                                            "response encode honored the Service's bound :string (the reply bytes :edn-decode to the map)")
+                                        (is (= "hi" (:data reply))
+                                            "respond's per-call :codec override encoded just this reply in :edn")
+                                        (is (= {:code 400 :description "nope"} (service/error err))
+                                            "the error reply reads back its {:code :description}")
+                                        (is (= "bad" (:data err))
+                                            "respond-error's per-call :codec override encoded the error reply's data in :edn"))))))
+                        (p/catch (fn [e]
+                                   (is false (str "request rejected unexpectedly: " e))))))))))))
+
 ;; An endpoint's :subject defaults to its :name when omitted: the handler must be
 ;; reachable on the :name as a subject when no :subject is given.
 (deftest endpoint-subject-defaults-to-name
