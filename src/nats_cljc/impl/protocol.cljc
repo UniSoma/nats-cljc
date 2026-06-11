@@ -399,6 +399,43 @@
      the watch sibling of `-unsubscribe`. Idempotent: stopping an already-ended
      Watch is a silent no-op (ADR 0012 spirit)."))
 
+(defprotocol Service
+  "Hosting a Service (ADR 0024) — EXTENDED onto each platform's Connection record
+   from the service impl namespaces (`nats-cljc.service.impl.*`), never implemented
+   inline on the record, so the `@nats-io/services` import stays out of a core-only
+   CLJS bundle (ADR 0016/0026). Unlike `-kv`/`-jetstream` there is no context and
+   nothing is verified at entry: `-create-service` hangs directly off the
+   Connection (ADR 0024). The facade owns the public arglists, the codec seam (the
+   handler's raw bytes are decoded there, the respond value encoded there), and the
+   ADR-0007 Handler delivery; these deal in raw wire bytes and the per-leg native
+   service message."
+  (-create-service [conn config]
+    "Create and start a Service from the portable `config`
+     `{:name :version :description :metadata :endpoints}`, returning a native
+     promise of a running Service handle — a platform record satisfying
+     `ServiceLifecycle`. Each endpoint `{:name :subject :handler :queue-group
+     :metadata}` (already defaulted by the facade — `:subject` is non-nil) binds a
+     queue-subscribed native handler; `handler` is the LOW-LEVEL handler, invoked
+     per request with a raw map `{:subject :bytes :reply :headers ::native}` where
+     `::native` is the per-leg native service message `-respond` routes a reply
+     through so native per-endpoint stats stay correct. The handler is an ADR-0007
+     push Handler (serial per endpoint, may return a native promise for
+     backpressure).")
+  (-respond [conn native bytes]
+    "Reply to the request whose native service message is `native` with raw
+     `bytes`, routing through that native message (not a bare publish to the reply
+     subject) so the owning endpoint's native stats stay correct — the service
+     analog of `-publish` to a reply subject, threading `conn` as jnats'
+     `ServiceMessage.respond(conn, bytes)` requires. Returns nil."))
+
+(defprotocol ServiceLifecycle
+  "A running Service's lifecycle — implemented by the per-leg Service handle record
+   `-create-service` resolves with."
+  (-stop-service [svc]
+    "Stop the Service and tear it down, returning a native promise that settles
+     once it has stopped — enough for test teardown (full drain semantics and the
+     `:stopped` promise are the lifecycle slice's job)."))
+
 (defprotocol OrderedPull
   "The pull triad over an Ordered consumer handle (the value `-js-ordered-consumer`
    resolves) — EXTENDED onto each platform's ordered record from the impl

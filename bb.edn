@@ -43,7 +43,7 @@
              (System/exit exit)))}
 
   bundle:check
-  {:doc "Bundle-isolation guard (ADR 0016) — release the core-only :core-bundle-check build and fail if the optimized bundle contains any @nats-io/jetstream or @nats-io/kv bytes. Local needs JDK 23+ (uses :silence-unsafe)."
+  {:doc "Bundle-isolation guard (ADR 0016) — release the core-only :core-bundle-check build and fail if the optimized bundle contains any @nats-io/jetstream, @nats-io/kv or @nats-io/services bytes. Local needs JDK 23+ (uses :silence-unsafe)."
    :requires ([babashka.fs :as fs]
               [babashka.process :as p]
               [clojure.string :as str])
@@ -56,15 +56,18 @@
                                :let  [content (str/lower-case (slurp (fs/file f)))]
                                ;; "$kv." is @nats-io/kv's subject-prefix literal ($KV.<bucket>.>),
                                ;; the KV marker that survives :advanced the way "$js.api" does.
-                               marker ["jetstream" "$js.api" "$kv."]
+                               ;; "$srv" is @nats-io/services' ServiceApiPrefix runtime constant
+                               ;; ($SRV.PING|INFO|STATS.*), the Services marker that survives :advanced
+                               ;; the same way (verified red on a service-bearing bundle, ADR 0024/0026).
+                               marker ["jetstream" "$js.api" "$kv." "$srv"]
                                :when (str/includes? content marker)]
                            (str (fs/file-name f) " contains \"" marker "\""))]
                (if (seq hits)
-                 (do (println "\nbundle:check FAILED — the core-only bundle contains JetStream/KV bytes:")
+                 (do (println "\nbundle:check FAILED — the core-only bundle contains JetStream/KV/Services bytes:")
                      (doseq [h hits] (println "  " h))
-                     (println "A [\"@nats-io/jetstream\"] or [\"@nats-io/kv\"] import leaked into a core-reachable namespace (ADR 0016 keeps each confined to its area's impl namespaces).")
+                     (println "A [\"@nats-io/jetstream\"], [\"@nats-io/kv\"] or [\"@nats-io/services\"] import leaked into a core-reachable namespace (ADR 0016 keeps each confined to its area's impl namespaces).")
                      (System/exit 1))
-                 (println "bundle:check OK — core-only bundle is JetStream-free and KV-free."))))}
+                 (println "bundle:check OK — core-only bundle is JetStream-free, KV-free and Services-free."))))}
 
   pre_start
   {:doc "Start dev daemons (idempotent) — nREPL :7888 + the anon/token/users/jwt nats-servers. Backs `bb pre_start` in .aishell/config.yaml."

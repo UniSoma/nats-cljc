@@ -37,19 +37,21 @@
    :modules {:main {:entries [nats-cljc.core
                               nats-cljc.jetstream
                               nats-cljc.kv
+                              nats-cljc.service
                               nats-cljc.codec
                               nats-cljc.codec.json
                               nats-cljc.codec.transit]}}}
 
   ;; Bundle-isolation guard (ADR 0016): a core-only entry — nats-cljc.core and
-  ;; nothing else — released to an optimized browser bundle. @nats-io/jetstream
-  ;; and @nats-io/kv are declared unconditionally in src/deps.cljs, but shadow
-  ;; only bundles an npm package that a reachable namespace actually requires, so
-  ;; this bundle must contain zero JetStream or KV bytes. `bb bundle:check` (and
-  ;; CI) compiles this and scans the output for JetStream/KV markers; a hit means
-  ;; a ["@nats-io/jetstream"] or ["@nats-io/kv"] import leaked into a
-  ;; core-reachable namespace (e.g. folded into nats-cljc.impl.js) and core-only
-  ;; consumers would ship it.
+  ;; nothing else — released to an optimized browser bundle. @nats-io/jetstream,
+  ;; @nats-io/kv and @nats-io/services are declared unconditionally in
+  ;; src/deps.cljs, but shadow only bundles an npm package that a reachable
+  ;; namespace actually requires, so this bundle must contain zero JetStream, KV
+  ;; or Services bytes. `bb bundle:check` (and CI) compiles this and scans the
+  ;; output for JetStream/KV/Services markers; a hit means a ["@nats-io/jetstream"],
+  ;; ["@nats-io/kv"] or ["@nats-io/services"] import leaked into a core-reachable
+  ;; namespace (e.g. folded into nats-cljc.impl.js) and core-only consumers would
+  ;; ship it.
   :core-bundle-check
   {:target     :browser
    :output-dir "target/core-bundle-check"
