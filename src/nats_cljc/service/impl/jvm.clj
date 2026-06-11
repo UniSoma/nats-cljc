@@ -245,18 +245,26 @@
     Connection$Status/CONNECTED (ex-info "Connection is draining" {:type :drained} e)
     e))
 
+(defn- narrow-id
+  "Client-side `:id` narrowing for a broadcast discovery: the $SRV control subjects
+   only encode name[.id], so an `:id` without a `:name` broadcasts and filters the
+   gathered vector on the instance `:id` — identical with the JS leg."
+  [results {:keys [name id]}]
+  (if (and id (not name)) (filterv #(= id (:id %)) results) results))
+
 (defn- discover
   "Run the blocking Discovery fan-out `f` off the caller's thread (ADR 0002,
-   `off-thread`), normalizing a non-open-connection failure to its canonical
-   `:type` (ADR 0006) so a discovery rejection never leaks the raw jnats
-   IllegalStateException — the consumer branches on `(:type (ex-data e))`
-   identically with the JS leg's `gather`."
+   `off-thread`), apply the client-side `:id`-only narrowing (`narrow-id`), and
+   normalize a non-open-connection failure to its canonical `:type` (ADR 0006) so
+   a discovery rejection never leaks the raw jnats IllegalStateException — the
+   consumer branches on `(:type (ex-data e))` identically with the JS leg's
+   `gather`."
   [^Connection client io-executor opts f]
   (off-thread
    io-executor
    (fn []
      (try
-       (f (discovery client opts))
+       (narrow-id (f (discovery client opts)) opts)
        (catch IllegalStateException e
          (throw (discovery-state-error client e)))))))
 

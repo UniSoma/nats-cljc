@@ -221,9 +221,17 @@
        :endpoints (mapv stats-endpoint->edn (.-endpoints s))}
       (assoc-some :metadata (some-> (.-metadata s) (js->clj :keywordize-keys true)))))
 
+(defn- narrow-id
+  "Client-side `:id` narrowing for a broadcast discovery: the $SRV control subjects
+   only encode name[.id], so an `:id` without a `:name` broadcasts and filters the
+   gathered vector on the instance `:id` — identical with the JVM leg."
+  [results {:keys [name id]}]
+  (if (and id (not name)) (filterv #(= id (:id %)) results) results))
+
 (defn- gather
   "Drive one discovery verb: build a bounded ServiceClient, run `(verb-fn client)`
-   (it resolves a QueuedIterator), drain it through `f`, and normalize a
+   (it resolves a QueuedIterator), drain it through `f`, apply the client-side
+   `:id`-only narrowing (`narrow-id`), and normalize a
    no-responders rejection — a narrowed fan-out that reached nobody — to an empty
    VECTOR, so the gather matches the JVM `Discovery` List that swallows the same
    condition (ADR 0024). A fan-out on a non-open connection is normalized to its
@@ -234,7 +242,7 @@
   [client opts verb-fn f]
   (let [c (.client (services/Svcm. client) (->request-many-opts opts))]
     (-> (verb-fn c)
-        (.then (fn [qi] (drain qi f)))
+        (.then (fn [qi] (.then (drain qi f) #(narrow-id % opts))))
         (.catch (fn [e]
                   (cond
                     (core/no-responders? e) []
@@ -248,9 +256,24 @@
 
 (extend-type core/JsConnection
   proto/Discovery
+  ;; A control subject token is only passed when present — an absent :name (or :id)
+  ;; broadcasts rather than interpolating an empty token into the subject; the
+  ;; :id-only case is narrowed client-side by `gather`'s `narrow-id`.
   (-ping [{:keys [client]} {:keys [name id] :as opts}]
-    (gather client opts #(.ping ^js % (or name "") (or id "")) ping->edn))
+    (gather client opts
+            (fn [^js c] (cond (and name id) (.ping c name id)
+                              name          (.ping c name)
+                              :else         (.ping c)))
+            ping->edn))
   (-info [{:keys [client]} {:keys [name id] :as opts}]
-    (gather client opts #(.info ^js % (or name "") (or id "")) info->edn))
+    (gather client opts
+            (fn [^js c] (cond (and name id) (.info c name id)
+                              name          (.info c name)
+                              :else         (.info c)))
+            info->edn))
   (-stats [{:keys [client]} {:keys [name id] :as opts}]
-    (gather client opts #(.stats ^js % (or name "") (or id "")) stats->edn)))
+    (gather client opts
+            (fn [^js c] (cond (and name id) (.stats c name id)
+                              name          (.stats c name)
+                              :else         (.stats c)))
+            stats->edn)))

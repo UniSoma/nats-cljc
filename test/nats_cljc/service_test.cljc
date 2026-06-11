@@ -819,6 +819,49 @@
                                       (check pn pi pw))))))
                       (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
 
+;; :id alone — no :name — narrows to that one instance: with two instances of the
+;; same Service running, an :id-only ping resolves exactly the matching instance.
+;; The $SRV control subjects only encode name.id, so the legs broadcast and filter
+;; client-side; identical on both legs.
+(deftest discovery-narrows-by-id-alone
+  (let [config {:name "disc_idonly" :version "1.0.0"
+                :endpoints [{:name "e" :subject "disc.idonly.e" :handler (fn [_] :placeholder)}]}
+        ;; Bound the broadcast so the gather terminates without waiting the full
+        ;; default window; high enough to reach both instances plus bystanders.
+        opts   (fn [id] {:id id :timeout-ms 1500 :max-results 50})
+        check  (fn [both narrowed]
+                 (is (= 2 (count both)) "two instances of the Service are up")
+                 (is (apply distinct? (mapv :id both)) "the instances have distinct :ids")
+                 (is (= [(first both)] narrowed)
+                     ":id alone resolves exactly the matching instance"))]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [svc-a (deref (service/create conn config) 5000 ::timeout)
+                 svc-b (deref (service/create conn config) 5000 ::timeout)]
+             (with-service svc-a
+               (fn []
+                 (with-service svc-b
+                   (fn []
+                     (let [both (deref (service/ping conn {:name "disc_idonly"}) 10000 ::timeout)
+                           id   (:id (first both))]
+                       (check both
+                              (deref (service/ping conn (opts id)) 10000 ::timeout))))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (p/let [svc-a (service/create conn config)
+                              svc-b (service/create conn config)]
+                        (with-service svc-a
+                          (fn []
+                            (with-service svc-b
+                              (fn []
+                                (p/let [both     (service/ping conn {:name "disc_idonly"})
+                                        narrowed (service/ping conn (opts (:id (first both))))]
+                                  (check both narrowed)))))))
+                      (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
+
 ;; :max-results and :timeout-ms bound the fan-out so the gather terminates
 ;; predictably: a tiny :timeout-ms still resolves (does not hang), and :max-results
 ;; caps the vector length. Asserted against this one Service narrowed by :name.

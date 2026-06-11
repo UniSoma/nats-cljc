@@ -213,10 +213,11 @@
    any other, narrowed by `opts`.
 
    `opts` (all optional): `:name` narrows to Services of that name, `:id` to a single
-   instance (with `:name`); `:max-results` and `:timeout-ms` BOUND the `$SRV.PING`
-   fan-out so the gather terminates predictably even when the Service count is
-   unknown — `:max-results` stops after that many replies, `:timeout-ms` after that
-   long. A zero-endpoint Service still answers, so it is discoverable here.
+   instance, alone or together with `:name`; `:max-results` and `:timeout-ms` BOUND
+   the `$SRV.PING` fan-out so the gather terminates predictably even when the
+   Service count is unknown — `:max-results` stops after that many replies,
+   `:timeout-ms` after that long. A zero-endpoint Service still answers, so it is
+   discoverable here.
 
    The result is normalized byte-identically across legs: kebab-case EDN with the
    wire `type` discriminator dropped."
