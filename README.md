@@ -5,7 +5,7 @@
 [![Clojars](https://img.shields.io/clojars/v/io.github.unisoma/nats-cljc.svg)](https://clojars.org/io.github.unisoma/nats-cljc)
 [![CI](https://github.com/unisoma/nats-cljc/actions/workflows/ci.yml/badge.svg)](https://github.com/unisoma/nats-cljc/actions/workflows/ci.yml)
 
-> **Status: `0.3.0`.** The Phase 1 core, the Phase 1.5 blocking layer, and Phase 2 JetStream (`nats-cljc.jetstream`) are implemented, tested on the JVM, Node, and the browser, and published to Clojars. Being pre-1.0, the API may still evolve as KV, Object Store, and the async adapters (Phases 3–5) land — but within [ADR 0009](./docs/adr/0009-project-foundations-and-versioning.md)'s stability discipline: adding a normalized vocabulary member is a minor bump, renaming or removing one is a major bump. The decisions behind every choice live in [`CONTEXT.md`](./CONTEXT.md) (glossary) and [`docs/adr/`](./docs/adr/) (architecture decision records).
+> **Status: `0.4.0`.** The Phase 1 core, the Phase 1.5 blocking layer, Phase 2 JetStream (`nats-cljc.jetstream`), and Phase 3 KV (`nats-cljc.kv`) are implemented, tested on the JVM, Node, and the browser, and published to Clojars. Being pre-1.0, the API may still evolve as Object Store and the async adapters (Phases 4–5) land — but within [ADR 0009](./docs/adr/0009-project-foundations-and-versioning.md)'s stability discipline: adding a normalized vocabulary member is a minor bump, renaming or removing one is a major bump. The decisions behind every choice live in [`CONTEXT.md`](./CONTEXT.md) (glossary) and [`docs/adr/`](./docs/adr/) (architecture decision records).
 
 ---
 
@@ -25,7 +25,7 @@ There are good NATS wrappers for the JVM (e.g. [clj-nats](https://github.com/cjo
 
 ```clojure
 ;; deps.edn
-io.github.unisoma/nats-cljc {:mvn/version "0.3.0"}
+io.github.unisoma/nats-cljc {:mvn/version "0.4.0"}
 ```
 
 That coordinate pulls in only the JVM client **`io.nats:jnats`** transitively. It deliberately forces **no other runtime dependency** — no async library (one-shot operations return the platform-native promise; see [Composing results](#composing-results)) and no serialization library (the default `:edn` codec uses only Clojure core; see [Codecs](#codecs)). On ClojureScript you additionally install the JS client yourself (shadow-cljs reads it from our `deps.cljs`):
@@ -209,6 +209,30 @@ The returned promise is a native `js/Promise`, so on CLJS you can use the langua
     (js/console.log (clj->js (:data reply)))))
 ```
 
+## KV (`nats-cljc.kv`)
+
+A portable facade over NATS Key/Value — the last-value registry built on JetStream. It speaks KV vocabulary throughout, never the stream substrate ([ADR 0023](./docs/adr/0023-kv-speaks-kv-vocabulary-not-its-stream-substrate.md)): Buckets and Revisions, `:bucket-not-found` rather than `:stream-not-found`, `:wrong-revision` rather than `:wrong-last-sequence`.
+
+```clojure
+(require '[nats-cljc.kv :as kv])
+
+(p/let [ctx    (kv/kv conn)                                   ; verified at entry
+        bucket (kv/create-bucket ctx {:bucket "config" :history 5})
+        rev    (kv/put bucket "service.timeout-ms" 5000)      ; → new Revision
+        entry  (kv/get bucket "service.timeout-ms")]
+  (println "current:" (:value entry))                         ; decoded via the Bucket's codec
+  (kv/update bucket "service.timeout-ms" 7500 rev))           ; compare-and-set
+```
+
+- **Entries are plain maps** — `{:bucket :key :value :revision :created :operation}`. `get` on an absent key resolves to `nil` (a normal outcome to branch on, not an error); a stored nil stays distinguishable as `{:value nil …}`. A `get` may pin `{:revision n}` to read an exact past Revision.
+- **Compare-and-set** — `create` writes only when the key is absent; `update` only when the expected Revision is still latest. A lost race rejects with `:wrong-revision`.
+- **Tombstones and history** — `delete` keeps the key's history readable; `purge` erases it down to a marker; `purge-deletes` reclaims every Tombstoned key Bucket-wide; `history` returns the retained Entries oldest-to-newest, markers visible; `keys` enumerates the live keys (optionally filtered, e.g. `"user.>"`).
+- **Watch** — each matching Entry is pushed to a handler under the same promise-return backpressure contract as core subscriptions. `:deliver` chooses the replay (`:latest` default / `:history` / `:updates`), `:keys` filters by subject-style patterns, `:ignore-deletes?` suppresses markers, `:on-error` is the per-watch failure sink. The handle's `:initialized` promise resolves when the replay completes — the "cache is warm" signal — and `stop` ends it, idempotently.
+- **One codec per Bucket** — bound at `create-bucket`/`open-bucket` (the connection default unless overridden there); a Bucket's values are homogeneous, never per-operation choices.
+- **Operators** — `bucket-names`, `list-buckets`, `bucket-status`, `delete-bucket`.
+
+On ClojureScript, `@nats-io/kv` is version-pinned and installed automatically alongside the core client; a bundle that never requires `nats-cljc.kv` ships zero KV bytes.
+
 ## JVM-only: blocking convenience layer
 
 When you want synchronous ergonomics on the JVM, require the parallel blocking tree instead. Same verb names; one-shots block, and subscriptions become a **pull loop** the async core can't offer:
@@ -230,7 +254,7 @@ When you want synchronous ergonomics on the JVM, require the parallel blocking t
 - **Phase 1** ✅ *(0.1.0)* — Core NATS: pub/sub, queue groups, request/reply, headers, codecs, lifecycle/status, errors.
 - **Phase 1.5** ✅ *(0.1.0)* — `nats-cljc.blocking.core`.
 - **Phase 2** ✅ *(0.2.0)* — JetStream (`nats-cljc.jetstream`): streams, consumers, acked publish, ack/nak/term; pull consumers delivered through the same promise-return handler as core subscriptions for backpressure (core.async/missionary adapters land in Phase 5).
-- **Phase 3** — KV (`nats-cljc.kv`), on a direct-get foundation (`getMessage`, `:no-message-found`).
+- **Phase 3** ✅ *(0.4.0)* — KV (`nats-cljc.kv`): Bucket lifecycle and operator surface, compare-and-set writes, Tombstones/history/archaeology, and watches — speaking KV vocabulary, never its stream substrate (ADR 0023). Also shipped: JetStream direct get (`jetstream/get-message`, `:no-message-found`).
 - **Phase 4** — Object Store (`nats-cljc.object`).
 - **Phase 5** — core.async + missionary subscription adapters; `request-many` scatter-gather.
 

@@ -9,8 +9,72 @@ bump, renaming or removing one is a major bump (see ADR 0009).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-11
+
+Phase 3: KV, tested on the JVM and Node. One new portable namespace,
+`nats-cljc.kv`, speaking KV vocabulary throughout — Buckets, Entries,
+Revisions — never its stream substrate (ADR 0023). All new vocabulary is
+additive ⇒ minor bump (ADR 0009).
+
 ### Added
 
+- **KV context** — `(kv conn)` resolves to the handle every Bucket-lifecycle
+  operation flows through, verified at entry exactly like the JetStream
+  context: a server or account without JetStream rejects with
+  `:jetstream-not-enabled` at the handle, not on the first operation
+  (ADR 0017).
+- **Bucket lifecycle** — `create-bucket`, `open-bucket`, and `delete-bucket`,
+  configured by the same portable closed kebab-keyword config maps as streams
+  (`:bucket`, `:history`, `:ttl-ms`, `:storage`, `:replicas`, …; an
+  unrecognized key is `:unknown-config-key`, an omitted `:bucket` is
+  `:missing-required-key`). Opening verifies the Bucket exists, rejecting with
+  the new operational `:type :bucket-not-found` — the KV face of
+  `:stream-not-found` (ADR 0023). The resolved Bucket handle binds the
+  Bucket's one Codec (the connection default, or an open/create-time `:codec`
+  override) — a Bucket's values are homogeneous, never per-operation choices.
+- **Operator surface** — `bucket-names`, `list-buckets`, and `bucket-status`,
+  resolving fully-realized vectors and one normalized status map shape
+  (config as applied plus the `:values`/`:bytes` counters), identical on every
+  platform.
+- **Entry round trip** — `put` and `get` through the Bucket's Codec: `put`
+  resolves the new Revision as a bare number; `get` resolves an Entry — a
+  plain map `{:bucket :key :value :revision :created :operation}` — or nil
+  for an absent key (absence is a normal outcome to branch on, not an Error;
+  a stored nil stays distinguishable as `{:value nil …}`). A malformed key is
+  the new validation `:type :invalid-key`, pre-flight on every entry
+  operation.
+- **Compare-and-set** — `create` (write only when absent — first-writer-wins
+  locks and initialization) and `update` (write only when the expected
+  Revision is still latest). A lost race rejects with the new operational
+  `:type :wrong-revision` carrying the contested `:key` — one canonical face
+  for both verbs, KV vocabulary rather than the substrate's
+  `:wrong-last-sequence` (ADR 0023).
+- **Tombstones and history** — `delete` (a Tombstone: the key reads as absent
+  while history retains the deletion, observable as an Entry with a delete
+  `:operation`), `purge` (erase one key's history down to a purge marker),
+  both with an optional `:revision` guard rejecting stale guards as
+  `:wrong-revision`; `purge-deletes` (the Bucket-wide janitor: every
+  Tombstoned key's retained history removed, marker included, immediately and
+  deterministically on both legs); and `history` — the retained Entries of a
+  key oldest-to-newest, markers visible, each Entry carrying `:delta`.
+- **History archaeology** — `get` takes an optional `:revision` pinning the
+  read to an exact past Revision (markers stay visible, never hidden), and
+  `keys` enumerates a Bucket's live keys, optionally restricted by a
+  subject-style filter.
+- **Watch** — `watch` pushes each matching Entry to a handler under the core
+  subscription contract (serial delivery; a returned promise suspends the
+  next delivery — ADR 0007), with a closed `:deliver` mode (`:latest` default
+  / `:history` / `:updates`; anything else is the new validation
+  `:type :invalid-deliver`), `:keys` pattern filtering (one subject-style
+  pattern or a vector — their union), `:ignore-deletes?` to suppress marker
+  deliveries, and a per-watch `:on-error` sink with the core-subscription
+  override semantics. The watch handle carries an `:initialized` promise —
+  the "cache is warm" signal — and `stop` ends it, idempotently.
+- **ClojureScript packaging** — `@nats-io/kv` is installed automatically and
+  version-pinned in lockstep with the core client, exactly like
+  `@nats-io/jetstream`; the KV import is confined to the KV impl namespace,
+  so a bundle that never requires `nats-cljc.kv` ships zero KV bytes
+  (ADR 0016).
 - **JetStream direct get** — `nats-cljc.jetstream/get-message`: a one-shot,
   promise-returning read of a stored message straight off a Stream, by stream
   sequence (`{:seq n}`) or newest-on-subject (`{:last-by-subject subj}`),
@@ -141,7 +205,8 @@ Node, and the browser.
 - **JVM-only blocking convenience layer** (`nats-cljc.blocking.core`) — the same
   verb names, synchronous, with a pull-based subscription model.
 
-[Unreleased]: https://github.com/unisoma/nats-cljc/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/unisoma/nats-cljc/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/unisoma/nats-cljc/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/unisoma/nats-cljc/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/unisoma/nats-cljc/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/unisoma/nats-cljc/compare/v0.1.0...v0.1.1
