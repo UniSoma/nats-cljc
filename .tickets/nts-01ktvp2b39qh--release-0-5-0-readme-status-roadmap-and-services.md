@@ -1,12 +1,12 @@
 ---
 id: nts-01ktvp2b39qh
 title: 'Release 0.5.0: README status, roadmap, and services usage docs'
-status: open
+status: in_progress
 type: task
 priority: 2
 mode: afk
 created: '2026-06-11T15:50:59.391720262Z'
-updated: '2026-06-11T15:50:59.391720262Z'
+updated: '2026-06-11T18:44:18.771113500Z'
 parent: nts-01ktvn87why4
 tags:
 - services

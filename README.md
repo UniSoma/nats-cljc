@@ -5,7 +5,7 @@
 [![Clojars](https://img.shields.io/clojars/v/io.github.unisoma/nats-cljc.svg)](https://clojars.org/io.github.unisoma/nats-cljc)
 [![CI](https://github.com/unisoma/nats-cljc/actions/workflows/ci.yml/badge.svg)](https://github.com/unisoma/nats-cljc/actions/workflows/ci.yml)
 
-> **Status: `0.4.0`.** The Phase 1 core, the Phase 1.5 blocking layer, Phase 2 JetStream (`nats-cljc.jetstream`), and Phase 3 KV (`nats-cljc.kv`) are implemented, tested on the JVM, Node, and the browser, and published to Clojars. Being pre-1.0, the API may still evolve as services, Object Store, and the async adapters (Phases 4–6) land — but within [ADR 0009](./docs/adr/0009-project-foundations-and-versioning.md)'s stability discipline: adding a normalized vocabulary member is a minor bump, renaming or removing one is a major bump. The decisions behind every choice live in [`CONTEXT.md`](./CONTEXT.md) (glossary) and [`docs/adr/`](./docs/adr/) (architecture decision records).
+> **Status: `0.5.0`.** The Phase 1 core, the Phase 1.5 blocking layer, Phase 2 JetStream (`nats-cljc.jetstream`), Phase 3 KV (`nats-cljc.kv`), and Phase 4 services (`nats-cljc.service`) are implemented, tested on the JVM, Node, and the browser, and published to Clojars. Being pre-1.0, the API may still evolve as Object Store and the async adapters (Phases 5–6) land — but within [ADR 0009](./docs/adr/0009-project-foundations-and-versioning.md)'s stability discipline: adding a normalized vocabulary member is a minor bump, renaming or removing one is a major bump. The decisions behind every choice live in [`CONTEXT.md`](./CONTEXT.md) (glossary) and [`docs/adr/`](./docs/adr/) (architecture decision records).
 
 ---
 
@@ -25,7 +25,7 @@ There are good NATS wrappers for the JVM (e.g. [clj-nats](https://github.com/cjo
 
 ```clojure
 ;; deps.edn
-io.github.unisoma/nats-cljc {:mvn/version "0.4.0"}
+io.github.unisoma/nats-cljc {:mvn/version "0.5.0"}
 ```
 
 That coordinate pulls in only the JVM client **`io.nats:jnats`** transitively. It deliberately forces **no other runtime dependency** — no async library (one-shot operations return the platform-native promise; see [Composing results](#composing-results)) and no serialization library (the default `:edn` codec uses only Clojure core; see [Codecs](#codecs)). On ClojureScript you additionally install the JS client yourself (shadow-cljs reads it from our `deps.cljs`):
@@ -233,6 +233,43 @@ A portable facade over NATS Key/Value — the last-value registry built on JetSt
 
 On ClojureScript, `@nats-io/kv` is version-pinned and installed automatically alongside the core client; a bundle that never requires `nats-cljc.kv` ships zero KV bytes.
 
+## Services (`nats-cljc.service`)
+
+A portable facade for hosting discoverable, instrumented request-reply **Services**. Services is pure convenience over core request-reply — a queue-subscribed handler per endpoint plus the framework's auto-responders on `$SRV.PING|INFO|STATS.*` — so unlike KV/JetStream there is **no service context** and nothing is verified at entry ([ADR 0024](./docs/adr/0024-service-has-no-context-and-verifies-nothing-at-entry.md)). A client just calls an endpoint with plain `core/request`; there is no new caller verb.
+
+```clojure
+(require '[nats-cljc.service :as svc]
+         '[nats-cljc.core :as nats])
+
+;; host: endpoints are declared as data
+(p/let [service (svc/create conn
+                  {:name      "calc"
+                   :version   "1.0.0"
+                   :endpoints [{:name    "add"
+                                :handler (fn [{:keys [data] :as msg}]
+                                           (if (every? number? data)
+                                             (svc/respond conn msg (apply + data))
+                                             (svc/respond-error conn msg 400 "numbers only")))}]})]
+  ;; a caller invokes the endpoint with an ordinary request — no service verb
+  (p/let [reply (nats/request conn "add" [1 2 3])]
+    (if-let [err (svc/error reply)]
+      (println "service error" (:code err) (:description err))
+      (println "sum:" (:data reply)))))                         ;=> sum: 6
+```
+
+- **Create as data** — `:name` and `:version` (semver) are required; `:description`, `:metadata`, and `:endpoints` are optional. Each endpoint is `{:name :subject :handler :queue-group :metadata}`: `:subject` defaults to `:name`, `:queue-group` load-balances across instances, and `:handler` is an ordinary [backpressure](#backpressure-without-coreasync) push handler (a returned promise applies per-endpoint backpressure). There is no Group noun — compose a grouped subject directly with `nats/subject`.
+- **Reply** — `respond` answers a request through its native service message so the endpoint's stats stay correct (the service analog of `core/reply`). `respond-error` replies with a first-class service error — an integer `code` and string `description`, optionally a `data` body — which is a *successful* reply carrying an error, not a transport failure ([ADR 0025](./docs/adr/0025-service-application-errors-are-reply-payloads-not-normalized-errors.md)); it is terminal like a thrown handler. A handler that throws or returns a rejected promise auto-replies the same shape with code 500.
+- **Read errors** — `(svc/error reply)` returns `nil` on a normal success or `{:code :description}` when the Service answered with an error. A service error is data the caller branches on, so `core/request` resolves normally and never throws on it.
+- **Lifecycle** — `(svc/stop service)` resolves once stopped, **draining** in-flight requests (each runs to completion and still replies); afterwards a fresh request rejects with `:no-responders`. Idempotent. The Service handle carries a `:stopped` promise that resolves to nil once it stops for any reason — the react-to-shutdown signal.
+- **Discovery** — `ping`, `info`, and `stats` query running Services over the control subjects, each a bounded fan-out resolving a **vector** of normalized maps: `ping` the identity `{:name :id :version}`, `info` adds `:description`/`:endpoints`, `stats` adds `:started` and per-endpoint counters (`:num-requests`, `:num-errors`, processing-time nanos). `opts` narrows by `:name`/`:id` and bounds the gather with `:max-results`/`:timeout-ms`. There is no Discovery handle and no local introspection — a Service inspects itself with the same wire request.
+  ```clojure
+  (p/let [services (svc/info conn {:name "calc" :timeout-ms 500})]
+    (doseq [s services] (println (:name s) (:version s) (map :subject (:endpoints s)))))
+  ```
+- **One codec per Service** — bound at `create` (the connection default unless a `:codec` override there); a single `respond`/`respond-error` may override it per call.
+
+On ClojureScript, `@nats-io/services` is version-pinned and installed automatically alongside the core client; a bundle that never requires `nats-cljc.service` ships zero services bytes. The dependency is unconditional and floors the nats-io trio at `3.4.0` ([ADR 0026](./docs/adr/0026-services-joins-the-unconditional-nats-family.md)).
+
 ## JVM-only: blocking convenience layer
 
 When you want synchronous ergonomics on the JVM, require the parallel blocking tree instead. Same verb names; one-shots block, and subscriptions become a **pull loop** the async core can't offer:
@@ -255,7 +292,7 @@ When you want synchronous ergonomics on the JVM, require the parallel blocking t
 - **Phase 1.5** ✅ *(0.1.0)* — `nats-cljc.blocking.core`.
 - **Phase 2** ✅ *(0.2.0)* — JetStream (`nats-cljc.jetstream`): streams, consumers, acked publish, ack/nak/term; pull consumers delivered through the same promise-return handler as core subscriptions for backpressure (core.async/missionary adapters land in Phase 6).
 - **Phase 3** ✅ *(0.4.0)* — KV (`nats-cljc.kv`): Bucket lifecycle and operator surface, compare-and-set writes, Tombstones/history/archaeology, and watches — speaking KV vocabulary, never its stream substrate (ADR 0023). Also shipped: JetStream direct get (`jetstream/get-message`, `:no-message-found`).
-- **Phase 4** — services (`nats-cljc.service`): host discoverable, instrumented request-reply Services and discover them with `ping`/`info`/`stats` — pure core request-reply, with no context to verify at entry (ADR 0024).
+- **Phase 4** ✅ *(0.5.0)* — services (`nats-cljc.service`): host discoverable, instrumented request-reply Services and discover them with `ping`/`info`/`stats` — pure core request-reply, with no context to verify at entry (ADR 0024).
 - **Phase 5** — Object Store (`nats-cljc.object`).
 - **Phase 6** — core.async + missionary subscription adapters; `request-many` scatter-gather.
 

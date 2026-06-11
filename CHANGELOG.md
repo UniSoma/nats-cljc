@@ -9,6 +9,94 @@ bump, renaming or removing one is a major bump (see ADR 0009).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-11
+
+Phase 4: services, tested on the JVM and Node. One new portable namespace,
+`nats-cljc.service`, for hosting discoverable, instrumented request-reply
+Services and discovering them — pure convenience over core request-reply, so
+there is NO service context and nothing is verified at entry (ADR 0024). All
+new vocabulary is additive ⇒ minor bump (ADR 0009).
+
+### Added
+
+- **Service hosting** — `(create conn config)` resolves a platform-native
+  promise to a running Service: a queue-subscribed handler per endpoint plus
+  the framework's auto-responders on `$SRV.PING|INFO|STATS.*`. There is no
+  service context and no server feature to round-trip against, so `create`
+  hangs directly off the Connection and resolves as soon as the endpoints are
+  subscribed (ADR 0024). The config is portable, closed data: `:name` and
+  `:version` (both required), `:description`, `:metadata`, and `:endpoints` —
+  a vector of endpoint maps `{:name :subject :handler :queue-group :metadata}`
+  where `:subject` defaults to `:name`. Each `:handler` is an ordinary ADR-0007
+  push handler invoked per request with `{:subject :data :reply}`, a returned
+  promise applying per-endpoint backpressure (Node serializes per the same
+  contract). There is no Group noun — a consumer composes a grouped subject
+  directly (ADR 0024). A client invokes an endpoint with plain
+  `nats-cljc.core/request`; there is no new caller verb.
+- **Create-config validation** — pre-flight on `create`, before any native or
+  wire call (ADR 0015): an omitted `:name`/`:version` rejects the promise with
+  `:missing-required-key` carrying the offending `:key`, a malformed service or
+  endpoint `:name` with `:invalid-name`, a non-semver `:version` with the new
+  validation `:type :invalid-version` carrying the offending `:version`, and two
+  endpoints sharing a `:name` with the new validation `:type
+  :duplicate-endpoint` carrying the offending `:name` (the per-endpoint stats
+  key must be unique). Empty or absent `:endpoints` is legal; endpoint
+  `:subject` syntax stays native/server-enforced.
+- **Replying** — `(respond conn msg data)` answers a request through its native
+  service message so the owning endpoint's native stats stay correct (ADR 0024),
+  the service analog of `core/reply`. `(respond-error conn msg code description
+  data?)` replies with a first-class service error (ADR 0025): a SUCCESSFUL
+  reply carrying an integer `code` and string `description` in the
+  `Nats-Service-Error` / `Nats-Service-Error-Code` headers, not a transport
+  failure — the caller's `core/request` resolves normally. It is terminal like a
+  thrown handler (it ends the handler so the native framework counts the
+  endpoint error), and a handler that throws or returns a rejected promise
+  auto-replies the same shape with code 500.
+- **Reading errors** — `(error msg)` reads the service error a reply carries
+  (ADR 0025): `nil` on a normal success, or `{:code <int> :description
+  <string>}` when the Service answered with an error. The opt-in reader of the
+  error headers `core/request` leaves intact — a service error is data the
+  caller branches on, never a thrown transport failure.
+- **One codec per Service** — bound at `create` (the connection default unless a
+  `:codec` registry keyword or `ICodec` instance overrides it there), used to
+  decode every request and encode every reply across all endpoints; a single
+  `respond` / `respond-error` may override it per call (ADR 0011). An
+  unresolvable `:codec` rejects the create promise pre-flight.
+- **Lifecycle** — `(stop svc)` resolves a native promise once the Service has
+  stopped, DRAINING in-flight requests (a request being handled runs to
+  completion and still receives its reply); after it settles a fresh request
+  rejects with the canonical `:no-responders` (ADR 0006). Idempotent. The
+  resolved Service handle carries a `:stopped` key — a native promise that
+  resolves to nil once the Service stops for any reason, the react-to-shutdown
+  signal paralleling the Watch handle's `:initialized` (ADR 0024).
+- **Discovery** — `ping`, `info`, and `stats`, the client side of the surface
+  hanging directly off the Connection (ADR 0024), each a bounded fan-out
+  resolving a native promise of a VECTOR of normalized kebab-case EDN maps:
+  `ping` the identity `{:name :id :version}` (plus `:metadata`), `info` adds
+  `:description` and `:endpoints` (`{:name :subject}` plus `:queue-group` /
+  `:metadata`), `stats` adds `:started` and per-endpoint counters
+  (`:num-requests`, `:num-errors`, `:processing-time-ns`,
+  `:average-processing-time-ns`, durations in integer nanoseconds). `opts`
+  narrows by `:name` / `:id` and BOUNDS the fan-out with `:max-results` /
+  `:timeout-ms`. There is no Discovery handle and no local introspection — a
+  Service inspects itself with the same wire request, narrowed by its
+  `:name`/`:id`.
+- **ClojureScript packaging** — `@nats-io/services` joins the unconditional
+  nats-io family (ADR 0026), declared in `deps.cljs` and pinned in lockstep
+  with the core client. The services import is confined to the service impl
+  namespace, so a bundle that never requires `nats-cljc.service` ships zero
+  services bytes, enforced by the `:services` bundle/externs CI guards
+  (ADR 0016).
+
+### Changed
+
+- **nats-io floor raised to 3.4.0** — `@nats-io/services@3.4.0` peer-requires
+  `@nats-io/nats-core@3.4.0`, so `@nats-io/nats-core`, `@nats-io/jetstream`,
+  and `@nats-io/kv` all move from `3.3.1` to `3.4.0` in lockstep (ADR 0026).
+  The bump is a tested gate, not an assumption: the full suite passes on both
+  local legs (JVM + Node) against the `3.4.0` trio. JVM consumers see no change
+  — `io.nats:jnats` carries `io.nats.service` in-jar.
+
 ## [0.4.0] - 2026-06-11
 
 Phase 3: KV, tested on the JVM and Node. One new portable namespace,
@@ -206,7 +294,8 @@ Node, and the browser.
 - **JVM-only blocking convenience layer** (`nats-cljc.blocking.core`) — the same
   verb names, synchronous, with a pull-based subscription model.
 
-[Unreleased]: https://github.com/unisoma/nats-cljc/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/unisoma/nats-cljc/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/unisoma/nats-cljc/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/unisoma/nats-cljc/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/unisoma/nats-cljc/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/unisoma/nats-cljc/compare/v0.1.1...v0.2.0
