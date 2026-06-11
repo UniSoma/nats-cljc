@@ -1,12 +1,13 @@
 ---
 id: nts-01ktsner23xc
 title: 'Phase 3: KV (nats-cljc.kv)'
-status: open
+status: closed
 type: epic
 priority: 1
 mode: afk
 created: '2026-06-10T21:01:48.478791146Z'
-updated: '2026-06-10T21:30:11.871012323Z'
+updated: '2026-06-11T02:54:14.826978924Z'
+closed: '2026-06-11T02:54:14.826978924Z'
 tags:
 - kv
 - phase-3
@@ -103,3 +104,9 @@ Tests assert external behavior at the public facade — Entry shapes, resolved/r
 - Revision-pinned `get` on a marker revision must be normalized to "deliver the marker Entry" on both legs; each native's exact behavior here is unverified and must be pinned by a test.
 - `:delta` semantics (whether it is meaningful outside watch/history deliveries) likewise get settled empirically, not inferred.
 - The design conversation's full decision trail lives in the updated CONTEXT.md KV section and ADR 0023.
+
+## Notes
+
+**2026-06-11T02:54:14.826978924Z**
+
+Phase 3 shipped as 0.4.0: nats-cljc.kv portable facade over jnats KeyValue and @nats-io/kv — KV context verified at entry, Bucket lifecycle + operator surface, five write verbs with Revision CAS (:wrong-revision), get/history/keys including revision-pinned marker reads, Watch with :deliver/:keys/:ignore-deletes?/:on-error and :initialized, per-Bucket Codec, zero KV bytes in core-only bundles. update-bucket dropped (nats.js lacks bucket-config update, won't-do follow-up nts-01ktt30j2ty5); jetstream-level direct get moved out and shipped separately as get-message (nts-01ktshvh6k6n). Released to Clojars as 0.4.0.
