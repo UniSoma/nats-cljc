@@ -248,6 +248,57 @@
        (impl/then (fn [_] (bucket/validate-key key)))
        (impl/bind (fn [_] (proto/-kv-purge handle key (:revision opts)))))))
 
+(defn- watch-entry
+  "Lift a raw watch delivery into the portable Entry the Handler receives: the
+   `history` shape — a live Entry's `:value` decoded through the Bucket's one
+   Codec, a Tombstone/purge marker carrying `:value` nil undecoded, `:delta` the
+   Entry's distance from the newest matching delivery (0 once caught up; both
+   natives populate it on watch deliveries — verified, not inferred)."
+  [handle raw]
+  {:bucket    (:bucket raw)
+   :key       (:key raw)
+   :value     (when (= :put (:operation raw))
+                (codec/decode (:codec handle) (:bytes raw)))
+   :revision  (:revision raw)
+   :created   (:created raw)
+   :operation (:operation raw)
+   :delta     (:delta raw)})
+
+(defn watch
+  "Watch the Bucket `handle` for changes — the open-ended observation that feels
+   exactly like a core subscription: each matching Entry (the `history` shape,
+   `:value` decoded through the Bucket's one Codec, Tombstones and purge markers
+   included with `:value` nil) is pushed to `handler`, the library's many-times
+   currency (ADR 0007: deliveries are serial within one Watch, a handler must
+   never block, and a returned promise suspends the next delivery until it
+   settles). Returns a platform-native promise that resolves to a watch handle
+   whose `:initialized` key holds a Promise resolving when the initial replay
+   completes — the \"cache is warm\" signal, so cache builders populate first and
+   serve reads after — and which `stop` ends, idempotently.
+
+   `opts` may carry the one CLOSED `:deliver` mode replacing the natives' flag
+   set: `:latest` (the default) replays each key's current value then streams
+   updates, `:history` replays the full retained history first, `:updates`
+   streams only new changes (its `:initialized` resolves immediately — nothing
+   replays). Any other value rejects pre-flight with a validation
+   `:type :invalid-deliver` carrying the offending `:deliver`, before any native
+   call (ADR 0015)."
+  ([handle handler] (watch handle handler {}))
+  ([handle handler opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (bucket/validate-deliver (:deliver opts :latest))))
+       (impl/bind (fn [deliver]
+                    (proto/-kv-watch handle deliver
+                                     (fn [raw] (handler (watch-entry handle raw)))))))))
+
+(defn stop
+  "End the Watch behind `watch-handle` (the value `watch` resolved to), ceasing
+   delivery to its Handler. Fire-and-forget — returns nil synchronously — and
+   idempotent: stopping an already-ended Watch is a safe no-op (ADR 0012
+   spirit), so teardown never needs racy liveness guards."
+  [watch-handle]
+  (proto/-watch-stop watch-handle))
+
 (defn history
   "Read the retained history of `key` from the Bucket `handle`, returning a
    platform-native promise that resolves to a fully-realized vector of Entries

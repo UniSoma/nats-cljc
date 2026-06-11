@@ -75,6 +75,23 @@
     (throw (ex-info "Invalid key" {:type :invalid-key :key key})))
   key)
 
+(def deliver-modes
+  "The CLOSED set of watch `:deliver` modes — one option replacing the natives'
+   flag set (jnats' KeyValueWatchOption, nats.js' KvWatchInclude), so invalid
+   flag combinations are unrepresentable: `:latest` (the default) replays each
+   key's current value then streams updates, `:history` replays the full
+   retained history first, `:updates` streams only new changes."
+  #{:latest :history :updates})
+
+(defn validate-deliver
+  "Guard a watch `:deliver` mode pre-flight, throwing a `:type :invalid-deliver`
+   ex-info carrying the offending `:deliver` on caller misuse (ADR 0015); returns
+   `deliver` so it can sit in a promise chain stage."
+  [deliver]
+  (when-not (contains? deliver-modes deliver)
+    (throw (ex-info "Invalid watch :deliver mode" {:type :invalid-deliver :deliver deliver})))
+  deliver)
+
 (defn validate-config
   "Guard a portable Bucket `config` map pre-flight (ADR 0015), before any native
    call: an unrecognized key (the map is closed) throws `:type :unknown-config-key`

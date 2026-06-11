@@ -1,12 +1,12 @@
 ---
 id: nts-01ktsqnjj6e1
 title: 'Watch core: handler delivery, :deliver modes, :initialized, stop'
-status: open
+status: in_progress
 type: feature
 priority: 1
 mode: afk
 created: '2026-06-10T21:40:29.377753998Z'
-updated: '2026-06-10T21:40:29.377753998Z'
+updated: '2026-06-10T23:44:22.981176042Z'
 parent: nts-01ktsner23xc
 tags:
 - kv

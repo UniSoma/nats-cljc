@@ -347,6 +347,34 @@
      populated by both natives) — INCLUDING Tombstones and purge markers, whose
      `:operation` stays visible (ADR 0023). An absent key resolves to []."))
 
+(defprotocol BucketWatch
+  "Watching a Bucket handle (ADR 0023) — EXTENDED onto each platform's Bucket
+   record from the impl namespaces, never implemented inline, so the
+   `@nats-io/kv` import stays confined (ADR 0016). The facade owns the public
+   arglists, the `:deliver` pre-flight validation, and the codec seam: the
+   raw-handler it passes down receives RAW entry maps, never decoded values."
+  (-kv-watch [bucket deliver raw-handler]
+    "Open a Watch over every key in the Bucket, returning a native promise of a
+     watch handle — a platform record satisfying `Watch`, whose `:initialized`
+     key holds a native promise that resolves when the initial replay completes
+     (immediately when there is nothing to replay). `deliver` is the validated
+     mode: `:latest` replays each key's current value then streams updates,
+     `:history` replays the full retained history first, `:updates` streams only
+     new changes (its `:initialized` resolves at once). `raw-handler` is invoked
+     per matching entry — including Tombstones and purge markers — with one raw
+     entry map (the `-kv-history` shape: `{:bucket :key :bytes :revision
+     :created :operation :delta}`); deliveries are serial within one Watch, and
+     a returned promise suspends the next delivery until it settles (the ADR
+     0007 contract)."))
+
+(defprotocol Watch
+  "A single Watch's lifecycle — implemented by the per-leg watch handle records
+   `-kv-watch` resolves with."
+  (-watch-stop [watch]
+    "End the Watch's delivery, returning nil synchronously — fire-and-forget,
+     the watch sibling of `-unsubscribe`. Idempotent: stopping an already-ended
+     Watch is a silent no-op (ADR 0012 spirit)."))
+
 (defprotocol OrderedPull
   "The pull triad over an Ordered consumer handle (the value `-js-ordered-consumer`
    resolves) — EXTENDED onto each platform's ordered record from the impl

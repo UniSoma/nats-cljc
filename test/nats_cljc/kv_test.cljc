@@ -9,6 +9,7 @@
             [nats-cljc.kv :as kv]
             [nats-cljc.kv.impl.bucket :as bucket]
             [nats-cljc.kv.impl.error :as kv-err]
+            [nats-cljc.test-support :refer [wait-for]]
             #?(:cljs [promesa.core :as p])))
 
 ;; The anonymous server (ci/nats.conf) is the only leg with a jetstream{} block:
@@ -981,3 +982,267 @@
                                                                                   (p/then (fn [_] (kv/purge handle "doc.k" {:revision (inc rev2)})))
                                                                                   (p/then (fn [r]
                                                                                             (is (nil? r) "purge with the latest Revision (the Tombstone's) resolves to nil"))))))))))))))))))))))))
+
+;; ─────────────────────────────── Watch ────────────────────────────────
+
+;; Deep-module unit (ADR 0015), no server: the watch :deliver seam — ONE closed
+;; option replacing the natives' flag set, so invalid flag combinations are
+;; unrepresentable, and an unrecognized value raises the validation
+;; `:type :invalid-deliver` carrying the offending `:deliver`, pre-flight before
+;; any native call.
+(deftest deep-module-watch-deliver-validation
+  (is (= :latest (bucket/validate-deliver :latest))
+      ":latest (the default) passes validation unchanged")
+  (is (= :history (bucket/validate-deliver :history))
+      ":history passes validation unchanged")
+  (is (= :updates (bucket/validate-deliver :updates))
+      ":updates passes validation unchanged")
+  (is (= :invalid-deliver (thrown-type #(bucket/validate-deliver :everything)))
+      "a value outside the closed mode set is :invalid-deliver")
+  (is (= :invalid-deliver (thrown-type #(bucket/validate-deliver "latest")))
+      "a string spelling of a mode is :invalid-deliver — the option is keyword-only")
+  (is (= :everything (:deliver (ex-data (try (bucket/validate-deliver :everything)
+                                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))))
+      ":invalid-deliver carries the offending :deliver"))
+
+;; The default watch (:deliver :latest): each key's CURRENT value replays first —
+;; older revisions never appear — each matching Entry pushed to the Handler with
+;; :value decoded through the Bucket's Codec; the handle's :initialized Promise
+;; resolves once that replay completes; then new writes stream as they land. The
+;; invalid-:deliver pre-flight rejection rides the same handle (deep-module seam
+;; wired through the facade promise).
+(deftest watch-latest-replays-then-streams
+  (let [bucket "TRACER_KV_WATCH_LATEST"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "cfg.a" {:v 1}) 5000 ::timeout)
+                 (deref (kv/put handle "cfg.a" {:v 2}) 5000 ::timeout)
+                 (deref (kv/put handle "cfg.b" {:v 3}) 5000 ::timeout)
+                 (let [seen (atom [])
+                       w    (deref (kv/watch handle #(swap! seen conj %)) 5000 ::timeout)]
+                   (try
+                     (is (not= ::timeout (deref (:initialized w) 5000 ::timeout))
+                         "the watch handle's :initialized Promise resolves when the replay completes")
+                     (is (wait-for #(= 2 (count @seen)) 5000)
+                         ":latest replays one Entry per key")
+                     (is (= ["cfg.a" "cfg.b"] (mapv :key @seen))
+                         "the replay covers each key, in stream order")
+                     (is (= [{:v 2} {:v 3}] (mapv :value @seen))
+                         "only each key's CURRENT value replays, decoded through the Bucket's Codec")
+                     (is (every? #(= :put (:operation %)) @seen)
+                         "replayed Entries carry the :put :operation")
+                     (is (= bucket (:bucket (first @seen)))
+                         "each Entry names its Bucket")
+                     (is (string? (:created (first @seen)))
+                         ":created is the canonical timestamp string")
+                     (is (zero? (:delta (last @seen)))
+                         "the Entry completing the replay carries :delta 0")
+                     (deref (kv/put handle "cfg.a" {:v 4}) 5000 ::timeout)
+                     (is (wait-for #(= 3 (count @seen)) 5000)
+                         "after the replay, new writes stream to the Handler")
+                     (is (= {:v 4} (:value (last @seen)))
+                         "the streamed update carries the new decoded :value")
+                     (is (= :invalid-deliver (:type (ex-data (reject-reason (kv/watch handle identity {:deliver :everything})))))
+                         "an invalid :deliver value rejects the watch promise as a validation error")
+                     (finally (kv/stop w)))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx    (kv/kv conn)
+                          handle (kv/create-bucket ctx {:bucket bucket :storage :memory})]
+                    (with-bucket ctx bucket
+                      (fn []
+                        (let [seen (atom [])]
+                          (p/let [_    (kv/put handle "cfg.a" {:v 1})
+                                  _    (kv/put handle "cfg.a" {:v 2})
+                                  _    (kv/put handle "cfg.b" {:v 3})
+                                  w    (kv/watch handle #(swap! seen conj %))
+                                  init (p/race [(:initialized w) (p/delay 5000 ::timeout)])
+                                  hit? (wait-for #(= 2 (count @seen)) 5000)]
+                            (-> (p/do
+                                  (is (not= ::timeout init)
+                                      "the watch handle's :initialized Promise resolves when the replay completes")
+                                  (is hit? ":latest replays one Entry per key")
+                                  (is (= ["cfg.a" "cfg.b"] (mapv :key @seen))
+                                      "the replay covers each key, in stream order")
+                                  (is (= [{:v 2} {:v 3}] (mapv :value @seen))
+                                      "only each key's CURRENT value replays, decoded through the Bucket's Codec")
+                                  (is (every? #(= :put (:operation %)) @seen)
+                                      "replayed Entries carry the :put :operation")
+                                  (is (= bucket (:bucket (first @seen)))
+                                      "each Entry names its Bucket")
+                                  (is (string? (:created (first @seen)))
+                                      ":created is the canonical timestamp string")
+                                  (is (zero? (:delta (last @seen)))
+                                      "the Entry completing the replay carries :delta 0")
+                                  (p/let [_    (kv/put handle "cfg.a" {:v 4})
+                                          hit? (wait-for #(= 3 (count @seen)) 5000)]
+                                    (is hit? "after the replay, new writes stream to the Handler")
+                                    (is (= {:v 4} (:value (last @seen)))
+                                        "the streamed update carries the new decoded :value")
+                                    (-> (kv/watch handle identity {:deliver :everything})
+                                        (p/then (fn [_] (is false "expected :invalid-deliver from watch")))
+                                        (p/catch (fn [e] (is (= :invalid-deliver (:type (ex-data e)))
+                                                             "an invalid :deliver value rejects the watch promise as a validation error"))))))
+                                (p/finally (fn [_ _] (kv/stop w)))))))))))))))
+
+;; :deliver :history replays the key's FULL retained history oldest-to-newest —
+;; including the Tombstone a delete wrote, its :operation visible (ADR 0023) —
+;; before streaming new writes.
+(deftest watch-history-replays-full-history
+  (let [bucket "TRACER_KV_WATCH_HISTORY"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "doc.k" {:v 1}) 5000 ::timeout)
+                 (deref (kv/put handle "doc.k" {:v 2}) 5000 ::timeout)
+                 (deref (kv/delete handle "doc.k") 5000 ::timeout)
+                 (let [seen (atom [])
+                       w    (deref (kv/watch handle #(swap! seen conj %) {:deliver :history}) 5000 ::timeout)]
+                   (try
+                     (is (not= ::timeout (deref (:initialized w) 5000 ::timeout))
+                         ":initialized resolves once the history replay completes")
+                     (is (wait-for #(= 3 (count @seen)) 5000)
+                         ":history replays every retained revision")
+                     (is (= [:put :put :delete] (mapv :operation @seen))
+                         "the replay arrives oldest-to-newest, the Tombstone's :operation visible")
+                     (is (= [{:v 1} {:v 2} nil] (mapv :value @seen))
+                         "live values decode through the Bucket's Codec; the Tombstone carries :value nil")
+                     (deref (kv/put handle "doc.k" {:v 3}) 5000 ::timeout)
+                     (is (wait-for #(= 4 (count @seen)) 5000)
+                         "after the replay, new writes stream to the Handler")
+                     (is (= {:v 3} (:value (last @seen)))
+                         "the streamed update carries the new decoded :value")
+                     (finally (kv/stop w)))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx    (kv/kv conn)
+                          handle (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})]
+                    (with-bucket ctx bucket
+                      (fn []
+                        (let [seen (atom [])]
+                          (p/let [_    (kv/put handle "doc.k" {:v 1})
+                                  _    (kv/put handle "doc.k" {:v 2})
+                                  _    (kv/delete handle "doc.k")
+                                  w    (kv/watch handle #(swap! seen conj %) {:deliver :history})
+                                  init (p/race [(:initialized w) (p/delay 5000 ::timeout)])
+                                  hit? (wait-for #(= 3 (count @seen)) 5000)]
+                            (-> (p/do
+                                  (is (not= ::timeout init)
+                                      ":initialized resolves once the history replay completes")
+                                  (is hit? ":history replays every retained revision")
+                                  (is (= [:put :put :delete] (mapv :operation @seen))
+                                      "the replay arrives oldest-to-newest, the Tombstone's :operation visible")
+                                  (is (= [{:v 1} {:v 2} nil] (mapv :value @seen))
+                                      "live values decode through the Bucket's Codec; the Tombstone carries :value nil")
+                                  (p/let [_    (kv/put handle "doc.k" {:v 3})
+                                          hit? (wait-for #(= 4 (count @seen)) 5000)]
+                                    (is hit? "after the replay, new writes stream to the Handler")
+                                    (is (= {:v 3} (:value (last @seen)))
+                                        "the streamed update carries the new decoded :value")))
+                                (p/finally (fn [_ _] (kv/stop w)))))))))))))))
+
+;; :deliver :updates streams ONLY new changes: nothing replays — :initialized
+;; resolves immediately, before any delivery — and a pre-existing Entry never
+;; reaches the Handler (serial delivery means it would have to precede the new
+;; write if it were going to arrive at all).
+(deftest watch-updates-streams-only-new
+  (let [bucket "TRACER_KV_WATCH_UPDATES"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "cfg.old" {:v 1}) 5000 ::timeout)
+                 (let [seen (atom [])
+                       w    (deref (kv/watch handle #(swap! seen conj %) {:deliver :updates}) 5000 ::timeout)]
+                   (try
+                     (is (not= ::timeout (deref (:initialized w) 5000 ::timeout))
+                         ":updates has no replay, so :initialized resolves immediately")
+                     (deref (kv/put handle "cfg.new" {:v 2}) 5000 ::timeout)
+                     (is (wait-for #(pos? (count @seen)) 5000)
+                         "a write after the watch starts is delivered")
+                     (is (= ["cfg.new"] (mapv :key @seen))
+                         "only the NEW change arrives — the pre-existing Entry never replays")
+                     (is (= {:v 2} (:value (first @seen)))
+                         "the streamed Entry decodes through the Bucket's Codec")
+                     (finally (kv/stop w)))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx    (kv/kv conn)
+                          handle (kv/create-bucket ctx {:bucket bucket :storage :memory})]
+                    (with-bucket ctx bucket
+                      (fn []
+                        (let [seen (atom [])]
+                          (p/let [_    (kv/put handle "cfg.old" {:v 1})
+                                  w    (kv/watch handle #(swap! seen conj %) {:deliver :updates})
+                                  init (p/race [(:initialized w) (p/delay 5000 ::timeout)])]
+                            (-> (p/do
+                                  (is (not= ::timeout init)
+                                      ":updates has no replay, so :initialized resolves immediately")
+                                  (p/let [_    (kv/put handle "cfg.new" {:v 2})
+                                          hit? (wait-for #(pos? (count @seen)) 5000)]
+                                    (is hit? "a write after the watch starts is delivered")
+                                    (is (= ["cfg.new"] (mapv :key @seen))
+                                        "only the NEW change arrives — the pre-existing Entry never replays")
+                                    (is (= {:v 2} (:value (first @seen)))
+                                        "the streamed Entry decodes through the Bucket's Codec")))
+                                (p/finally (fn [_ _] (kv/stop w)))))))))))))))
+
+;; stop ends delivery — fire-and-forget, returning nil — and is idempotent: a
+;; second stop on an already-ended Watch is a safe no-op (ADR 0012 spirit). The
+;; Watch opens over an EMPTY Bucket, pinning the empty-replay edge: :initialized
+;; still resolves when there is nothing to replay.
+(deftest watch-stop-ends-delivery-and-is-idempotent
+  (let [bucket "TRACER_KV_WATCH_STOP"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [seen (atom [])
+                       w    (deref (kv/watch handle #(swap! seen conj %)) 5000 ::timeout)]
+                   (is (not= ::timeout (deref (:initialized w) 5000 ::timeout))
+                       "an empty Bucket's replay completes immediately — :initialized still resolves")
+                   (is (nil? (kv/stop w)) "stop is fire-and-forget, returning nil")
+                   (deref (kv/put handle "after.stop" {:v 1}) 5000 ::timeout)
+                   (is (not (wait-for #(pos? (count @seen)) 800))
+                       "stop ends delivery — a write after stop never reaches the Handler")
+                   (is (nil? (kv/stop w)) "a second stop is a safe no-op")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx    (kv/kv conn)
+                          handle (kv/create-bucket ctx {:bucket bucket :storage :memory})]
+                    (with-bucket ctx bucket
+                      (fn []
+                        (let [seen (atom [])]
+                          (p/let [w    (kv/watch handle #(swap! seen conj %))
+                                  init (p/race [(:initialized w) (p/delay 5000 ::timeout)])]
+                            (is (not= ::timeout init)
+                                "an empty Bucket's replay completes immediately — :initialized still resolves")
+                            (is (nil? (kv/stop w)) "stop is fire-and-forget, returning nil")
+                            (p/let [_    (kv/put handle "after.stop" {:v 1})
+                                    hit? (wait-for #(pos? (count @seen)) 800)]
+                              (is (not hit?)
+                                  "stop ends delivery — a write after stop never reaches the Handler")
+                              (is (nil? (kv/stop w)) "a second stop is a safe no-op")))))))))))))

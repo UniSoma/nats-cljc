@@ -19,11 +19,12 @@
             [nats-cljc.kv.impl.error :as kv-err])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection JetStreamApiException KeyValue KeyValueManagement]
-           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry KeyValueStatus StorageType]
+           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry KeyValueStatus KeyValueWatcher KeyValueWatchOption StorageType]
+           [io.nats.client.impl NatsKeyValueWatchSubscription]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
            [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
-           [java.util.concurrent CompletableFuture ExecutorService RejectedExecutionException]
+           [java.util.concurrent CompletableFuture CompletionStage ExecutorService RejectedExecutionException]
            [java.util.function Supplier]))
 
 ;; The KV context (ADR 0017's twin): the handle wrapping jnats' management-plane
@@ -222,6 +223,27 @@
    :created   (->canonical-timestamp (.getCreated e))
    :operation (operation->kw (.name (.getOperation e)))})
 
+;; The watch handle (the value `-kv-watch` resolves with): the jnats watch
+;; subscription to close on stop, plus the `initialized` future the facade's
+;; consumers read as `(:initialized handle)`. `stopped?` makes stop idempotent
+;; OUR way (ADR 0012 spirit): jnats' close routes through Dispatcher.unsubscribe,
+;; which throws IllegalStateException on an already-removed subscription, so the
+;; CAS guard (plus the belt-and-braces catch for a close racing the connection's
+;; own teardown) turns the second stop into a silent no-op.
+(defrecord JvmWatch [^NatsKeyValueWatchSubscription sub ^CompletableFuture initialized stopped?]
+  proto/Watch
+  (-watch-stop [_]
+    (when (compare-and-set! stopped? false true)
+      (try (.close sub) (catch Exception _ nil)))
+    nil))
+
+;; The portable :deliver mode → jnats KeyValueWatchOption flags. :latest is
+;; jnats' optionless default (DeliverPolicy.LastPerSubject).
+(def ^:private deliver->watch-options
+  {:latest  []
+   :history [KeyValueWatchOption/INCLUDE_HISTORY]
+   :updates [KeyValueWatchOption/UPDATES_ONLY]})
+
 (extend-type JvmKvContext
   proto/BucketManager
   (-create-bucket [ctx config]
@@ -304,3 +326,28 @@
                 #(mapv (fn [^KeyValueEntry e]
                          (assoc (entry->raw e) :delta (.getDelta e)))
                        (.history ^KeyValue (:kv bucket) ^String key)))))
+
+(extend-type JvmBucket
+  proto/BucketWatch
+  (-kv-watch [bucket deliver raw-handler]
+    ;; jnats' watchAll drives the Watch natively: a dedicated dispatcher delivers
+    ;; serially to the KeyValueWatcher, whose endOfData IS the initialized signal
+    ;; — jnats fires it immediately for UPDATES_ONLY, at subscribe time when
+    ;; there is nothing to replay, else after the delta-0 entry. Blocking the
+    ;; watch callback on a returned CompletionStage is road 2 again (ADR 0007):
+    ;; per-Watch backpressure rides jnats' own dispatcher queue, exactly like the
+    ;; core subscription leg. watchAll's construction round-trips the consumer
+    ;; subscribe, hence off-thread (ADR 0002).
+    (off-thread (:io-executor bucket)
+                #(let [initialized (CompletableFuture.)
+                       watcher     (reify KeyValueWatcher
+                                     (watch [_ e]
+                                       (let [r (raw-handler (assoc (entry->raw e) :delta (.getDelta ^KeyValueEntry e)))]
+                                         (when (instance? CompletionStage r)
+                                           (-> ^CompletionStage r .toCompletableFuture .join))))
+                                     (endOfData [_]
+                                       (.complete initialized nil)))
+                       sub         (.watchAll ^KeyValue (:kv bucket) watcher
+                                              ^"[Lio.nats.client.api.KeyValueWatchOption;"
+                                              (into-array KeyValueWatchOption (deliver->watch-options deliver)))]
+                   (->JvmWatch sub initialized (atom false))))))

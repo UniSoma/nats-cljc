@@ -252,3 +252,75 @@
                                                           (assoc (entry->raw e) :delta (.-delta e)))))))))]
                      (step [])))))
         with-kv-error)))
+
+;; The portable :deliver mode → @nats-io/kv's KvWatchInclude string. :latest is
+;; the native default (KvWatchInclude.LastValue, the empty string — omitted).
+(def ^:private deliver->include
+  {:latest nil :history "history" :updates "updates"})
+
+;; The watch handle (the value `-kv-watch` resolves with): the QueuedIterator to
+;; stop on stop, plus the `initialized` promise the facade's consumers read as
+;; `(:initialized handle)`. `stopped?` makes stop idempotent OUR way (ADR 0012
+;; spirit), independent of how the native iterator takes a second stop.
+(defrecord JsWatch [iter initialized stopped?]
+  proto/Watch
+  (-watch-stop [_]
+    (when (compare-and-set! stopped? false true)
+      (.stop ^js iter))
+    nil))
+
+(defn- watch-loop!
+  "Drive a watch QueuedIterator as an async-iterable — the `consume!` detached
+   loop (road 2, ADR 0007), watch-flavored: each entry is lifted and handed to
+   `raw-handler`, and the loop awaits a returned promise before pulling the next
+   entry (per-Watch backpressure, the backlog filling nats.js' own buffer). A
+   rejecting handler promise just continues — the Watch survives; `:on-error`
+   routing is the refinements slice's seam. An entry arriving with delta 0 means
+   the Watch has caught up, so `initialized!` fires once that entry's delivery
+   settles — the same boundary jnats' endOfData marks. The iterable completing
+   (stop/close) ends the loop; the `.next` `.catch` swallows that close-race."
+  [^js qi raw-handler initialized!]
+  (let [it (.call (unchecked-get qi (.-asyncIterator js/Symbol)) qi)]
+    (letfn [(step []
+              (-> (.next it)
+                  (.then (fn [^js r]
+                           (when-not (.-done r)
+                             (let [^js e   (.-value r)
+                                   caught? (zero? (.-delta e))
+                                   settle  (fn [_]
+                                             (when caught? (initialized!))
+                                             (step))]
+                               (-> (js/Promise. (fn [resolve _]
+                                                  (resolve (raw-handler (assoc (entry->raw e) :delta (.-delta e))))))
+                                   (.then settle settle))))))
+                  (.catch (fn [_] nil))))]
+      (step))))
+
+(extend-type JsBucket
+  proto/BucketWatch
+  (-kv-watch [bucket deliver raw-handler]
+    ;; @nats-io/kv 3.x exposes no initializedFn, so the initialized signal is
+    ;; derived to match jnats' endOfData semantics: immediately for :updates
+    ;; (nothing replays); when an entry lands with delta 0 (the caught-up
+    ;; boundary, fired from watch-loop!); and — the empty-replay edge neither of
+    ;; those reaches — when a status round-trip AFTER the watch is live shows
+    ;; zero stored messages, so there was nothing to replay (any later write is
+    ;; an update, which the delta-0 path would also catch — resolution is
+    ;; idempotent). The opts object is string-keyed via clj->js, surviving
+    ;; advanced compilation.
+    (let [resolve!    (atom nil)
+          initialized (js/Promise. (fn [res _] (reset! resolve! res)))
+          init!       #(@resolve! nil)]
+      (-> (.watch ^js (:kv bucket)
+                  (clj->js (cond-> {}
+                             (deliver->include deliver) (assoc :include (deliver->include deliver)))))
+          (.then (fn [^js qi]
+                   (watch-loop! qi raw-handler init!)
+                   (if (= :updates deliver)
+                     (do (init!)
+                         (->JsWatch qi initialized (atom false)))
+                     (-> (.status ^js (:kv bucket))
+                         (.then (fn [^js s]
+                                  (when (zero? (.-values s)) (init!))
+                                  (->JsWatch qi initialized (atom false))))))))
+          with-kv-error))))
