@@ -1592,6 +1592,61 @@
                                                              "an empty :keys vector rejects the watch promise as a validation error"))))))
                                 (p/finally (fn [_ _] (kv/stop w1) (kv/stop w2) (kv/stop w3)))))))))))))))
 
+;; The empty-replay edge must distinguish "nothing will replay" from "only
+;; Tombstones will replay": a :keys pattern matching nothing but tombstoned
+;; keys still replays their markers, so :initialized — the replay-complete
+;; signal — resolves only AFTER those marker deliveries settle. The operations
+;; are snapshotted at the instant :initialized resolves, not after, so a
+;; marker landing late can't disguise an early resolve.
+(deftest watch-keys-tombstone-only-match-initializes-after-markers
+  (let [bucket "TRACER_KV_WATCH_TOMBSTONE_INIT"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "ghost.1" {:v 1}) 5000 ::timeout)
+                 (deref (kv/delete handle "ghost.1") 5000 ::timeout)
+                 (let [seen     (atom [])
+                       snapshot (promise)
+                       w        (deref (kv/watch handle #(swap! seen conj %) {:keys "ghost.>"}) 5000 ::timeout)]
+                   (try
+                     (.whenComplete ^java.util.concurrent.CompletableFuture (:initialized w)
+                                    (reify java.util.function.BiConsumer
+                                      (accept [_ _ _] (deliver snapshot (mapv :operation @seen)))))
+                     (let [ops (deref snapshot 5000 ::timeout)]
+                       (is (not= ::timeout ops) ":initialized resolves for a tombstone-only :keys match")
+                       (is (= [:delete] ops)
+                           "the Tombstone marker is delivered before :initialized resolves"))
+                     (finally (kv/stop w)))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (p/let [ctx    (kv/kv conn)
+                          handle (kv/create-bucket ctx {:bucket bucket :storage :memory})]
+                    (with-bucket ctx bucket
+                      (fn []
+                        (let [seen (atom [])
+                              ;; ADR 0007: a returned promise suspends the next
+                              ;; delivery — the 300ms settle keeps the marker's
+                              ;; delivery slower than any probe round-trip, so an
+                              ;; early probe resolve can't be mistaken for the
+                              ;; post-replay boundary by winning a tight race.
+                              slow (fn [e] (p/do (p/delay 300) (swap! seen conj e)))]
+                          (p/let [_ (kv/put handle "ghost.1" {:v 1})
+                                  _ (kv/delete handle "ghost.1")
+                                  w (kv/watch handle slow {:keys "ghost.>"})]
+                            (-> (p/race [(p/then (:initialized w) (fn [_] (mapv :operation @seen)))
+                                         (p/delay 5000 ::timeout)])
+                                (p/then (fn [ops]
+                                          (is (not= ::timeout ops) ":initialized resolves for a tombstone-only :keys match")
+                                          (is (= [:delete] ops)
+                                              "the Tombstone marker is delivered before :initialized resolves")))
+                                (p/finally (fn [_ _] (kv/stop w)))))))))))))))
+
 ;; :ignore-deletes? true suppresses Tombstone AND purge-marker deliveries —
 ;; replay and stream alike — while the default delivers them with :operation
 ;; visible (ADR 0023): cache-maintenance consumers skip markers, event-log

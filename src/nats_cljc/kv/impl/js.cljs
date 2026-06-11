@@ -361,12 +361,14 @@
     ;; boundary, fired from watch-loop!); and — the empty-replay edge neither of
     ;; those reaches — when a round-trip AFTER the watch is live shows there was
     ;; nothing to replay: without :keys, a status read with zero stored
-    ;; messages; with :keys, a filtered live-key enumeration matching nothing
-    ;; (status counts the whole Bucket, so it cannot see a filter; the keys
-    ;; probe trades the tombstone-only-match edge — markers still replay after
-    ;; an early resolve — for never leaving :initialized unresolved). Any later
-    ;; write is an update the delta-0 path also catches — resolution is
-    ;; idempotent.
+    ;; messages; with :keys, a filtered history probe matching nothing (status
+    ;; counts the whole Bucket, so it cannot see a filter; history — unlike a
+    ;; live-key enumeration — sees Tombstone/purge markers, which DO replay, so
+    ;; a tombstone-only :keys match correctly waits for the delta-0 boundary).
+    ;; The probe stops after the first entry: emptiness is the question, and
+    ;; any matching history guarantees a replayed entry for delta-0 to mark.
+    ;; Any later write is an update the delta-0 path also catches — resolution
+    ;; is idempotent.
     ;;
     ;; :ignore-deletes? is OURS, not the native flag: nats.js' ignoreDeletes
     ;; skips only "DEL" (a purge marker still delivers, diverging from jnats'
@@ -397,11 +399,15 @@
                          (->JsWatch qi initialized (atom false)))
 
                      keys
-                     (-> (.keys ^js (:kv bucket) (clj->js keys))
-                         (.then (fn [^js ks-qi] (drain-qi ks-qi identity)))
-                         (.then (fn [ks]
-                                  (when (empty? ks) (init!))
-                                  (->JsWatch qi initialized (atom false)))))
+                     (-> (.history ^js (:kv bucket) (clj->js {:key keys}))
+                         (.then (fn [^js h-qi]
+                                  (let [it (.call (unchecked-get h-qi (.-asyncIterator js/Symbol)) h-qi)]
+                                    (.then (.next it)
+                                           (fn [^js r]
+                                             (if (.-done r)
+                                               (init!)
+                                               (.stop h-qi)))))))
+                         (.then (fn [_] (->JsWatch qi initialized (atom false)))))
 
                      :else
                      (-> (.status ^js (:kv bucket))
