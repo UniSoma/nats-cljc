@@ -15,7 +15,11 @@
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection]
            [io.nats.client.impl Headers]
-           [io.nats.service Service ServiceEndpoint Endpoint ServiceMessage ServiceMessageHandler]
+           [io.nats.client.support JsonValue JsonValue$Type]
+           [io.nats.service Service ServiceEndpoint Endpoint ServiceMessage ServiceMessageHandler
+            Discovery PingResponse InfoResponse StatsResponse EndpointStats]
+           [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
+           [java.time ZonedDateTime]
            [java.util.concurrent CompletableFuture CompletionStage]))
 
 (defn- msg->raw
@@ -111,3 +115,127 @@
               (.add ServiceMessage/NATS_SERVICE_ERROR_CODE ^java.util.Collection [(str code)]))]
       (.respond native client ^bytes (or bytes (byte-array 0)) h))
     nil))
+
+;; ── Discovery (ADR 0024) ─────────────────────────────────────────────────────
+;; jnats' `Discovery(conn, maxTimeMillis, maxResults)` IS the bounded fan-out: it
+;; gathers $SRV.* replies into a List, terminating after `maxResults` replies or
+;; `maxTimeMillis`, whichever first — exactly the portable `:max-results`/`:timeout-ms`
+;; bound. We default both to jnats' own DEFAULT_DISCOVERY_* (5000ms / 10) so an
+;; unbounded call still terminates predictably and matches the CLJS leg's defaults.
+
+;; The one canonical timestamp format on this leg (UTC, exactly three fractional
+;; digits) — the same `:started` form KV's `:created` uses, built the same way the
+;; KV/JetStream impls pin theirs (duplicated, not shared, so no impl ns owns
+;; another's date seam).
+(def ^:private ^DateTimeFormatter canonical-instant
+  (-> (DateTimeFormatterBuilder.) (.appendInstant 3) .toFormatter))
+
+(defn- ->canonical-timestamp
+  "Normalize a jnats ZonedDateTime to the canonical portable timestamp string."
+  [^ZonedDateTime zdt]
+  (.format canonical-instant (.toInstant zdt)))
+
+(defn- json-value->edn
+  "Walk a jnats `JsonValue` (the parsed per-endpoint custom stats `:data`) into EDN
+   — map keys keywordized, byte-identical with the CLJS leg's `js->clj`-of-`JSON.parse`
+   path (ADR 0024). This deliberately does NOT go through the connection codec: the
+   stats `:data` is a polyglot JSON blob, not an application payload. Numbers collapse
+   to the natural Clojure type the matching enum arm carries; an absent/NULL value is
+   nil so the lift can drop the key."
+  [^JsonValue jv]
+  (when (and jv (not= JsonValue$Type/NULL (.-type jv)))
+    (condp = (.-type jv)
+      JsonValue$Type/MAP    (reduce-kv (fn [m k v] (assoc m (keyword k) (json-value->edn v)))
+                                       {} (into {} (.-map jv)))
+      JsonValue$Type/ARRAY  (mapv json-value->edn (.-array jv))
+      JsonValue$Type/STRING (.-string jv)
+      JsonValue$Type/BOOL   (.-bool jv)
+      (.-number jv))))
+
+(defn- assoc-some
+  "Assoc `k`→`v` only when `v` is present (non-nil and, for strings/maps, non-empty),
+   so the normalized maps stay byte-identical across legs — an absent native field
+   (jnats nil, nats.js undefined) drops the key on both rather than surfacing as a
+   leg-specific empty value."
+  [m k v]
+  (cond-> m (and (some? v) (not (and (or (string? v) (map? v)) (empty? v)))) (assoc k v)))
+
+(defn- ping->edn
+  "Lift a jnats `PingResponse` to the portable identity map, dropping the wire `type`
+   discriminator (ADR 0024)."
+  [^PingResponse p]
+  (-> {:name (.getName p) :id (.getId p) :version (.getVersion p)}
+      (assoc-some :metadata (some->> (.getMetadata p) (into {})))))
+
+(defn- info-endpoint->edn
+  [^Endpoint e]
+  (-> {:name (.getName e) :subject (.getSubject e)}
+      (assoc-some :queue-group (.getQueueGroup e))
+      (assoc-some :metadata (some->> (.getMetadata e) (into {})))))
+
+(defn- info->edn
+  [^InfoResponse i]
+  (-> {:name (.getName i) :id (.getId i) :version (.getVersion i)
+       :description (.getDescription i)
+       :endpoints (mapv info-endpoint->edn (.getEndpoints i))}
+      (assoc-some :metadata (some->> (.getMetadata i) (into {})))))
+
+(defn- stats-endpoint->edn
+  [^EndpointStats es]
+  (-> {:name                       (.getName es)
+       :subject                    (.getSubject es)
+       :num-requests               (.getNumRequests es)
+       :num-errors                 (.getNumErrors es)
+       :processing-time-ns         (.getProcessingTime es)
+       :average-processing-time-ns (.getAverageProcessingTime es)}
+      (assoc-some :queue-group (.getQueueGroup es))
+      (assoc-some :last-error (.getLastError es))
+      (assoc-some :data (json-value->edn (.getData es)))))
+
+(defn- stats->edn
+  [^StatsResponse s]
+  (-> {:name (.getName s) :id (.getId s) :version (.getVersion s)
+       :started (->canonical-timestamp (.getStarted s))
+       :endpoints (mapv stats-endpoint->edn (.getEndpointStatsList s))}
+      (assoc-some :metadata (some->> (.getMetadata s) (into {})))))
+
+(defn- discovery
+  "Build a jnats `Discovery` bounded by the portable `opts`, defaulting to jnats'
+   own DEFAULT_DISCOVERY_* so an unbounded call still terminates."
+  ^Discovery [^Connection client {:keys [max-results timeout-ms]}]
+  (Discovery. client
+              (long (or timeout-ms Discovery/DEFAULT_DISCOVERY_MAX_TIME_MILLIS))
+              (int (or max-results Discovery/DEFAULT_DISCOVERY_MAX_RESULTS))))
+
+(extend-type JvmConnection
+  proto/Discovery
+  (-ping [{:keys [^Connection client]} {:keys [name id] :as opts}]
+    ;; jnats' Discovery has no List-returning 2-arg ping; narrowing to a single
+    ;; instance (name + id) returns one response (or null when absent), so wrap it
+    ;; into the same VECTOR the broadcast variants drain into (ADR 0024).
+    (core/then
+     (core/resolved nil)
+     (fn [_]
+       (let [d (discovery client opts)]
+         (mapv ping->edn
+               (cond (and name id) (remove nil? [(.ping d ^String name ^String id)])
+                     name          (.ping d ^String name)
+                     :else         (.ping d)))))))
+  (-info [{:keys [^Connection client]} {:keys [name id] :as opts}]
+    (core/then
+     (core/resolved nil)
+     (fn [_]
+       (let [d (discovery client opts)]
+         (mapv info->edn
+               (cond (and name id) (remove nil? [(.info d ^String name ^String id)])
+                     name          (.info d ^String name)
+                     :else         (.info d)))))))
+  (-stats [{:keys [^Connection client]} {:keys [name id] :as opts}]
+    (core/then
+     (core/resolved nil)
+     (fn [_]
+       (let [d (discovery client opts)]
+         (mapv stats->edn
+               (cond (and name id) (remove nil? [(.stats d ^String name ^String id)])
+                     name          (.stats d ^String name)
+                     :else         (.stats d))))))))

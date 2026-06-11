@@ -1,12 +1,12 @@
 ---
 id: nts-01ktvp17f0r7
 title: 'Discovery: ping, info, stats — narrowing, bounding, normalized EDN'
-status: open
+status: in_progress
 type: feature
 priority: 2
 mode: afk
 created: '2026-06-11T15:50:22.932715847Z'
-updated: '2026-06-11T15:50:22.932715847Z'
+updated: '2026-06-11T17:11:37.102039296Z'
 parent: nts-01ktvn87why4
 tags:
 - services

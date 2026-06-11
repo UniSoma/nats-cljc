@@ -7,9 +7,12 @@
             [nats-cljc.impl.protocol :as proto]
             ["@nats-io/nats-core" :as nats-core]))
 
-(defn- no-responders?
+(defn no-responders?
   "True when `e` is nats.js' no-responders rejection: a RequestError whose
-   .isNoResponders() is true, or a bare NoRespondersError (its usual cause)."
+   .isNoResponders() is true, or a bare NoRespondersError (its usual cause).
+   Public within this `^:no-doc` ns so the service impl can read a narrowed
+   Discovery `requestMany` that reached nobody as an empty gather (ADR 0024) — the
+   JVM `Discovery` swallows the same condition into a null/empty List."
   [e]
   (or (instance? nats-core/NoRespondersError e)
       (and (instance? nats-core/RequestError e) (.isNoResponders ^js e))))

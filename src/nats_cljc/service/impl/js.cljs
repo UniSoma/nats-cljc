@@ -100,3 +100,105 @@
     ;; `stopped` promise (null|Error); map it to nil so stop resolves to nil after
     ;; teardown, idempotently (a second stop is a native no-op).
     (.then (.stop svc) (fn [_] nil))))
+
+;; ── Discovery (ADR 0024) ─────────────────────────────────────────────────────
+;; `new Svcm(nc).client(opts)` hands back a ServiceClient whose ping/info/stats
+;; resolve a QueuedIterator of the JSON-decoded $SRV.* replies. The `opts` are
+;; nats.js' RequestManyOptions — the bounded fan-out: `count` strategy stops after
+;; `maxMessages` replies OR `maxWait` ms, whichever first, exactly the portable
+;; `:max-results`/`:timeout-ms` bound. Default both to 10 / 5000 to match the JVM
+;; leg's jnats DEFAULT_DISCOVERY_* so an unbounded call terminates identically.
+
+(defn- ->request-many-opts
+  "Build a nats.js RequestManyOptions from the portable discovery `opts`."
+  [{:keys [max-results timeout-ms]}]
+  #js {:strategy    "count"
+       :maxMessages (or max-results 10)
+       :maxWait     (or timeout-ms 5000)})
+
+(defn- drain
+  "Drain a nats.js QueuedIterator (the discovery fan-out) into a native promise of a
+   VECTOR, lifting each already-JSON-decoded reply with `f` as it arrives. The
+   iterator completes itself once the bounded requestMany strategy terminates, which
+   ends the loop — the CLJS analog of the JVM Discovery List being fully gathered."
+  [^js qi f]
+  (let [it (.call (unchecked-get qi (.-asyncIterator js/Symbol)) qi)]
+    (letfn [(step [acc]
+              (.then (.next it)
+                     (fn [^js r]
+                       (if (.-done r)
+                         acc
+                         (step (conj acc (f (.-value r))))))))]
+      (step []))))
+
+(defn- assoc-some
+  "Assoc `k`→`v` only when present (non-nil, non-empty for strings/maps), so an
+   absent native field (nats.js undefined) drops the key — byte-identical with the
+   JVM leg's `assoc-some`."
+  [m k v]
+  (cond-> m (and (some? v) (not (and (or (string? v) (map? v)) (empty? v)))) (assoc k v)))
+
+(defn- ping->edn
+  "Lift a JSON-decoded $SRV.PING reply (a plain JS object) to the portable identity
+   map, dropping the wire `type` discriminator (ADR 0024)."
+  [^js p]
+  (-> {:name (.-name p) :id (.-id p) :version (.-version p)}
+      (assoc-some :metadata (some-> (.-metadata p) (js->clj :keywordize-keys true)))))
+
+(defn- info-endpoint->edn
+  [^js e]
+  (-> {:name (.-name e) :subject (.-subject e)}
+      (assoc-some :queue-group (.-queue_group e))
+      (assoc-some :metadata (some-> (.-metadata e) (js->clj :keywordize-keys true)))))
+
+(defn- info->edn
+  [^js i]
+  (-> {:name (.-name i) :id (.-id i) :version (.-version i)
+       :description (.-description i)
+       :endpoints (mapv info-endpoint->edn (.-endpoints i))}
+      (assoc-some :metadata (some-> (.-metadata i) (js->clj :keywordize-keys true)))))
+
+(defn- stats-endpoint->edn
+  [^js es]
+  (-> {:name                       (.-name es)
+       :subject                    (.-subject es)
+       :num-requests               (.-num_requests es)
+       :num-errors                 (.-num_errors es)
+       :processing-time-ns         (.-processing_time es)
+       :average-processing-time-ns (.-average_processing_time es)}
+      (assoc-some :queue-group (.-queue_group es))
+      (assoc-some :last-error (.-last_error es))
+      ;; the per-endpoint custom `:data` blob arrives already JSON-decoded (nats.js'
+      ;; `m.json()`); `js->clj` finishes the JSON→EDN lift WITHOUT the connection
+      ;; codec (ADR 0024).
+      (assoc-some :data (some-> (.-data es) (js->clj :keywordize-keys true)))))
+
+(defn- stats->edn
+  [^js s]
+  (-> {:name (.-name s) :id (.-id s) :version (.-version s)
+       ;; nats.js' `started` is an ISO date string; round-trip it through Date so
+       ;; `:started` is byte-identical with the JVM leg and KV's `:created` form.
+       :started (.toISOString (js/Date. (.-started s)))
+       :endpoints (mapv stats-endpoint->edn (.-endpoints s))}
+      (assoc-some :metadata (some-> (.-metadata s) (js->clj :keywordize-keys true)))))
+
+(defn- gather
+  "Drive one discovery verb: build a bounded ServiceClient, run `(verb-fn client)`
+   (it resolves a QueuedIterator), drain it through `f`, and normalize a
+   no-responders rejection — a narrowed fan-out that reached nobody — to an empty
+   VECTOR, so the gather matches the JVM `Discovery` List that swallows the same
+   condition (ADR 0024)."
+  [client opts verb-fn f]
+  (let [c (.client (services/Svcm. client) (->request-many-opts opts))]
+    (-> (verb-fn c)
+        (.then (fn [qi] (drain qi f)))
+        (.catch (fn [e] (if (core/no-responders? e) [] (throw e)))))))
+
+(extend-type core/JsConnection
+  proto/Discovery
+  (-ping [{:keys [client]} {:keys [name id] :as opts}]
+    (gather client opts #(.ping ^js % (or name "") (or id "")) ping->edn))
+  (-info [{:keys [client]} {:keys [name id] :as opts}]
+    (gather client opts #(.info ^js % (or name "") (or id "")) info->edn))
+  (-stats [{:keys [client]} {:keys [name id] :as opts}]
+    (gather client opts #(.stats ^js % (or name "") (or id "")) stats->edn)))

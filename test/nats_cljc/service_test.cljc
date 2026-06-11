@@ -477,6 +477,213 @@
                                (is (= :no-responders (:type (ex-data e)))
                                    "no Service hosts the subject — the request rejects with :no-responders")))))))))
 
+;; ── Discovery: ping / info / stats (ADR 0024) ────────────────────────────────
+
+;; ping resolves a vector of identity maps; info adds :description + :endpoints;
+;; stats adds :started + per-endpoint counters — kebab EDN, the wire `type`
+;; discriminator dropped, normalized identically on both legs. Each call is narrowed
+;; by :name so the shared :4222 server's other Services don't bleed into the assertion.
+(deftest ping-info-stats-resolve-normalized-vectors
+  (let [config {:name "disc_shape" :version "2.3.4" :description "shape probe"
+                :endpoints [{:name "echo" :subject "disc.shape.echo"
+                             :handler (fn [_] :placeholder)}]}
+        opts   {:name "disc_shape"}
+        ;; The portable assertions on the three results, identical on both legs.
+        check  (fn [p i s]
+                 (is (= 1 (count p)) "ping narrows to the one Service of that name")
+                 (let [pe (first p) ie (first i) se (first s) ep (first (:endpoints se))]
+                   (is (= {:name "disc_shape" :version "2.3.4"}
+                          (select-keys pe [:name :version])) "ping is an identity map")
+                   (is (string? (:id pe)) "ping carries the instance :id")
+                   (is (nil? (:type pe)) "the wire `type` discriminator is dropped")
+                   (is (= "shape probe" (:description ie)) "info adds :description")
+                   (is (= [{:name "echo" :subject "disc.shape.echo" :queue-group "q"}]
+                          (mapv #(select-keys % [:name :subject :queue-group]) (:endpoints ie)))
+                       "info adds :endpoints")
+                   (is (nil? (:type ie)) "info drops `type`")
+                   (is (string? (:started se)) "stats adds :started as a string")
+                   (is (re-find #"^\d{4}-\d{2}-\d{2}T.*Z$" (:started se))
+                       ":started is the canonical UTC timestamp string (same form as KV :created)")
+                   (is (= "echo" (:name ep)) "stats carries the per-endpoint counter map")
+                   (is (= 0 (:num-requests ep)) "a fresh endpoint reports a zero request count")
+                   (is (= 0 (:num-errors ep)) "a fresh endpoint reports a zero error count")
+                   (is (int? (:processing-time-ns ep)) ":processing-time-ns is an integer")
+                   (is (int? (:average-processing-time-ns ep)) ":average-processing-time-ns is an integer")
+                   (is (nil? (:type se)) "stats drops `type`")
+                   (is (= (:id pe) (:id ie) (:id se)) "the three views agree on the instance :id")))]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [svc (deref (service/create conn config) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (check (deref (service/ping conn opts) 5000 ::timeout)
+                        (deref (service/info conn opts) 5000 ::timeout)
+                        (deref (service/stats conn opts) 5000 ::timeout)))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (service/create conn config)
+                      (p/then (fn [svc]
+                                (with-service svc
+                                  (fn []
+                                    (p/let [p (service/ping conn opts)
+                                            i (service/info conn opts)
+                                            s (service/stats conn opts)]
+                                      (check p i s))))))
+                      (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
+
+;; Discovery narrows by :name to a specific Service and by :id to a specific
+;; instance: a matching :id resolves that one instance, a non-matching :id resolves
+;; an empty vector. Identical on both legs.
+(deftest discovery-narrows-by-name-and-id
+  (let [config {:name "disc_narrow" :version "1.0.0"
+                :endpoints [{:name "e" :subject "disc.narrow.e" :handler (fn [_] :placeholder)}]}
+        check  (fn [ping-name ping-id ping-wrong]
+                 (is (= ["disc_narrow"] (mapv :name ping-name)) ":name narrows to that Service")
+                 (is (= 1 (count ping-id)) ":id narrows to that one instance")
+                 (is (= (:id (first ping-name)) (:id (first ping-id))) "the :id-narrowed instance matches")
+                 (is (= [] ping-wrong) "a non-matching :id resolves an empty vector"))]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [svc (deref (service/create conn config) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (let [pn (deref (service/ping conn {:name "disc_narrow"}) 5000 ::timeout)
+                       id (:id (first pn))]
+                   (check pn
+                          (deref (service/ping conn {:name "disc_narrow" :id id}) 5000 ::timeout)
+                          (deref (service/ping conn {:name "disc_narrow" :id "no-such-id"}) 5000 ::timeout))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (service/create conn config)
+                      (p/then (fn [svc]
+                                (with-service svc
+                                  (fn []
+                                    (p/let [pn (service/ping conn {:name "disc_narrow"})
+                                            id (:id (first pn))
+                                            pi (service/ping conn {:name "disc_narrow" :id id})
+                                            pw (service/ping conn {:name "disc_narrow" :id "no-such-id"})]
+                                      (check pn pi pw))))))
+                      (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
+
+;; :max-results and :timeout-ms bound the fan-out so the gather terminates
+;; predictably: a tiny :timeout-ms still resolves (does not hang), and :max-results
+;; caps the vector length. Asserted against this one Service narrowed by :name.
+(deftest max-results-and-timeout-ms-bound-the-fan-out
+  (let [config {:name "disc_bound" :version "1.0.0"
+                :endpoints [{:name "e" :subject "disc.bound.e" :handler (fn [_] :placeholder)}]}
+        check  (fn [timed capped]
+                 (is (vector? timed) ":timeout-ms bounds the gather — it resolves a vector, never hangs")
+                 (is (<= 1 (count timed)) "the timed gather still reached this Service")
+                 (is (>= 1 (count capped)) ":max-results caps the gathered vector length"))]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [svc (deref (service/create conn config) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (check (deref (service/ping conn {:name "disc_bound" :timeout-ms 200}) 5000 ::timeout)
+                        (deref (service/ping conn {:name "disc_bound" :max-results 1}) 5000 ::timeout)))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (service/create conn config)
+                      (p/then (fn [svc]
+                                (with-service svc
+                                  (fn []
+                                    (p/let [timed  (service/ping conn {:name "disc_bound" :timeout-ms 200})
+                                            capped (service/ping conn {:name "disc_bound" :max-results 1})]
+                                      (check timed capped))))))
+                      (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
+
+;; Stats counters MOVE: a handled request increments the endpoint's request count,
+;; and an error reply — a `respond-error` OR a thrown handler — increments its error
+;; count (the half deferred from the errors slice, ADR 0025). Both error forms count
+;; on both legs. Drive one request at each endpoint, then read stats narrowed by name.
+(deftest stats-counters-move-on-handled-and-errored-requests
+  (let [check (fn [by]
+                (is (= 1 (:num-requests (by "ok")))   "a handled request increments the request count")
+                (is (= 0 (:num-errors (by "ok")))     "a success does not increment the error count")
+                (is (= 1 (:num-requests (by "rerr")))  "respond-error still counts the request")
+                (is (= 1 (:num-errors (by "rerr")))   "respond-error increments the endpoint error count")
+                (is (= 1 (:num-errors (by "boom")))   "a thrown handler increments the endpoint error count"))]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [cfg {:name "disc_counters" :version "1.0.0"
+                      :endpoints [{:name "ok"   :subject "disc.cnt.ok"
+                                   :handler (fn [m] (service/respond conn m {:ok true}))}
+                                  {:name "rerr" :subject "disc.cnt.rerr"
+                                   :handler (fn [m] (service/respond-error conn m 400 "bad"))}
+                                  {:name "boom" :subject "disc.cnt.boom"
+                                   :handler (fn [_] (throw (ex-info "kaboom" {})))}]}
+                 svc (deref (service/create conn cfg) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (doseq [s ["disc.cnt.ok" "disc.cnt.rerr" "disc.cnt.boom"]]
+                   (deref (nats/request conn s {} {:timeout-ms 5000}) 5000 ::timeout))
+                 (let [st (first (deref (service/stats conn {:name "disc_counters"}) 5000 ::timeout))
+                       by (into {} (map (juxt :name identity) (:endpoints st)))]
+                   (check by)))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [cfg {:name "disc_counters" :version "1.0.0"
+                             :endpoints [{:name "ok"   :subject "disc.cnt.ok"
+                                          :handler (fn [m] (service/respond conn m {:ok true}))}
+                                         {:name "rerr" :subject "disc.cnt.rerr"
+                                          :handler (fn [m] (service/respond-error conn m 400 "bad"))}
+                                         {:name "boom" :subject "disc.cnt.boom"
+                                          :handler (fn [_] (throw (ex-info "kaboom" {})))}]}]
+                    (-> (service/create conn cfg)
+                        (p/then (fn [svc]
+                                  (with-service svc
+                                    (fn []
+                                      (p/let [_  (nats/request conn "disc.cnt.ok" {} {:timeout-ms 5000})
+                                              _  (nats/request conn "disc.cnt.rerr" {} {:timeout-ms 5000})
+                                              _  (nats/request conn "disc.cnt.boom" {} {:timeout-ms 5000})
+                                              ss (service/stats conn {:name "disc_counters"})]
+                                        (check (into {} (map (juxt :name identity) (:endpoints (first ss))))))))))
+                        (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e))))))))))))
+
+;; A zero-endpoint Service is legal and still answers $SRV.* — it is discoverable via
+;; ping, info, and stats, with an empty :endpoints vector on info and stats (ADR 0024).
+(deftest zero-endpoint-service-is-discoverable
+  (let [config {:name "disc_zero" :version "1.0.0"}
+        check  (fn [p i s]
+                 (is (= ["disc_zero"] (mapv :name p)) "a zero-endpoint Service answers ping")
+                 (is (= [] (:endpoints (first i))) "info reports an empty :endpoints vector")
+                 (is (= [] (:endpoints (first s))) "stats reports an empty :endpoints vector"))]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [svc (deref (service/create conn config) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (check (deref (service/ping conn {:name "disc_zero"}) 5000 ::timeout)
+                        (deref (service/info conn {:name "disc_zero"}) 5000 ::timeout)
+                        (deref (service/stats conn {:name "disc_zero"}) 5000 ::timeout)))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (service/create conn config)
+                      (p/then (fn [svc]
+                                (with-service svc
+                                  (fn []
+                                    (p/let [p (service/ping conn {:name "disc_zero"})
+                                            i (service/info conn {:name "disc_zero"})
+                                            s (service/stats conn {:name "disc_zero"})]
+                                      (check p i s))))))
+                      (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
+
 ;; Deep-module unit (ADR 0015/0024), no server: the strict-from-day-one config
 ;; guards are the portable pre-flight half of a Service, raising their validation
 ;; `:type`s before any native or wire call — thrown identically on both legs. A

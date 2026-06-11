@@ -446,6 +446,29 @@
      when stop is called runs to completion and still receives its reply, never
      dropped mid-request (ADR 0024). Idempotent: a second stop is a silent no-op."))
 
+(defprotocol Discovery
+  "Discovering Services others host (ADR 0024) — the client side of the surface,
+   EXTENDED onto each platform's Connection record from the service impl namespaces.
+   There is no Discovery handle and no local introspection of a hosted Service:
+   self-inspection is a wire request narrowed by `:name`/`:id`, drained from the
+   native fan-out (jnats' `Discovery` List, nats.js' `QueuedIterator`) and NORMALIZED
+   to portable EDN entirely in the impl — kebab keys, the wire `type` discriminator
+   dropped, durations as integer nanoseconds, `:started` the canonical timestamp
+   string, custom `:data` parsed JSON→EDN (NOT through the connection codec). The
+   facade owns only the public arglists; each verb takes the portable `opts`
+   `{:name :id :max-results :timeout-ms}` and returns a native promise of a VECTOR."
+  (-ping [conn opts]
+    "Resolve a native promise of a VECTOR of identity maps `{:name :id :version
+     :metadata?}` for the running Services the bounded `$SRV.PING` fan-out reaches.")
+  (-info [conn opts]
+    "Resolve a native promise of a VECTOR of info maps — identity plus `:description`
+     and `:endpoints` (each `{:name :subject :queue-group? :metadata?}`).")
+  (-stats [conn opts]
+    "Resolve a native promise of a VECTOR of stats maps — identity plus `:started`
+     and per-endpoint counters (each `{:name :subject :queue-group? :num-requests
+     :num-errors :processing-time-ns :average-processing-time-ns :last-error?
+     :data?}`)."))
+
 (defprotocol OrderedPull
   "The pull triad over an Ordered consumer handle (the value `-js-ordered-consumer`
    resolves) — EXTENDED onto each platform's ordered record from the impl
