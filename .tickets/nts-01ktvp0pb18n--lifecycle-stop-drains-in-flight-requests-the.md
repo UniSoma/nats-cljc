@@ -1,12 +1,12 @@
 ---
 id: nts-01ktvp0pb18n
 title: 'Lifecycle: stop drains in-flight requests, the :stopped promise'
-status: open
+status: in_progress
 type: feature
 priority: 2
 mode: afk
 created: '2026-06-11T15:50:05.402799533Z'
-updated: '2026-06-11T15:50:05.402799533Z'
+updated: '2026-06-11T16:59:55.979478787Z'
 parent: nts-01ktvn87why4
 tags:
 - services

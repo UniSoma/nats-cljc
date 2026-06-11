@@ -11,7 +11,8 @@
             [nats-cljc.core :as nats]
             [nats-cljc.service :as service]
             [nats-cljc.service.impl.config :as config]
-            #?(:cljs [promesa.core :as p])))
+            #?@(:cljs [[nats-cljc.test-support :as ts]
+                       [promesa.core :as p]])))
 
 ;; The anonymous server: TCP on the JVM, ws on CLJS (ADR 0001). No JetStream needed
 ;; (services is pure core request-reply).
@@ -267,6 +268,98 @@
                                                      "after stop the endpoint is gone — a request rejects with :no-responders"))))))
                         (p/catch (fn [e]
                                    (is false (str "stop teardown failed unexpectedly: " e))))))))))))
+
+;; (stop svc) DRAINS in-flight requests (ADR 0024): a request being handled when
+;; stop is called still receives its reply, never dropped mid-request. Verified with
+;; a deliberately slow handler — fire the request, wait until the handler is provably
+;; in flight (it flips a flag on entry), call stop, and assert the ORIGINAL caller
+;; still resolves with the handler's reply. The slow handler holds the dispatcher
+;; in-flight by RETURNING a promise (ADR 0007 backpressure) that responds only after
+;; a delay, so stop lands while the request is mid-handle.
+(deftest stop-drains-an-in-flight-request
+  (let [config {:name "drain_svc" :version "0.1.0"
+                :endpoints [{:name "slow" :subject "tracer.svc.drain"
+                             :handler (fn [_] :placeholder)}]}]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [in-flight (promise)
+                 cfg (assoc-in config [:endpoints 0 :handler]
+                               (fn [msg]
+                                 (java.util.concurrent.CompletableFuture/runAsync
+                                  (reify Runnable
+                                    (run [_]
+                                      (deliver in-flight true)
+                                      (Thread/sleep 1500)
+                                      (service/respond conn msg {:ok true}))))))
+                 svc (deref (service/create conn cfg) 5000 ::timeout)
+                 reply-fut (nats/request conn "tracer.svc.drain" {} {:timeout-ms 8000})]
+             (is (= true (deref in-flight 5000 ::timeout)) "the handler is provably in flight")
+             (let [stop-fut (service/stop svc)
+                   reply    (deref reply-fut 8000 ::timeout)]
+               (is (not= ::timeout reply) "the in-flight request still resolves (was not dropped by stop)")
+               (is (= {:ok true} (:data reply))
+                   "the caller receives the drained handler's reply")
+               (is (nil? (deref stop-fut 5000 ::timeout)) "stop resolves to nil after draining")))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [in-flight (atom false)
+                        cfg (assoc-in config [:endpoints 0 :handler]
+                                      (fn [msg]
+                                        (reset! in-flight true)
+                                        (-> (p/delay 1500)
+                                            (p/then (fn [_] (service/respond conn msg {:ok true}))))))]
+                    (-> (service/create conn cfg)
+                        (p/then (fn [svc]
+                                  (let [reply-fut (nats/request conn "tracer.svc.drain" {} {:timeout-ms 8000})]
+                                    (-> (ts/wait-for #(deref in-flight) 5000)
+                                        (p/then (fn [up?]
+                                                  (is (true? up?) "the handler is provably in flight")
+                                                  (let [stop-fut (service/stop svc)]
+                                                    (p/let [reply reply-fut
+                                                            stopped stop-fut]
+                                                      (is (= {:ok true} (:data reply))
+                                                          "the caller receives the drained handler's reply")
+                                                      (is (nil? stopped) "stop resolves to nil after draining")))))))))
+                        (p/catch (fn [e]
+                                   (is false (str "drain test failed unexpectedly: " e))))))))))))
+
+;; The Service handle carries a :stopped promise that resolves to nil once the
+;; Service stops for any reason (ADR 0024) — the lifecycle parallel of the Watch
+;; handle's :initialized. It is unresolved while the Service runs, and resolves to
+;; nil after stop, observed off the handle as (:stopped svc).
+(deftest stopped-promise-resolves-to-nil-on-stop
+  (let [config {:name "stopped_svc" :version "0.1.0"
+                :endpoints [{:name "noop" :subject "tracer.svc.stopped"
+                             :handler (fn [_] :placeholder)}]}]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [cfg (assoc-in config [:endpoints 0 :handler]
+                               (fn [msg] (service/respond conn msg {:ok true})))
+                 svc (deref (service/create conn cfg) 5000 ::timeout)]
+             (is (not (.isDone ^java.util.concurrent.CompletableFuture (:stopped svc)))
+                 "the :stopped promise is unresolved while the Service runs")
+             (deref (service/stop svc) 5000 ::timeout)
+             (is (nil? (deref (:stopped svc) 5000 ::timeout))
+                 "the :stopped promise resolves to nil once the Service stops"))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [cfg (assoc-in config [:endpoints 0 :handler]
+                                      (fn [msg] (service/respond conn msg {:ok true})))]
+                    (-> (service/create conn cfg)
+                        (p/then (fn [svc]
+                                  (-> (service/stop svc)
+                                      (p/then (fn [_] (:stopped svc)))
+                                      (p/then (fn [stopped]
+                                                (is (nil? stopped)
+                                                    "the :stopped promise resolves to nil once the Service stops"))))))
+                        (p/catch (fn [e]
+                                   (is false (str ":stopped test failed unexpectedly: " e))))))))))))
 
 ;; (respond-error conn msg code description data?) reaches the caller as a reply
 ;; whose (service/error msg) is {:code … :description …}, with the data? body

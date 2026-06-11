@@ -17,9 +17,11 @@
 ;; nats.js `Service`. nats.js does NOT export its `ServiceImpl` class, so the
 ;; lifecycle protocol can't be extended onto it directly (the JVM leg extends the
 ;; referenceable `io.nats.service.Service` interface instead); wrap it in a record
-;; here so `-stop-service` has a concrete type to dispatch on. Opaque to the
-;; consumer either way.
-(defrecord JsService [^js svc])
+;; here so `-stop-service` has a concrete type to dispatch on. The `stopped` field
+;; is the facade-read `(:stopped handle)` — nats.js' own `svc.stopped` promise
+;; (resolves to null|Error once the Service ends) mapped to nil, the lifecycle
+;; parallel of the Watch handle's `initialized` (ADR 0024). Opaque to the consumer.
+(defrecord JsService [^js svc stopped])
 
 (defn- msg->raw
   "Lift a nats.js `ServiceMsg` into the raw map the facade decodes (the core
@@ -73,7 +75,10 @@
       (-> (.add svcm config)
           (.then (fn [^js svc]
                    (doseq [ep endpoints] (add-endpoint! svc ep))
-                   (->JsService svc))))))
+                   ;; `svc.stopped` resolves to null|Error once the Service ends for
+                   ;; any reason; map it to nil so `(:stopped handle)` is the same
+                   ;; portable signal the JVM leg's future carries (ADR 0024).
+                   (->JsService svc (.then (.-stopped svc) (fn [_] nil))))))))
   (-respond [_ ^js native bytes]
     ;; Route through the native ServiceMsg (not a bare publish to the reply
     ;; subject) so the owning endpoint's native stats stay correct (ADR 0024).
@@ -89,6 +94,9 @@
 (extend-type JsService
   proto/ServiceLifecycle
   (-stop-service [{:keys [^js svc]}]
-    ;; nats.js' Service.stop() already returns a Promise; enough for test teardown —
-    ;; full drain semantics are the lifecycle slice.
-    (.stop svc)))
+    ;; nats.js' Service.stop() DRAINS: it drains each endpoint subscription before
+    ;; resolving, so an in-flight request runs to completion and its reply lands
+    ;; before teardown, never dropped mid-request (ADR 0024). It returns the same
+    ;; `stopped` promise (null|Error); map it to nil so stop resolves to nil after
+    ;; teardown, idempotently (a second stop is a native no-op).
+    (.then (.stop svc) (fn [_] nil))))

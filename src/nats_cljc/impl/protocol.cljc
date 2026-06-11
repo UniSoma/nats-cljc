@@ -413,7 +413,9 @@
     "Create and start a Service from the portable `config`
      `{:name :version :description :metadata :endpoints}`, returning a native
      promise of a running Service handle — a platform record satisfying
-     `ServiceLifecycle`. Each endpoint `{:name :subject :handler :queue-group
+     `ServiceLifecycle`, carrying a `:stopped` native promise that resolves to nil
+     once the Service stops for any reason (the lifecycle parallel of the Watch
+     handle's `:initialized`, ADR 0024). Each endpoint `{:name :subject :handler :queue-group
      :metadata}` (already defaulted by the facade — `:subject` is non-nil) binds a
      queue-subscribed native handler; `handler` is the LOW-LEVEL handler, invoked
      per request with a raw map `{:subject :bytes :reply :headers ::native}` where
@@ -439,9 +441,10 @@
   "A running Service's lifecycle — implemented by the per-leg Service handle record
    `-create-service` resolves with."
   (-stop-service [svc]
-    "Stop the Service and tear it down, returning a native promise that settles
-     once it has stopped — enough for test teardown (full drain semantics and the
-     `:stopped` promise are the lifecycle slice's job)."))
+    "Stop the Service and tear it down, returning a native promise that resolves to
+     nil once it has stopped. DRAINS in-flight requests — a request being handled
+     when stop is called runs to completion and still receives its reply, never
+     dropped mid-request (ADR 0024). Idempotent: a second stop is a silent no-op."))
 
 (defprotocol OrderedPull
   "The pull triad over an Ordered consumer handle (the value `-js-ordered-consumer`

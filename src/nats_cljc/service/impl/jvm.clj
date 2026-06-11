@@ -55,14 +55,34 @@
     (when queue-group (.endpointQueueGroup seb ^String queue-group))
     (.build seb)))
 
+;; The Service handle the facade resolves to: the jnats `Service` to stop, plus the
+;; `stopped` future the facade's consumers read as `(:stopped handle)` — the
+;; lifecycle parallel of the Watch handle's `initialized` (ADR 0024). `startService`
+;; hands back a CompletableFuture that completes when the Service stops for any
+;; reason, so `stopped` is that future mapped to nil. `stopped?` makes stop
+;; idempotent OUR way (ADR 0012 spirit): a second stop is a silent no-op.
+(defrecord JvmService [^Service svc ^CompletableFuture stopped stopped?]
+  proto/ServiceLifecycle
+  (-stop-service [_]
+    ;; jnats' Service.stop() is void and DRAINS by default — an in-flight handler
+    ;; (the dispatcher thread blocked in `onMessage`) runs to completion and its
+    ;; reply lands before teardown, never dropped mid-request (ADR 0024). Run it
+    ;; off-thread (ADR 0002), then resolve the returned promise once `stopped`
+    ;; settles, so the promise resolves AFTER teardown completes.
+    (core/then
+     (do (when (compare-and-set! stopped? false true)
+           (CompletableFuture/runAsync (reify Runnable (run [_] (.stop svc)))))
+         stopped)
+     (fn [_] nil))))
+
 (extend-type JvmConnection
   proto/Service
   (-create-service [{:keys [^Connection client]} {:keys [name version description metadata endpoints]}]
     ;; No context, no entry verification (ADR 0024): build the Service with its
     ;; endpoints and start it. `startService` returns a CompletableFuture that
-    ;; completes when the Service stops, so we DON'T chain the handle off it; we
-    ;; start it and resolve the handle now — the endpoints' subscriptions are live
-    ;; synchronously once `build` returns.
+    ;; completes when the Service stops; we carry it on the handle as `stopped`
+    ;; (mapped to nil) and resolve the handle now — the endpoints' subscriptions
+    ;; are live synchronously once `build` returns.
     (core/then
      (core/resolved nil)
      (fn [_]
@@ -73,9 +93,10 @@
              _  (when description (.description sb ^String description))
              _  (when metadata (.metadata sb ^java.util.Map metadata))
              _  (doseq [ep endpoints] (.addServiceEndpoint sb (->endpoint ep)))
-             ^Service svc (.build sb)]
-         (.startService svc)
-         svc))))
+             ^Service svc (.build sb)
+             native-stopped (.startService svc)
+             stopped (core/then native-stopped (fn [_] nil))]
+         (->JvmService svc stopped (atom false))))))
   (-respond [{:keys [^Connection client]} ^ServiceMessage native ^bytes bytes]
     (.respond native client bytes)
     nil)
@@ -90,14 +111,3 @@
               (.add ServiceMessage/NATS_SERVICE_ERROR_CODE ^java.util.Collection [(str code)]))]
       (.respond native client ^bytes (or bytes (byte-array 0)) h))
     nil))
-
-(extend-type Service
-  proto/ServiceLifecycle
-  (-stop-service [^Service svc]
-    ;; jnats' Service.stop() is void (it tears the Service's subscriptions down and
-    ;; completes the future startService handed back); run it off-thread so the
-    ;; facade returns a settling promise (ADR 0002). Enough for test teardown —
-    ;; full drain semantics are the lifecycle slice.
-    (CompletableFuture/runAsync
-     (reify Runnable
-       (run [_] (.stop svc))))))

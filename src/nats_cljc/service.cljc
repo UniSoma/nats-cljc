@@ -90,7 +90,12 @@
    composes a grouped subject directly (ADR 0024).
 
    The Service binds `conn`'s default codec at create, used to decode every request
-   and encode every reply (the `:codec` create override is the codec slice)."
+   and encode every reply (the `:codec` create override is the codec slice).
+
+   The resolved Service handle carries a `:stopped` key holding a platform-native
+   promise that resolves to nil once the Service stops for any reason — the
+   react-to-shutdown signal the lifecycle parallel of the Watch handle's
+   `:initialized` (ADR 0024), so a consumer awaits it instead of polling."
   [conn {:keys [endpoints] :as config}]
   (let [codec (:codec conn)]
     (-> (impl/resolved nil)
@@ -150,8 +155,12 @@
        :description description})))
 
 (defn stop
-  "Stop the Service `svc`, returning a platform-native promise that settles once it
-   has stopped — tearing the Service's endpoints down (enough for test teardown;
-   full drain semantics and a `:stopped` promise are the lifecycle slice, ADR 0024)."
+  "Stop the Service `svc`, returning a platform-native promise that resolves to nil
+   once it has stopped — tearing the Service's endpoints down (ADR 0024). The stop
+   DRAINS in-flight requests: a request being handled when `stop` is called runs to
+   completion and still receives its reply, never dropped mid-request. After it
+   settles the endpoints are gone, so a fresh request to one rejects with the
+   canonical `:no-responders` (ADR 0006) — services hosts no responder once stopped.
+   Idempotent: a second `stop` is a safe no-op. There is no `reset` in v1."
   [svc]
   (proto/-stop-service svc))
