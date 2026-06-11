@@ -1,25 +1,26 @@
 ---
 id: nts-01ktvnz0v6pp
 title: nats-io trio floor 3.4.0 with @nats-io/services in lockstep
-status: in_progress
+status: closed
 type: chore
 priority: 2
 mode: afk
 created: '2026-06-11T15:49:10.629969334Z'
-updated: '2026-06-11T16:03:52.206787564Z'
+updated: '2026-06-11T16:06:59.189299892Z'
+closed: '2026-06-11T16:06:59.189299892Z'
 parent: nts-01ktvn87why4
 tags:
 - services
 - phase-4
 acceptance:
 - title: nats-core, @nats-io/jetstream and @nats-io/kv are pinned at 3.4.0 in deps.cljs :npm-deps and the root package.json, in one change
-  done: false
+  done: true
 - title: '@nats-io/services is declared unconditionally at 3.4.0, lockstep-pinned with the trio'
-  done: false
+  done: true
 - title: The full existing test suite is green on JVM and Node against the 3.4.0 floor
-  done: false
+  done: true
 - title: Existing bundle-check and externs-check guards stay green; clj-kondo lint is clean
-  done: false
+  done: true
 ---
 
 ## Description
@@ -29,3 +30,9 @@ Enacts the dependency half of ADR 0026 in isolation, before any service code exi
 No service code lands here — nothing imports the new package yet, so bundles are unchanged; the :services bundle/externs guards arrive with the tracer slice.
 
 The point of slicing this off: the floor move is the behavior-breaking risk of Phase 4, and it must be proven green by us, not a consumer. Verification is the full existing suite (core, JetStream, KV) on JVM + Node against the shared server, plus the existing bundle-check/externs-check guards and lint.
+
+## Notes
+
+**2026-06-11T16:06:59.189299892Z**
+
+Floored nats-io trio (@nats-io/nats-core, @nats-io/jetstream, @nats-io/kv) at 3.4.0 and added @nats-io/services at 3.4.0, unconditional + lockstep-pinned, in src/deps.cljs :npm-deps and root package.json (ADR 0026). npm install dedupes one nats-core@3.4.0 (nuid 2.0.3->3.0.0 transitively). No service code; bundles unchanged. Verified: clj-kondo clean, bundle:check + externs:check green, full suite green on JVM (212 tests/701 assertions) and Node (183 tests/610 assertions).
