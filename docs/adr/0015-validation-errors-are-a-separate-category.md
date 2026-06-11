@@ -4,7 +4,7 @@ The library throws five **validation** `:type`s — `:invalid-header`, `:invalid
 
 A Validation error is defined by three guarantees, not by a sync/async axis (that axis does **not** separate the categories — `connect` rejects its promise with the operational `:connect-failed` *and* with the validation `:invalid-max`):
 
-1. **Raised through the operation's own channel.** A synchronous operation **throws** it; the one promise-returning operation that validates, `connect`, **rejects its promise** with it. The contract promises neither "always throws" nor "always rejects" — it promises the operation's own return convention.
+1. **Raised through the operation's own channel.** A synchronous operation **throws** it; a promise-returning operation that validates (`connect`, `service/create`) **rejects its promise** with it. The contract promises neither "always throws" nor "always rejects" — it promises the operation's own return convention.
 2. **Before any native NATS call** — fail-fast on the argument; nothing reaches jnats/nats.js.
 3. **Never an async sink.** This is *the* distinguishing, testable line: a Validation error never reaches `:on-error` or `:on-status`. The sinks are exclusively the NATS error model's channel — a NATS error *can* go to a sink; a Validation error never does.
 

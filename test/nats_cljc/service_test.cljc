@@ -158,7 +158,8 @@
 ;; Service's bound :string ENCODED the reply — had it wrongly used the :edn default,
 ;; the bytes would be the quoted "\"{:n 7}\"" and the :edn decode would give the
 ;; string, not the map). That :edn-decode = map assertion is the red-before-green
-;; lever: the pre-slice respond, encoding with the connection :edn default, fails it.
+;; lever: a respond that ignores the bound codec and encodes with the connection
+;; :edn default fails it.
 ;;
 ;; The override endpoint flips it back per call: the Service is :string, but its
 ;; handler responds the string "hi" with a per-call {:codec :edn} override, so the
