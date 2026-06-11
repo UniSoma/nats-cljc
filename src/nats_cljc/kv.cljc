@@ -288,15 +288,17 @@
    :delta     (:delta raw)})
 
 (defn- watch-keys
-  "Normalize a watch `:keys` option — one subject-style key pattern or a sequence
-   of them — to nil (every key) or a non-empty vector of pattern strings, the one
-   shape the impls take. Patterns are subject-style (wildcards welcome), so they
-   are deliberately NOT `validate-key`-guarded — the `keys` filter precedent."
+  "Normalize a watch `:keys` option — one subject-style key pattern or a
+   non-empty sequence of them (`bucket/validate-watch-keys` rejects an empty
+   sequence upstream) — to nil (every key) or a non-empty vector of pattern
+   strings, the one shape the impls take. Patterns are subject-style (wildcards
+   welcome), so they are deliberately NOT `validate-key`-guarded — the `keys`
+   filter precedent."
   [ks]
   (cond
     (nil? ks)    nil
     (string? ks) [ks]
-    :else        (when (seq ks) (vec ks))))
+    :else        (vec ks)))
 
 (defn watch
   "Watch the Bucket `handle` for changes — the open-ended observation that feels
@@ -319,8 +321,11 @@
    call (ADR 0015).
 
    `:keys` restricts the Watch to one subject-style key pattern (e.g.
-   `\"user.>\"`) or a vector of patterns, delivering their union — replay and
-   stream alike; without it every key is watched. `:ignore-deletes?` true
+   `\"user.>\"`) or a non-empty vector of patterns, delivering their union —
+   replay and stream alike; without it every key is watched. An EMPTY vector
+   rejects pre-flight with a validation `:type :invalid-keys` carrying the
+   offending `:keys` (ADR 0015) — the union of zero patterns matches nothing,
+   never every key. `:ignore-deletes?` true
    suppresses Tombstone and purge-marker deliveries (the default delivers them,
    `:operation` visible) — cache maintainers skip markers, event-log consumers
    observe them. `:on-error` is this Watch's async-failure sink (ADR 0006/0007,
@@ -331,7 +336,9 @@
   ([handle handler] (watch handle handler {}))
   ([handle handler opts]
    (-> (impl/resolved nil)
-       (impl/then (fn [_] (bucket/validate-deliver (:deliver opts :latest))))
+       (impl/then (fn [_]
+                    (bucket/validate-watch-keys (:keys opts))
+                    (bucket/validate-deliver (:deliver opts :latest))))
        (impl/bind (fn [deliver]
                     (proto/-kv-watch handle
                                      {:deliver         deliver

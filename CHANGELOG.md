@@ -66,7 +66,8 @@ additive ⇒ minor bump (ADR 0009).
   next delivery — ADR 0007), with a closed `:deliver` mode (`:latest` default
   / `:history` / `:updates`; anything else is the new validation
   `:type :invalid-deliver`), `:keys` pattern filtering (one subject-style
-  pattern or a vector — their union), `:ignore-deletes?` to suppress marker
+  pattern or a non-empty vector — their union; an empty vector is the new
+  validation `:type :invalid-keys`), `:ignore-deletes?` to suppress marker
   deliveries, and a per-watch `:on-error` sink with the core-subscription
   override semantics. The watch handle carries an `:initialized` promise —
   the "cache is warm" signal — and `stop` ends it, idempotently.

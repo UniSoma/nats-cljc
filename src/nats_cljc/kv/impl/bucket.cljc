@@ -92,6 +92,18 @@
     (throw (ex-info "Invalid watch :deliver mode" {:type :invalid-deliver :deliver deliver})))
   deliver)
 
+(defn validate-watch-keys
+  "Guard a watch `:keys` option pre-flight: an EMPTY sequence of patterns throws
+   a `:type :invalid-keys` ex-info carrying the offending `:keys` (ADR 0015) —
+   the union of zero patterns matches nothing, and silently widening it to
+   every key would invert the caller's intent. nil (every key), one pattern
+   string, and a non-empty sequence pass through; returns `ks` so it can sit in
+   a promise chain stage."
+  [ks]
+  (when (and (sequential? ks) (empty? ks))
+    (throw (ex-info "Watch :keys must not be empty" {:type :invalid-keys :keys ks})))
+  ks)
+
 (defn validate-config
   "Guard a portable Bucket `config` map pre-flight (ADR 0015), before any native
    call: an unrecognized key (the map is closed) throws `:type :unknown-config-key`

@@ -1241,6 +1241,27 @@
                                              (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))))
       ":invalid-deliver carries the offending :deliver"))
 
+;; Deep-module unit (ADR 0015), no server: the watch :keys seam — nil (every
+;; key), one pattern string, or a non-empty sequence of patterns pass through;
+;; an EMPTY sequence raises the validation `:type :invalid-keys` carrying the
+;; offending `:keys`, pre-flight before any native call — the union of zero
+;; patterns matches nothing, and silently widening it to every key would invert
+;; the caller's intent.
+(deftest deep-module-watch-keys-validation
+  (is (nil? (bucket/validate-watch-keys nil))
+      "nil (every key) passes validation unchanged")
+  (is (= "user.>" (bucket/validate-watch-keys "user.>"))
+      "one pattern string passes validation unchanged")
+  (is (= ["user.>" "other.1"] (bucket/validate-watch-keys ["user.>" "other.1"]))
+      "a non-empty pattern vector passes validation unchanged")
+  (is (= :invalid-keys (thrown-type #(bucket/validate-watch-keys [])))
+      "an empty pattern vector is :invalid-keys — the union of zero patterns matches nothing")
+  (is (= :invalid-keys (thrown-type #(bucket/validate-watch-keys '())))
+      "an empty pattern list is :invalid-keys")
+  (is (= [] (:keys (ex-data (try (bucket/validate-watch-keys [])
+                                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))))
+      ":invalid-keys carries the offending :keys"))
+
 ;; The default watch (:deliver :latest): each key's CURRENT value replays first —
 ;; older revisions never appear — each matching Entry pushed to the Handler with
 ;; :value decoded through the Bucket's Codec; the handle's :initialized Promise
@@ -1486,7 +1507,9 @@
 ;; :keys restricts a Watch to subject-style key patterns: a single pattern
 ;; delivers only matching keys (replay AND stream alike), a vector of patterns
 ;; delivers their union, and a pattern matching nothing still resolves
-;; :initialized — there is just nothing to replay.
+;; :initialized — there is just nothing to replay. An EMPTY pattern vector
+;; rejects pre-flight with the validation :type :invalid-keys (the union of
+;; zero patterns matches nothing — it never silently widens to every key).
 (deftest watch-keys-filters-deliveries
   (let [bucket "TRACER_KV_WATCH_KEYS"]
     #?(:clj
@@ -1523,6 +1546,8 @@
                          "the streamed delivery is the matching new write")
                      (is (not (wait-for #(pos? (count @none)) 800))
                          "a Watch whose pattern matches nothing receives no deliveries")
+                     (is (= :invalid-keys (:type (ex-data (reject-reason (kv/watch handle identity {:keys []})))))
+                         "an empty :keys vector rejects the watch promise as a validation error")
                      (finally (kv/stop w1) (kv/stop w2) (kv/stop w3)))))))))
        :cljs
        (async done
@@ -1560,7 +1585,11 @@
                                     (is (= "user.3" (:key (last @one)))
                                         "the streamed delivery is the matching new write")
                                     (is (not miss?)
-                                        "a Watch whose pattern matches nothing receives no deliveries")))
+                                        "a Watch whose pattern matches nothing receives no deliveries")
+                                    (-> (kv/watch handle identity {:keys []})
+                                        (p/then (fn [_] (is false "expected :invalid-keys from watch")))
+                                        (p/catch (fn [e] (is (= :invalid-keys (:type (ex-data e)))
+                                                             "an empty :keys vector rejects the watch promise as a validation error"))))))
                                 (p/finally (fn [_ _] (kv/stop w1) (kv/stop w2) (kv/stop w3)))))))))))))))
 
 ;; :ignore-deletes? true suppresses Tombstone AND purge-marker deliveries —
