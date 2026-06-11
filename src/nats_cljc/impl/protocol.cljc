@@ -426,7 +426,14 @@
      `bytes`, routing through that native message (not a bare publish to the reply
      subject) so the owning endpoint's native stats stay correct — the service
      analog of `-publish` to a reply subject, threading `conn` as jnats'
-     `ServiceMessage.respond(conn, bytes)` requires. Returns nil."))
+     `ServiceMessage.respond(conn, bytes)` requires. Returns nil.")
+  (-respond-error [conn native code description bytes]
+    "Reply to the request whose native service message is `native` with a service
+     error (ADR 0025): integer `code`, string `description`, and optional raw
+     `bytes` as the body (nil for an empty body), routed through that native
+     message so the owning endpoint's native ERROR stats stay correct. Sets the
+     `Nats-Service-Error` / `Nats-Service-Error-Code` headers the facade's `error`
+     reads back; `conn` is threaded as in `-respond`. Returns nil."))
 
 (defprotocol ServiceLifecycle
   "A running Service's lifecycle — implemented by the per-leg Service handle record

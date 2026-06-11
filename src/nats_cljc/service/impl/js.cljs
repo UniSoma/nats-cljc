@@ -38,12 +38,24 @@
    defaulted by the facade, `:handler` already the low-level decode wrapper). The
    function handler makes nats.js dispatch via a callback subscription, invoking
    `(err, msg)` per request — the err arm closes the subscription, so deliver only
-   on a normal message; the handler's return flows back (its promise is not awaited
-   natively here — per-endpoint backpressure is the serialization-gate slice)."
+   on a normal message. nats.js auto-replies a 500 on a SYNCHRONOUS handler throw
+   but does not await the handler's returned promise, so a rejected promise is
+   awaited here to auto-reply 500 too (ADR 0025); per-endpoint backpressure (gating
+   the next delivery on it) is still the serialization-gate slice's job."
   [^js svc {:keys [name subject handler queue-group]}]
   (let [opts #js {:subject subject
                   :handler (fn [err ^js msg]
-                             (when-not err (handler (msg->raw msg))))}]
+                             (when-not err
+                               ;; nats.js auto-replies a 500 on a SYNCHRONOUS handler
+                               ;; throw, but does NOT await the handler's returned
+                               ;; promise — so a handler that REJECTS would leave the
+                               ;; caller hanging. Await it here and auto-reply 500
+                               ;; ourselves on rejection, so both failure modes land
+                               ;; the same error reply the JVM gets for free (ADR 0025).
+                               (let [r (handler (msg->raw msg))]
+                                 (when (and r (fn? (.-then r)))
+                                   (.catch r (fn [e]
+                                               (.respondError msg 500 (str (or (.-message e) e)) (js/Uint8Array.))))))))}]
     (when queue-group (set! (.-queue opts) queue-group))
     (.addEndpoint svc name opts)))
 
@@ -66,6 +78,12 @@
     ;; Route through the native ServiceMsg (not a bare publish to the reply
     ;; subject) so the owning endpoint's native stats stay correct (ADR 0024).
     (.respond native bytes)
+    nil)
+  (-respond-error [_ ^js native code description bytes]
+    ;; nats.js' own `respondError(code, description, data?, opts?)` sets the two
+    ;; error headers and routes through the ServiceMsg, so reuse it rather than
+    ;; rebuilding the headers — an empty body when no `data` was given (ADR 0025).
+    (.respondError native code (str description) (or bytes (js/Uint8Array.)))
     nil))
 
 (extend-type JsService

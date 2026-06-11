@@ -29,6 +29,14 @@
 ;; this key directly, exactly as `core/reply` threads `:reply`.
 (def ^:private ^:no-doc native-key ::native)
 
+;; The two wire headers a service error reply carries — the same case-sensitive
+;; names on both legs (jnats `ServiceMessage.NATS_SERVICE_ERROR*`, nats.js
+;; `ServiceErrorHeader*`): the description and the integer code (carried as its
+;; string form on the wire). `error` reads them back off a reply Message; the impls
+;; set them when answering an error (ADR 0025).
+(def ^:private ^:no-doc error-header "Nats-Service-Error")
+(def ^:private ^:no-doc error-code-header "Nats-Service-Error-Code")
+
 (defn- decode-request
   "Lift one raw request map `{:subject :bytes :reply :headers ::native}` into the
    public message the endpoint handler sees: `{:subject :data :reply ::native}`,
@@ -90,6 +98,43 @@
    (proto/-respond conn (get msg native-key)
                    (codec/encode (msg/effective-codec conn opts) data))
    nil))
+
+(defn respond-error
+  "Reply to a request message `msg` with a first-class service error (ADR 0025):
+   an integer `code` and a string `description`, optionally carrying `data` as the
+   reply body (encoded with `conn`'s codec, as `respond`), routed through the
+   request's native service message so the owning endpoint's native error stats
+   stay correct. Sets the `Nats-Service-Error` / `Nats-Service-Error-Code` headers
+   the caller reads back with `error`; conn is threaded as in `respond`. Returns nil.
+
+   This is a SUCCESSFUL reply carrying an error payload, not a transport failure —
+   the caller's plain `core/request` resolves normally and branches on
+   `(service/error reply)`, which is `{:code … :description …}` here (ADR 0025). A
+   handler that throws or returns a rejected promise auto-replies the same shape
+   with code 500; this is the explicit form. `opts` may set `:codec` to override the
+   connection default for the `data` encode (ADR 0011)."
+  ([conn msg code description] (respond-error conn msg code description nil {}))
+  ([conn msg code description data] (respond-error conn msg code description data {}))
+  ([conn msg code description data opts]
+   (proto/-respond-error conn (get msg native-key) code description
+                         (some->> data (codec/encode (msg/effective-codec conn opts))))
+   nil))
+
+(defn error
+  "Read the service error a reply Message `msg` carries (ADR 0025): `nil` when the
+   reply is a normal success, or `{:code <int> :description <string>}` when the
+   Service answered with an error (`respond-error`, or the auto-500 on a thrown /
+   rejected handler). The opt-in reader of the `Nats-Service-Error` /
+   `Nats-Service-Error-Code` headers `core/request` leaves intact on the reply — a
+   service error is data the caller branches on, NOT a thrown transport failure, so
+   `core/request` resolves normally and never sniffs these headers (ADR 0025). The
+   `:code` is returned as an integer, parsed from the header's wire string form."
+  [msg]
+  (let [headers (:headers msg)]
+    (when-let [description (first (get headers error-header))]
+      {:code        (#?(:clj Long/parseLong :cljs js/parseInt)
+                     (first (get headers error-code-header)))
+       :description description})))
 
 (defn stop
   "Stop the Service `svc`, returning a platform-native promise that settles once it

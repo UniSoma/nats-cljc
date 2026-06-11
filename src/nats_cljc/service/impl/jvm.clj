@@ -14,6 +14,7 @@
             [nats-cljc.impl.jvm :as core])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection]
+           [io.nats.client.impl Headers]
            [io.nats.service Service ServiceEndpoint Endpoint ServiceMessage ServiceMessageHandler]
            [java.util.concurrent CompletableFuture CompletionStage]))
 
@@ -77,6 +78,17 @@
          svc))))
   (-respond [{:keys [^Connection client]} ^ServiceMessage native ^bytes bytes]
     (.respond native client bytes)
+    nil)
+  (-respond-error [{:keys [^Connection client]} ^ServiceMessage native code description ^bytes bytes]
+    ;; jnats' `respondStandardError` carries no body, so build the error headers
+    ;; ourselves and route through the regular `respond(conn, bytes, headers)` —
+    ;; same reply path, so the endpoint's native error stats count it and an
+    ;; optional `data` body rides along (ADR 0025). The two header names are jnats'
+    ;; own public constants; the code is its string wire form.
+    (let [h (doto (Headers.)
+              (.add ServiceMessage/NATS_SERVICE_ERROR ^java.util.Collection [(str description)])
+              (.add ServiceMessage/NATS_SERVICE_ERROR_CODE ^java.util.Collection [(str code)]))]
+      (.respond native client ^bytes (or bytes (byte-array 0)) h))
     nil))
 
 (extend-type Service

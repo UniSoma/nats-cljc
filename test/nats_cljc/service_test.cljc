@@ -254,3 +254,119 @@
                                                      "after stop the endpoint is gone — a request rejects with :no-responders"))))))
                         (p/catch (fn [e]
                                    (is false (str "stop teardown failed unexpectedly: " e))))))))))))
+
+;; (respond-error conn msg code description data?) reaches the caller as a reply
+;; whose (service/error msg) is {:code … :description …}, with the data? body
+;; decoded as a normal reply; a SUCCESS reply reads (service/error) => nil. And
+;; core/request RESOLVES (does not reject) on a service-error reply — an application
+;; error is data the caller branches on, not a thrown transport failure (ADR 0025).
+(deftest respond-error-reaches-the-caller-as-a-reply-payload
+  (let [config {:name "err_svc" :version "0.1.0"
+                :endpoints [{:name "bad"  :subject "errs.svc.bad"  :handler (fn [_] :placeholder)}
+                            {:name "good" :subject "errs.svc.good" :handler (fn [_] :placeholder)}]}]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [cfg (-> config
+                         (assoc-in [:endpoints 0 :handler]
+                                   (fn [msg] (service/respond-error conn msg 400 "bad input" {:why :nope})))
+                         (assoc-in [:endpoints 1 :handler]
+                                   (fn [msg] (service/respond conn msg {:ok true}))))
+                 svc (deref (service/create conn cfg) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (let [err (deref (nats/request conn "errs.svc.bad" {} {:timeout-ms 5000}) 5000 ::timeout)
+                       ok  (deref (nats/request conn "errs.svc.good" {} {:timeout-ms 5000}) 5000 ::timeout)]
+                   (is (not= ::timeout err) "core/request RESOLVES on a service-error reply (does not reject/time out)")
+                   (is (= {:code 400 :description "bad input"} (service/error err))
+                       "(service/error reply) reads the {:code :description} the handler responded")
+                   (is (= {:why :nope} (:data err)) "the data? body rides the error reply, codec-decoded")
+                   (is (nil? (service/error ok)) "(service/error reply) is nil on a success reply")
+                   (is (= {:ok true} (:data ok)) "a success reply decodes normally")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [cfg (-> config
+                                (assoc-in [:endpoints 0 :handler]
+                                          (fn [msg] (service/respond-error conn msg 400 "bad input" {:why :nope})))
+                                (assoc-in [:endpoints 1 :handler]
+                                          (fn [msg] (service/respond conn msg {:ok true}))))]
+                    (-> (service/create conn cfg)
+                        (p/then (fn [svc]
+                                  (with-service svc
+                                    (fn []
+                                      (p/let [err (nats/request conn "errs.svc.bad" {} {:timeout-ms 5000})
+                                              ok  (nats/request conn "errs.svc.good" {} {:timeout-ms 5000})]
+                                        (is (= {:code 400 :description "bad input"} (service/error err))
+                                            "(service/error reply) reads the {:code :description} the handler responded")
+                                        (is (= {:why :nope} (:data err)) "the data? body rides the error reply, codec-decoded")
+                                        (is (nil? (service/error ok)) "(service/error reply) is nil on a success reply")
+                                        (is (= {:ok true} (:data ok)) "a success reply decodes normally"))))))
+                        (p/catch (fn [e]
+                                   (is false (str "request rejected unexpectedly: " e))))))))))))
+
+;; A handler that THROWS or returns a REJECTED promise auto-replies code 500 with
+;; the exception's description (ADR 0025) — core/request still resolves, and
+;; (service/error reply) is {:code 500 :description <non-empty>}. The exact
+;; description text differs per leg (jnats' Throwable.toString vs the JS error
+;; message), so assert the code and a non-blank description, not exact equality.
+(deftest a-thrown-or-rejected-handler-auto-replies-500
+  (let [config {:name "auto500_svc" :version "0.1.0"
+                :endpoints [{:name "throws"  :subject "errs.svc.throws"
+                             :handler (fn [_] (throw (ex-info "kaboom" {})))}
+                            {:name "rejects" :subject "errs.svc.rejects"
+                             :handler (fn [_]
+                                        #?(:clj  (doto (java.util.concurrent.CompletableFuture.)
+                                                   (.completeExceptionally (ex-info "kaboom" {})))
+                                           :cljs (p/rejected (ex-info "kaboom" {}))))}]}]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [svc (deref (service/create conn config) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (doseq [subject ["errs.svc.throws" "errs.svc.rejects"]]
+                   (let [reply (deref (nats/request conn subject {} {:timeout-ms 5000}) 5000 ::timeout)
+                         err   (service/error reply)]
+                     (is (not= ::timeout reply) (str subject " resolves (never hangs to timeout)"))
+                     (is (= 500 (:code err)) (str subject " auto-replies code 500"))
+                     (is (and (string? (:description err)) (seq (:description err)))
+                         (str subject " carries the exception's description")))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (service/create conn config)
+                      (p/then (fn [svc]
+                                (with-service svc
+                                  (fn []
+                                    (p/let [throws  (nats/request conn "errs.svc.throws" {} {:timeout-ms 5000})
+                                            rejects (nats/request conn "errs.svc.rejects" {} {:timeout-ms 5000})]
+                                      (doseq [reply [throws rejects]]
+                                        (let [err (service/error reply)]
+                                          (is (= 500 (:code err)) "auto-replies code 500")
+                                          (is (and (string? (:description err)) (seq (:description err)))
+                                              "carries the exception's description"))))))))
+                      (p/catch (fn [e]
+                                 (is false (str "request rejected unexpectedly: " e)))))))))))
+
+;; A request to a subject NO Service hosts rejects with the normalized
+;; :no-responders Error — services does not change the canonical Error set; an
+;; absent responder is still transport, not a service-error payload (ADR 0025).
+(deftest request-to-an-unhosted-subject-rejects-no-responders
+  #?(:clj
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [e (reject-reason (nats/request conn "errs.svc.nobody" {} {:timeout-ms 800}))]
+           (is (= :no-responders (:type (ex-data e)))
+               "no Service hosts the subject — the request rejects with :no-responders"))))
+     :cljs
+     (async done
+            (with-conn {:servers [server-url]} done
+              (fn [conn]
+                (-> (nats/request conn "errs.svc.nobody" {} {:timeout-ms 800})
+                    (p/then (fn [_] (is false "expected :no-responders for an unhosted subject")))
+                    (p/catch (fn [e]
+                               (is (= :no-responders (:type (ex-data e)))
+                                   "no Service hosts the subject — the request rejects with :no-responders")))))))))
