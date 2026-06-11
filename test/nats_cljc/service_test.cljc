@@ -468,7 +468,7 @@
                      (is (= 2 (count @entries)) "both handler invocations were recorded")
                      (is (>= (- e2 e1) floor-ms)
                          "the 2nd handler did not enter until the 1st's awaited promise settled (serial delivery)"))
-                   (let [st (first (deref (service/stats conn {:name "gate_svc"}) 5000 ::timeout))
+                   (let [st (first (deref (service/stats conn {:name "gate_svc"}) 10000 ::timeout))
                          ep (first (:endpoints st))]
                      (is (>= (:processing-time-ns ep) floor-ns)
                          ":processing-time-ns reflects the awaited handler duration, not the synchronous callback time"))))))))
@@ -692,9 +692,9 @@
            (let [svc (deref (service/create conn config) 5000 ::timeout)]
              (with-service svc
                (fn []
-                 (check (deref (service/ping conn opts) 5000 ::timeout)
-                        (deref (service/info conn opts) 5000 ::timeout)
-                        (deref (service/stats conn opts) 5000 ::timeout)))))))
+                 (check (deref (service/ping conn opts) 10000 ::timeout)
+                        (deref (service/info conn opts) 10000 ::timeout)
+                        (deref (service/stats conn opts) 10000 ::timeout)))))))
        :cljs
        (async done
               (with-conn {:servers [server-url]} done
@@ -726,11 +726,11 @@
            (let [svc (deref (service/create conn config) 5000 ::timeout)]
              (with-service svc
                (fn []
-                 (let [pn (deref (service/ping conn {:name "disc_narrow"}) 5000 ::timeout)
+                 (let [pn (deref (service/ping conn {:name "disc_narrow"}) 10000 ::timeout)
                        id (:id (first pn))]
                    (check pn
-                          (deref (service/ping conn {:name "disc_narrow" :id id}) 5000 ::timeout)
-                          (deref (service/ping conn {:name "disc_narrow" :id "no-such-id"}) 5000 ::timeout))))))))
+                          (deref (service/ping conn {:name "disc_narrow" :id id}) 10000 ::timeout)
+                          (deref (service/ping conn {:name "disc_narrow" :id "no-such-id"}) 10000 ::timeout))))))))
        :cljs
        (async done
               (with-conn {:servers [server-url]} done
@@ -777,6 +777,32 @@
                                       (check timed capped))))))
                       (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
 
+;; JVM-only (ADR 0001/0002): the discovery gather runs OFF the caller's thread.
+;; With :name narrowing and one live instance below the default :max-results, the
+;; jnats fan-out keeps gathering for its full :timeout-ms window before resolving —
+;; so if `service/ping` itself returns well inside that window, the caller's thread
+;; was never blocked on the gather; the promise still resolves the same normalized
+;; vector afterwards.
+#?(:clj
+   (deftest discovery-gathers-off-the-callers-thread
+     (with-conn {:servers [server-url]}
+       (fn [conn]
+         (let [config {:name "disc_offload" :version "1.0.0"
+                       :endpoints [{:name "e" :subject "disc.offload.e"
+                                    :handler (fn [_] :placeholder)}]}
+               svc (deref (service/create conn config) 5000 ::timeout)]
+           (with-service svc
+             (fn []
+               (let [t0 (System/nanoTime)
+                     p  (service/ping conn {:name "disc_offload" :timeout-ms 2000})
+                     elapsed-ms (/ (- (System/nanoTime) t0) 1e6)]
+                 (is (< elapsed-ms 1000)
+                     (str "ping returned the caller's thread inside the 2000ms fan-out window"
+                          " (took " (long elapsed-ms) "ms)"))
+                 (is (= ["disc_offload"]
+                        (mapv :name (deref p 5000 ::timeout)))
+                     "the off-thread gather still resolves the normalized vector")))))))))
+
 ;; Stats counters MOVE: a handled request increments the endpoint's request count,
 ;; and an error reply — a `respond-error` OR a thrown handler — increments its error
 ;; count (the half deferred from the errors slice, ADR 0025). Both error forms count
@@ -803,7 +829,7 @@
                (fn []
                  (doseq [s ["disc.cnt.ok" "disc.cnt.rerr" "disc.cnt.boom"]]
                    (deref (nats/request conn s {} {:timeout-ms 5000}) 5000 ::timeout))
-                 (let [st (first (deref (service/stats conn {:name "disc_counters"}) 5000 ::timeout))
+                 (let [st (first (deref (service/stats conn {:name "disc_counters"}) 10000 ::timeout))
                        by (into {} (map (juxt :name identity) (:endpoints st)))]
                    (check by)))))))
        :cljs
@@ -842,9 +868,9 @@
            (let [svc (deref (service/create conn config) 5000 ::timeout)]
              (with-service svc
                (fn []
-                 (check (deref (service/ping conn {:name "disc_zero"}) 5000 ::timeout)
-                        (deref (service/info conn {:name "disc_zero"}) 5000 ::timeout)
-                        (deref (service/stats conn {:name "disc_zero"}) 5000 ::timeout)))))))
+                 (check (deref (service/ping conn {:name "disc_zero"}) 10000 ::timeout)
+                        (deref (service/info conn {:name "disc_zero"}) 10000 ::timeout)
+                        (deref (service/stats conn {:name "disc_zero"}) 10000 ::timeout)))))))
        :cljs
        (async done
               (with-conn {:servers [server-url]} done

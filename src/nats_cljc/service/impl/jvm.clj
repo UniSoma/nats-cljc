@@ -20,7 +20,9 @@
             Discovery PingResponse InfoResponse StatsResponse EndpointStats]
            [java.time.format DateTimeFormatter DateTimeFormatterBuilder]
            [java.time ZonedDateTime]
-           [java.util.concurrent CompletableFuture CompletionStage]))
+           [java.util.concurrent CompletableFuture CompletionStage ExecutorService
+            RejectedExecutionException]
+           [java.util.function Supplier]))
 
 (defn- msg->raw
   "Lift a jnats `ServiceMessage` into the raw map the facade decodes (the core
@@ -79,17 +81,38 @@
          stopped)
      (fn [_] nil))))
 
+(defn- off-thread
+  "Run the blocking Services thunk `f` off the caller's thread (ADR 0002) on the
+   connection's IO `executor` — never the shared commonPool, so a long discovery
+   fan-out can't starve unrelated work (the JetStream/KV impls' shared idiom).
+   `then identity` re-wraps so a rejection surfaces as the BARE ex-info (ADR 0006).
+   A submit racing the connection's close hits a shut-down executor
+   (RejectedExecutionException); surface it as the same retry-able
+   `:connection-closed` a closed connection's round-trip would, as a rejected
+   future so the facade still settles rather than throwing (ADR 0002/0006)."
+  [^ExecutorService executor f]
+  (core/then
+   (try
+     (CompletableFuture/supplyAsync
+      (reify Supplier (get [_] (f)))
+      executor)
+     (catch RejectedExecutionException _
+       (CompletableFuture/failedFuture
+        (ex-info "Connection is closed" {:type :connection-closed}))))
+   identity))
+
 (extend-type JvmConnection
   proto/Service
-  (-create-service [{:keys [^Connection client]} {:keys [name version description metadata endpoints]}]
+  (-create-service [{:keys [^Connection client io-executor]} {:keys [name version description metadata endpoints]}]
     ;; No context, no entry verification (ADR 0024): build the Service with its
-    ;; endpoints and start it. `startService` returns a CompletableFuture that
-    ;; completes when the Service stops; we carry it on the handle as `stopped`
-    ;; (mapped to nil) and resolve the handle now — the endpoints' subscriptions
-    ;; are live synchronously once `build` returns.
-    (core/then
-     (core/resolved nil)
-     (fn [_]
+    ;; endpoints and start it, off the caller's thread (ADR 0002). `startService`
+    ;; returns a CompletableFuture that completes when the Service stops; we carry
+    ;; it on the handle as `stopped` (mapped to nil) and resolve the handle — the
+    ;; endpoints' subscriptions are live once `build` returns, before the handle
+    ;; resolves.
+    (off-thread
+     io-executor
+     (fn []
        (let [sb (-> (Service/builder)
                     (.connection client)
                     (.name name)
@@ -209,31 +232,32 @@
 
 (extend-type JvmConnection
   proto/Discovery
-  (-ping [{:keys [^Connection client]} {:keys [name id] :as opts}]
+  (-ping [{:keys [^Connection client io-executor]} {:keys [name id] :as opts}]
     ;; jnats' Discovery has no List-returning 2-arg ping; narrowing to a single
     ;; instance (name + id) returns one response (or null when absent), so wrap it
-    ;; into the same VECTOR the broadcast variants drain into (ADR 0024).
-    (core/then
-     (core/resolved nil)
-     (fn [_]
+    ;; into the same VECTOR the broadcast variants drain into (ADR 0024). The
+    ;; blocking fan-out gathers off the caller's thread (ADR 0002, `off-thread`).
+    (off-thread
+     io-executor
+     (fn []
        (let [d (discovery client opts)]
          (mapv ping->edn
                (cond (and name id) (remove nil? [(.ping d ^String name ^String id)])
                      name          (.ping d ^String name)
                      :else         (.ping d)))))))
-  (-info [{:keys [^Connection client]} {:keys [name id] :as opts}]
-    (core/then
-     (core/resolved nil)
-     (fn [_]
+  (-info [{:keys [^Connection client io-executor]} {:keys [name id] :as opts}]
+    (off-thread
+     io-executor
+     (fn []
        (let [d (discovery client opts)]
          (mapv info->edn
                (cond (and name id) (remove nil? [(.info d ^String name ^String id)])
                      name          (.info d ^String name)
                      :else         (.info d)))))))
-  (-stats [{:keys [^Connection client]} {:keys [name id] :as opts}]
-    (core/then
-     (core/resolved nil)
-     (fn [_]
+  (-stats [{:keys [^Connection client io-executor]} {:keys [name id] :as opts}]
+    (off-thread
+     io-executor
+     (fn []
        (let [d (discovery client opts)]
          (mapv stats->edn
                (cond (and name id) (remove nil? [(.stats d ^String name ^String id)])
