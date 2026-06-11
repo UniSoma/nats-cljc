@@ -5,7 +5,7 @@
 [![Clojars](https://img.shields.io/clojars/v/io.github.unisoma/nats-cljc.svg)](https://clojars.org/io.github.unisoma/nats-cljc)
 [![CI](https://github.com/unisoma/nats-cljc/actions/workflows/ci.yml/badge.svg)](https://github.com/unisoma/nats-cljc/actions/workflows/ci.yml)
 
-> **Status: `0.4.0`.** The Phase 1 core, the Phase 1.5 blocking layer, Phase 2 JetStream (`nats-cljc.jetstream`), and Phase 3 KV (`nats-cljc.kv`) are implemented, tested on the JVM, Node, and the browser, and published to Clojars. Being pre-1.0, the API may still evolve as Object Store and the async adapters (Phases 4–5) land — but within [ADR 0009](./docs/adr/0009-project-foundations-and-versioning.md)'s stability discipline: adding a normalized vocabulary member is a minor bump, renaming or removing one is a major bump. The decisions behind every choice live in [`CONTEXT.md`](./CONTEXT.md) (glossary) and [`docs/adr/`](./docs/adr/) (architecture decision records).
+> **Status: `0.4.0`.** The Phase 1 core, the Phase 1.5 blocking layer, Phase 2 JetStream (`nats-cljc.jetstream`), and Phase 3 KV (`nats-cljc.kv`) are implemented, tested on the JVM, Node, and the browser, and published to Clojars. Being pre-1.0, the API may still evolve as services, Object Store, and the async adapters (Phases 4–6) land — but within [ADR 0009](./docs/adr/0009-project-foundations-and-versioning.md)'s stability discipline: adding a normalized vocabulary member is a minor bump, renaming or removing one is a major bump. The decisions behind every choice live in [`CONTEXT.md`](./CONTEXT.md) (glossary) and [`docs/adr/`](./docs/adr/) (architecture decision records).
 
 ---
 
@@ -253,10 +253,11 @@ When you want synchronous ergonomics on the JVM, require the parallel blocking t
 
 - **Phase 1** ✅ *(0.1.0)* — Core NATS: pub/sub, queue groups, request/reply, headers, codecs, lifecycle/status, errors.
 - **Phase 1.5** ✅ *(0.1.0)* — `nats-cljc.blocking.core`.
-- **Phase 2** ✅ *(0.2.0)* — JetStream (`nats-cljc.jetstream`): streams, consumers, acked publish, ack/nak/term; pull consumers delivered through the same promise-return handler as core subscriptions for backpressure (core.async/missionary adapters land in Phase 5).
+- **Phase 2** ✅ *(0.2.0)* — JetStream (`nats-cljc.jetstream`): streams, consumers, acked publish, ack/nak/term; pull consumers delivered through the same promise-return handler as core subscriptions for backpressure (core.async/missionary adapters land in Phase 6).
 - **Phase 3** ✅ *(0.4.0)* — KV (`nats-cljc.kv`): Bucket lifecycle and operator surface, compare-and-set writes, Tombstones/history/archaeology, and watches — speaking KV vocabulary, never its stream substrate (ADR 0023). Also shipped: JetStream direct get (`jetstream/get-message`, `:no-message-found`).
-- **Phase 4** — Object Store (`nats-cljc.object`).
-- **Phase 5** — core.async + missionary subscription adapters; `request-many` scatter-gather.
+- **Phase 4** — services (`nats-cljc.service`): host discoverable, instrumented request-reply Services and discover them with `ping`/`info`/`stats` — pure core request-reply, with no context to verify at entry (ADR 0024).
+- **Phase 5** — Object Store (`nats-cljc.object`).
+- **Phase 6** — core.async + missionary subscription adapters; `request-many` scatter-gather.
 
 ## Design docs
 

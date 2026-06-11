@@ -17,7 +17,7 @@ The one real cost of going unconditional — shipping JetStream bytes to a brows
 
 ## Consequences
 
-- `src/deps.cljs` `:npm-deps` grows `@nats-io/jetstream` now and `@nats-io/kv` (Phase 3) / `@nats-io/obj` (Phase 4) — each pinned in lockstep with the nats-core version. Root `package.json` (dev/test toolchain) grows the same dep so our Node and browser test legs resolve it.
+- `src/deps.cljs` `:npm-deps` grows `@nats-io/jetstream` now and `@nats-io/kv` (Phase 3) / `@nats-io/obj` (Phase 4) — each pinned in lockstep with the nats-core version. Root `package.json` (dev/test toolchain) grows the same dep so our Node and browser test legs resolve it. *(Amended: `@nats-io/services` joined the list as Phase 4 — see ADR 0026 — moving Object Store to Phase 5.)*
 - **The lockstep pin is nats-cljc's maintenance burden**: bumping nats-core means bumping JetStream (and KV/OS) to the matching release in the same change. A mismatched pair is a release bug, caught by us, not the consumer.
 - The JetStream JS import is constrained to JetStream namespaces (an internal-structure obligation; see ADR 0005), so core-only CLJS consumers ship zero JetStream bytes despite the unconditional dependency.
 - Documentation should still *state* the `@nats-io/jetstream` requirement and its pinned version plainly, even though install is automatic — so a consumer auditing their tree understands why it is there and never hand-installs a conflicting version.

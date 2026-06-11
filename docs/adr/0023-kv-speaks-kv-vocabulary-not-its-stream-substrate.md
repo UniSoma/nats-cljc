@@ -16,4 +16,4 @@ A KV Bucket is a JetStream Stream under the hood (a `KV_*` stream, entries as me
 
 - The canonical Error set grows `:bucket-not-found` and `:wrong-revision` — minor-bump vocabulary additions per ADR 0009.
 - The KV impl layer owns the mapping from each native client's stream-flavored failures to the KV-flavored canonical `:type`s; tests assert the mapping on both legs.
-- Future KV-adjacent layers (Object Store, Phase 4) inherit the principle: each facade speaks its own domain's language and re-faces substrate conditions rather than re-exporting them.
+- Future KV-adjacent layers (Object Store, Phase 4) inherit the principle: each facade speaks its own domain's language and re-faces substrate conditions rather than re-exporting them. *(Amended: services took Phase 4 — see ADR 0026 — moving Object Store to Phase 5; ADRs 0024/0025 apply this same principle to the services facade.)*
