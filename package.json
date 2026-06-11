@@ -4,9 +4,10 @@
   "private": true,
   "description": "Dev/test toolchain for nats-cljc (shadow-cljs + karma).",
   "dependencies": {
-    "@nats-io/jetstream": "3.3.1",
-    "@nats-io/kv": "3.3.1",
-    "@nats-io/nats-core": "3.3.1"
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/kv": "3.4.0",
+    "@nats-io/nats-core": "3.4.0",
+    "@nats-io/services": "3.4.0"
   },
   "devDependencies": {
     "karma": "6.4.4",

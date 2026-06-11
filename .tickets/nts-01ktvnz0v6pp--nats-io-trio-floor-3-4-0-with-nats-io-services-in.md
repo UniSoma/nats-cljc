@@ -1,12 +1,12 @@
 ---
 id: nts-01ktvnz0v6pp
 title: nats-io trio floor 3.4.0 with @nats-io/services in lockstep
-status: open
+status: in_progress
 type: chore
 priority: 2
 mode: afk
 created: '2026-06-11T15:49:10.629969334Z'
-updated: '2026-06-11T15:49:10.629969334Z'
+updated: '2026-06-11T16:03:52.206787564Z'
 parent: nts-01ktvn87why4
 tags:
 - services
