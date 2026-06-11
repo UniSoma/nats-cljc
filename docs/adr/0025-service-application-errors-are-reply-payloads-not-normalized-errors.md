@@ -12,7 +12,17 @@ So the split is clean: transport failures of the request (no responder, timeout,
 
 ## The server-side counterpart
 
-The same boundary governs the hosting side. A handler that throws or returns a rejected promise does **not** reach `:on-error` (a Service has no such sink) — it auto-replies a service error (code 500, description from the exception) and is counted in the endpoint's `num_errors` / `last_error` natively. The thrown value is the *cause* of an error reply, never a normalized Error delivered to a connection-level channel. `(service/respond-error conn msg code description)` is the explicit form of the same act.
+The same boundary governs the hosting side. A handler that throws or returns a rejected promise does **not** reach `:on-error` (a Service has no such sink) — it auto-replies a service error (code 500, description from the exception) and is counted in the endpoint's `num_errors` / `last_error` natively. The thrown value is the *cause* of an error reply, never a normalized Error delivered to a connection-level channel. `(service/respond-error conn msg code description)` is the explicit error *reply*, but not the same act: it is **not terminal** — the handler keeps running after it, exactly as after `respond` / `core/reply` — and it does **not** move `num_errors` (see the amendment below).
+
+## Amendment: respond-error is not terminal and does not count an endpoint error
+
+`respond-error` briefly shipped (unreleased) as *terminal*: after sending the reply it threw, so the native dispatch would count the request in the endpoint's `num_errors`. That throw put a **second** error reply on the wire — both natives' catch-all answers an uncaught handler failure with an auto-500, after `respond-error` had already sent the explicit reply. The terminality was also an invention: neither this ADR nor 0024 asked for it, and it existed only to drive the counter.
+
+The constraint that decides it (verified against jnats 2.25.3): jnats' per-endpoint `num_errors` is a private counter whose **only** public lever is its dispatcher's catch-all — and that catch-all *inseparably* auto-500s (`ServiceMessage` has no already-responded guard; every respond is a bare publish to the reply subject). So "terminal + counted + exactly one reply" cannot all hold on the JVM. One of the three had to go, and the wire is the contract: **exactly one reply per `respond-error`**.
+
+The decision: `respond-error` is non-terminal and uncounted. `num_errors` counts **uncaught handler failures only** — a throw or a rejected promise, the auto-500 path — which is precisely what both natives themselves count (jnats and nats.js each tally an endpoint error only on a handler throw, never on an error reply). The portable stats relay that native truth rather than forcing a throw to synthesize a richer contract. A consumer who needs application-error visibility reads `(service/error reply)` per call; `num_errors` / `last_error` report genuine handler failures.
+
+Rejected alternatives: keeping the throw with the second reply suppressed (impossible on the JVM through public jnats API); suppressing it on the JS leg only (we drive that dispatch ourselves, but it breaks leg parity); reflection into jnats' private counter (fragile across versions).
 
 ## Considered options
 

@@ -129,10 +129,12 @@
     nil)
   (-respond-error [{:keys [^Connection client]} ^ServiceMessage native code description ^bytes bytes]
     ;; jnats' `respondStandardError` carries no body, so build the error headers
-    ;; ourselves and route through the regular `respond(conn, bytes, headers)` —
-    ;; same reply path, so the endpoint's native error stats count it and an
+    ;; ourselves and route through the regular `respond(conn, bytes, headers)` so an
     ;; optional `data` body rides along (ADR 0025). The two header names are jnats'
-    ;; own public constants; the code is its string wire form.
+    ;; own public constants; the code is its string wire form. This does NOT move
+    ;; the endpoint's num_errors: jnats counts one only when the handler throws
+    ;; through to its dispatch catch — which also auto-500s, inseparably — so an
+    ;; explicit error reply is deliberately uncounted (ADR 0025).
     (let [h (doto (Headers.)
               (.add ServiceMessage/NATS_SERVICE_ERROR ^java.util.Collection [(str description)])
               (.add ServiceMessage/NATS_SERVICE_ERROR_CODE ^java.util.Collection [(str code)]))]

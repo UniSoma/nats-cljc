@@ -632,6 +632,79 @@
                       (p/catch (fn [e]
                                  (is false (str "request rejected unexpectedly: " e)))))))))))
 
+;; respond-error sends EXACTLY ONE reply on the wire and is NOT terminal — it is
+;; core/reply-shaped: the handler keeps running after it, and no auto-500 straggler
+;; follows the explicit reply (ADR 0025). Proven below the request machinery (a
+;; single-reply core/request would hide a second reply): a hand-rolled request —
+;; a native publish with an explicit reply-to, the one native touch core/publish
+;; cannot express — and a plain subscription on the reply box collecting EVERY
+;; reply that lands there. After the first reply a settle window lets any
+;; straggler arrive before the count is asserted.
+(deftest respond-error-replies-exactly-once-and-is-not-terminal
+  (let [endpoint-subject "term.svc.rerr"
+        box-subject      "term.svc.reply-box"
+        config {:name "term_svc" :version "0.1.0"
+                :endpoints [{:name "rerr" :subject endpoint-subject
+                             :handler (fn [_] :placeholder)}]}]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [after (atom false)
+                 cfg   (assoc-in config [:endpoints 0 :handler]
+                                 (fn [msg]
+                                   (service/respond-error conn msg 400 "bad")
+                                   (reset! after true)))
+                 svc   (deref (service/create conn cfg) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (let [replies (atom [])
+                       arrived (promise)
+                       _sub    (nats/subscribe conn box-subject
+                                               (fn [m]
+                                                 (swap! replies conj m)
+                                                 (deliver arrived true)))]
+                   (.publish ^io.nats.client.Connection (:client conn)
+                             endpoint-subject box-subject (.getBytes "{}"))
+                   (is (not= ::timeout (deref arrived 5000 ::timeout))
+                       "the explicit error reply lands in the reply box")
+                   (Thread/sleep 500)
+                   (is (= 1 (count @replies)) "exactly one reply reached the wire")
+                   (is (= {:code 400 :description "bad"} (service/error (first @replies)))
+                       "the one reply is the explicit respond-error, not an auto-500")
+                   (is (true? @after)
+                       "respond-error is not terminal — handler code after it ran")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [after (atom false)
+                        cfg   (assoc-in config [:endpoints 0 :handler]
+                                        (fn [msg]
+                                          (service/respond-error conn msg 400 "bad")
+                                          (reset! after true)))]
+                    (-> (service/create conn cfg)
+                        (p/then (fn [svc]
+                                  (with-service svc
+                                    (fn []
+                                      (let [replies (atom [])
+                                            arrived (p/deferred)
+                                            _sub    (nats/subscribe conn box-subject
+                                                                    (fn [m]
+                                                                      (swap! replies conj m)
+                                                                      (p/resolve! arrived true)))]
+                                        (.publish ^js (:client conn) endpoint-subject
+                                                  (.encode (js/TextEncoder.) "{}")
+                                                  #js {:reply box-subject})
+                                        (p/let [_ (p/timeout arrived 5000 ::timeout)
+                                                _ (p/delay 500)]
+                                          (is (= 1 (count @replies)) "exactly one reply reached the wire")
+                                          (is (= {:code 400 :description "bad"} (service/error (first @replies)))
+                                              "the one reply is the explicit respond-error, not an auto-500")
+                                          (is (true? @after)
+                                              "respond-error is not terminal — handler code after it ran")))))))
+                        (p/catch (fn [e]
+                                   (is false (str "exactly-once test failed unexpectedly: " e))))))))))))
+
 ;; A request to a subject NO Service hosts rejects with the normalized
 ;; :no-responders Error — services does not change the canonical Error set; an
 ;; absent responder is still transport, not a service-error payload (ADR 0025).
@@ -804,15 +877,17 @@
                      "the off-thread gather still resolves the normalized vector")))))))))
 
 ;; Stats counters MOVE: a handled request increments the endpoint's request count,
-;; and an error reply — a `respond-error` OR a thrown handler — increments its error
-;; count (the half deferred from the errors slice, ADR 0025). Both error forms count
-;; on both legs. Drive one request at each endpoint, then read stats narrowed by name.
+;; and an UNCAUGHT handler failure — a throw or a rejected promise — increments its
+;; error count. An explicit `respond-error` does NOT: it is an ordinary reply
+;; carrying an error payload, and both natives tally an endpoint error only on a
+;; handler throw, never on the reply itself (ADR 0025). Drive one request at each
+;; endpoint, then read stats narrowed by name.
 (deftest stats-counters-move-on-handled-and-errored-requests
   (let [check (fn [by]
                 (is (= 1 (:num-requests (by "ok")))   "a handled request increments the request count")
                 (is (= 0 (:num-errors (by "ok")))     "a success does not increment the error count")
                 (is (= 1 (:num-requests (by "rerr")))  "respond-error still counts the request")
-                (is (= 1 (:num-errors (by "rerr")))   "respond-error increments the endpoint error count")
+                (is (= 0 (:num-errors (by "rerr")))   "an explicit respond-error is NOT an endpoint error — only an uncaught failure counts")
                 (is (= 1 (:num-errors (by "boom")))   "a thrown handler increments the endpoint error count"))]
     #?(:clj
        (with-conn {:servers [server-url]}

@@ -165,25 +165,17 @@
    with code 500; this is the explicit form. `opts` may set `:codec` to override the
    Service's codec for this single reply's `data` encode (ADR 0011).
 
-   TERMINAL like a thrown handler: after sending the reply this THROWS to end the
-   handler, so the native framework counts the request in the endpoint's `num_errors`
-   the same way it counts an auto-500 (a respond-error or a thrown handler are the
-   one act — ADR 0025; the counter is asserted via Discovery `stats`). Both natives
-   tally an endpoint error only on a handler throw, never on the error REPLY itself,
-   so the explicit code/description must ride the reply we already sent (the caller
-   reads that first reply) while the throw drives the count. Therefore code after a
-   `respond-error` in the same handler does not run — it is the last thing a handler
-   does, exactly as a thrown error would be."
+   NOT terminal: like `respond` (and `core/reply`) the handler keeps running after
+   it, and exactly one reply reaches the wire. It does NOT move the endpoint's
+   `num_errors` — both natives tally an endpoint error only on an UNCAUGHT handler
+   failure (the auto-500 path), never on an error REPLY, and jnats offers no other
+   lever on its counter, so the portable stats relay that native truth (ADR 0025)."
   ([conn msg code description] (respond-error conn msg code description nil {}))
   ([conn msg code description data] (respond-error conn msg code description data {}))
   ([conn msg code description data opts]
    (proto/-respond-error conn (get msg native-key) code description
                          (some->> data (codec/encode (reply-codec conn msg opts))))
-   ;; End the handler so the native dispatch counts the endpoint error (see docstring).
-   ;; A bare runtime exception on both legs: the JVM dispatcher's catch counts it and
-   ;; sends a redundant auto-500 the single-reply caller never sees (it already has
-   ;; our reply); nats.js' synchronous handler catch does the same.
-   (throw (#?(:clj RuntimeException. :cljs js/Error.) "nats-cljc.service/respond-error"))))
+   nil))
 
 (defn error
   "Read the service error a reply Message `msg` carries (ADR 0025): `nil` when the
@@ -245,8 +237,9 @@
    timestamp string, same form as KV `:created`) and `:endpoints`, a vector of
    per-endpoint counter maps `{:name :subject :num-requests :num-errors
    :processing-time-ns :average-processing-time-ns}` (and `:queue-group`/`:last-error`
-   when set). A handled request moves `:num-requests`; an error reply (`respond-error`
-   or a thrown / rejected handler) moves `:num-errors` (ADR 0025). Durations are
+   when set). A handled request moves `:num-requests`; an UNCAUGHT handler failure —
+   a throw or a rejected promise, the auto-500 path — moves `:num-errors`; an
+   explicit `respond-error` does not (ADR 0025). Durations are
    integer NANOSECONDS; the per-endpoint custom `:data` blob, when a Service supplies
    one, passes through as parsed JSON→EDN — NOT via the connection codec. Same `opts`,
    narrowing, bounding, and normalization as `ping` (ADR 0024)."

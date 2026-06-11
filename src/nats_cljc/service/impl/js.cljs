@@ -40,8 +40,8 @@
    QueuedIterator is `qi`. nats.js tracks each endpoint as a handler entry on the
    Service carrying both its `.qi` and its mutable `.stats`; on the ITERATOR path
    (no callback) nats.js never calls `stats.countError`, so error counting is ours
-   to drive — `respond-error` and a thrown/rejected handler must still move the
-   endpoint's `num_errors` (the discovery slice's contract). Locate the entry by its
+   to drive — a thrown/rejected handler must still move the endpoint's `num_errors`
+   (an explicit `respond-error` does not count, ADR 0025). Locate the entry by its
    `.qi` identity (the same `qi` `.addEndpoint` returned). Confined to this impl ns;
    returns nil if nats.js' shape ever changes, so a miss degrades to no count rather
    than throwing."

@@ -48,9 +48,9 @@ new vocabulary is additive ⇒ minor bump (ADR 0009).
   data?)` replies with a first-class service error (ADR 0025): a SUCCESSFUL
   reply carrying an integer `code` and string `description` in the
   `Nats-Service-Error` / `Nats-Service-Error-Code` headers, not a transport
-  failure — the caller's `core/request` resolves normally. It is terminal like a
-  thrown handler (it ends the handler so the native framework counts the
-  endpoint error), and a handler that throws or returns a rejected promise
+  failure — the caller's `core/request` resolves normally. It is NOT terminal
+  (the handler keeps running after it, as after `respond`) and sends exactly one
+  reply on the wire; a handler that throws or returns a rejected promise
   auto-replies the same shape with code 500.
 - **Reading errors** — `(error msg)` reads the service error a reply carries
   (ADR 0025): `nil` on a normal success, or `{:code <int> :description
