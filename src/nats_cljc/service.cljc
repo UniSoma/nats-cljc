@@ -19,6 +19,9 @@
   (:require [nats-cljc.codec :as codec]
             [nats-cljc.impl.msg :as msg]
             [nats-cljc.impl.protocol :as proto]
+            [nats-cljc.service.impl.config :as config]
+            #?(:clj  [nats-cljc.impl.jvm :as impl]
+               :cljs [nats-cljc.impl.js :as impl])
             #?(:clj  [nats-cljc.service.impl.jvm]
                :cljs [nats-cljc.service.impl.js])))
 
@@ -65,8 +68,15 @@
   "Create and start a Service on `conn` from the portable `config`, returning a
    platform-native promise (CompletableFuture on the JVM, js/Promise on CLJS) that
    resolves to a running Service — the value `stop` tears down. There is no context
-   and nothing is verified at entry: the promise resolves as soon as the Service's
-   endpoints are subscribed (ADR 0024).
+   and no server feature to verify at entry: the promise resolves as soon as the
+   Service's endpoints are subscribed (ADR 0024). The config IS validated pre-flight,
+   before any native or wire call (ADR 0015): an omitted `:name` or `:version`
+   rejects the promise with `:type :missing-required-key` carrying the offending
+   `:key`, a malformed service or endpoint `:name` with `:invalid-name`, a non-semver
+   `:version` with `:invalid-version` carrying the offending `:version`, and two
+   endpoints sharing a `:name` with `:duplicate-endpoint` carrying the offending
+   `:name`. Endpoint `:subject` syntax stays native/server-enforced; empty or absent
+   `:endpoints` is legal.
 
    Config keys: `:name` (required), `:version` (required), `:description`,
    `:metadata`, and `:endpoints`, a vector of endpoint maps. Each endpoint is
@@ -83,8 +93,11 @@
    and encode every reply (the `:codec` create override is the codec slice)."
   [conn {:keys [endpoints] :as config}]
   (let [codec (:codec conn)]
-    (proto/-create-service
-     conn (assoc config :endpoints (mapv #(prepare-endpoint codec %) endpoints)))))
+    (-> (impl/resolved nil)
+        (impl/then (fn [_] (config/validate-config config)))
+        (impl/bind (fn [_]
+                     (proto/-create-service
+                      conn (assoc config :endpoints (mapv #(prepare-endpoint codec %) endpoints))))))))
 
 (defn respond
   "Reply to a request message `msg` (the one an endpoint handler received) with

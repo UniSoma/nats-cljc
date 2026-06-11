@@ -1,12 +1,12 @@
 ---
 id: nts-01ktvp0cttme
 title: 'Create-config validation pre-flights: missing keys, names, semver, duplicate endpoints'
-status: open
+status: in_progress
 type: feature
 priority: 2
 mode: afk
 created: '2026-06-11T15:49:55.668516541Z'
-updated: '2026-06-11T15:49:55.668516541Z'
+updated: '2026-06-11T16:49:03.611012735Z'
 parent: nts-01ktvn87why4
 tags:
 - services

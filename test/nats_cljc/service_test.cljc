@@ -10,6 +10,7 @@
                :cljs [cljs.test :refer-macros [deftest is async]])
             [nats-cljc.core :as nats]
             [nats-cljc.service :as service]
+            [nats-cljc.service.impl.config :as config]
             #?(:cljs [promesa.core :as p])))
 
 ;; The anonymous server: TCP on the JVM, ws on CLJS (ADR 0001). No JetStream needed
@@ -32,6 +33,18 @@
        (.whenComplete cf (reify java.util.function.BiConsumer
                            (accept [_ _ e] (deliver a e))))
        (deref a 5000 ::timeout))))
+
+;; Capture the validation `:type` a synchronous deep-module guard throws, portably
+;; (kv-test's helper) — the no-server pre-flight tests below assert on it.
+(defn- thrown-type [thunk]
+  (try (thunk) nil
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e (:type (ex-data e)))))
+
+;; Capture the whole ex-data a synchronous deep-module guard throws, so a test can
+;; assert the offending value the validation `:type` carries (`:key`/`:version`/`:name`).
+(defn- thrown-data [thunk]
+  (try (thunk) nil
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e (ex-data e))))
 
 ;; The connect / settle / teardown envelope (kv-test's `with-conn`): JVM blocks on
 ;; connect, runs `(f conn)`, closes in a finally; CLJS awaits the promise `(f conn)`
@@ -370,3 +383,105 @@
                     (p/catch (fn [e]
                                (is (= :no-responders (:type (ex-data e)))
                                    "no Service hosts the subject — the request rejects with :no-responders")))))))))
+
+;; Deep-module unit (ADR 0015/0024), no server: the strict-from-day-one config
+;; guards are the portable pre-flight half of a Service, raising their validation
+;; `:type`s before any native or wire call — thrown identically on both legs. A
+;; fully-specified config (incl. endpoints) passes unchanged; each malformed shape
+;; raises its own `:type` carrying the offending value.
+(deftest deep-module-config-validation
+  (let [ok {:name "echo_svc" :version "1.2.3"
+            :endpoints [{:name "a" :handler (fn [_] nil)}
+                        {:name "b" :handler (fn [_] nil)}]}]
+    (is (= ok (config/validate-config ok))
+        "a fully-specified recognized config passes validation unchanged")
+    (is (= ok (config/validate-config ok))
+        "validation does not mutate the config it returns"))
+  ;; absent :name / :version reuse :missing-required-key, carrying the offending :key
+  (is (= :missing-required-key (thrown-type #(config/validate-config {:version "1.0.0"})))
+      "a config omitting :name is :missing-required-key, not :invalid-name {:name nil}")
+  (is (= :name (:key (thrown-data #(config/validate-config {:version "1.0.0"}))))
+      ":missing-required-key for an absent :name carries the offending :key")
+  (is (= :missing-required-key (thrown-type #(config/validate-config {:name "svc"})))
+      "a config omitting :version is :missing-required-key")
+  (is (= :version (:key (thrown-data #(config/validate-config {:name "svc"}))))
+      ":missing-required-key for an absent :version carries the offending :key")
+  ;; malformed service / endpoint :name reuses :invalid-name
+  (is (= :invalid-name (thrown-type #(config/validate-config {:name "bad.name" :version "1.0.0"})))
+      "a service name carrying a subject delimiter is :invalid-name")
+  (is (= :invalid-name (thrown-type #(config/validate-config {:name "bad name" :version "1.0.0"})))
+      "a service name carrying whitespace is :invalid-name")
+  (is (= :invalid-name (thrown-type #(config/validate-config
+                                      {:name "svc" :version "1.0.0"
+                                       :endpoints [{:name "bad.ep" :handler (fn [_] nil)}]})))
+      "a malformed endpoint :name is :invalid-name")
+  (is (= "ok_svc-1" (config/validate-name "ok_svc-1"))
+      "a well-formed name (alphanumerics, dash, underscore) passes unchanged")
+  ;; non-semver :version raises the new :invalid-version carrying the offending :version
+  (is (= :invalid-version (thrown-type #(config/validate-config {:name "svc" :version "nope"})))
+      "a non-semver :version is :invalid-version")
+  (is (= "nope" (:version (thrown-data #(config/validate-config {:name "svc" :version "nope"}))))
+      ":invalid-version carries the offending :version")
+  ;; two endpoints sharing a :name raise the new :duplicate-endpoint carrying the :name
+  (is (= :duplicate-endpoint
+         (thrown-type #(config/validate-config
+                        {:name "svc" :version "1.0.0"
+                         :endpoints [{:name "dup" :handler (fn [_] nil)}
+                                     {:name "dup" :handler (fn [_] nil)}]})))
+      "two endpoints sharing a :name is :duplicate-endpoint")
+  (is (= "dup"
+         (:name (thrown-data #(config/validate-config
+                               {:name "svc" :version "1.0.0"
+                                :endpoints [{:name "dup" :handler (fn [_] nil)}
+                                            {:name "dup" :handler (fn [_] nil)}]}))))
+      ":duplicate-endpoint carries the offending :name")
+  ;; empty / absent :endpoints is legal — must not trip validation
+  (is (= {:name "svc" :version "1.0.0"}
+         (config/validate-config {:name "svc" :version "1.0.0"}))
+      "a config with absent :endpoints passes validation")
+  (is (= {:name "svc" :version "1.0.0" :endpoints []}
+         (config/validate-config {:name "svc" :version "1.0.0" :endpoints []}))
+      "a config with empty :endpoints passes validation"))
+
+;; Deep-module unit (ADR 0015/0024), no server: the semver accept-set is PINNED on
+;; the borderline pair both natives agree on at the 3.4.0 floor — "1.0" rejected (no
+;; PATCH), "1.2.3-rc1+build" accepted (prerelease + build). The native pin lives in
+;; the regex's comment, verified live against jnats' validateSemVer AND
+;; @nats-io/services' parseSemVer; this asserts the portable guard tracks it.
+(deftest deep-module-semver-accept-set
+  (is (true? (config/valid-version? "1.2.3-rc1+build"))
+      "the prerelease+build borderline is accepted — matches both natives at 3.4.0")
+  (is (false? (config/valid-version? "1.0"))
+      "the two-segment borderline is rejected — matches both natives at 3.4.0")
+  (is (true? (config/valid-version? "1.2.3")) "a plain MAJOR.MINOR.PATCH is accepted")
+  (is (true? (config/valid-version? "0.1.0")) "a 0.x version is accepted")
+  (is (false? (config/valid-version? "v1.2.3")) "a leading 'v' is rejected — the regex is anchored")
+  (is (false? (config/valid-version? "1.2.3.4")) "a four-segment version is rejected")
+  (is (false? (config/valid-version? "")) "an empty version is rejected")
+  (is (false? (config/valid-version? nil)) "a nil version is rejected"))
+
+;; Facade rejection shape (ADR 0015/0024): the pre-flight rejects the create promise
+;; — not throws synchronously — carrying the validation ex-info, identically on both
+;; legs and before any native/wire call (no server is needed to observe it). The
+;; canonical seam is the public facade, so this drives service/create directly.
+(deftest create-rejects-the-promise-on-invalid-config
+  (let [bad {:name "svc"}]  ;; missing :version
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [e (reject-reason (service/create conn bad))]
+             (is (= :missing-required-key (:type (ex-data e)))
+                 "create rejects its promise with the validation ex-info")
+             (is (= :version (:key (ex-data e)))
+                 "the rejection carries the offending :key"))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (service/create conn bad)
+                      (p/then (fn [_] (is false "expected create to reject on a config missing :version")))
+                      (p/catch (fn [e]
+                                 (is (= :missing-required-key (:type (ex-data e)))
+                                     "create rejects its promise with the validation ex-info")
+                                 (is (= :version (:key (ex-data e)))
+                                     "the rejection carries the offending :key"))))))))))
