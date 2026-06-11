@@ -35,31 +35,69 @@
    :headers               nil
    :nats-cljc.service/native msg})
 
+(defn- endpoint-stats
+  "The native NamedEndpointStats object backing the iterator endpoint whose
+   QueuedIterator is `qi`. nats.js tracks each endpoint as a handler entry on the
+   Service carrying both its `.qi` and its mutable `.stats`; on the ITERATOR path
+   (no callback) nats.js never calls `stats.countError`, so error counting is ours
+   to drive — `respond-error` and a thrown/rejected handler must still move the
+   endpoint's `num_errors` (the discovery slice's contract). Locate the entry by its
+   `.qi` identity (the same `qi` `.addEndpoint` returned). Confined to this impl ns;
+   returns nil if nats.js' shape ever changes, so a miss degrades to no count rather
+   than throwing."
+  [^js svc ^js qi]
+  (some-> (.-handlers svc)
+          (.find (fn [^js h] (identical? (.-qi h) qi)))
+          (.-stats)))
+
+(defn- drive-endpoint!
+  "Drive a no-handler endpoint's QueuedIterator (road 2, ADR 0007) so a returned
+   handler promise is AWAITED before the next request is pulled — the JS realization
+   of the serial-per-endpoint, promise-return backpressure contract. A detached
+   `.next` loop mirrors core's `consume!`: the handler runs inside a Promise executor
+   so a sync throw, a sync decode throw, and a rejecting promise all funnel to the
+   same `.catch`, which counts the error on the endpoint, auto-replies a 500, and
+   CONTINUES (the endpoint survives). The iterator yields one message at a time and
+   resumes only on the next `.next`, so the awaited handler duration falls inside the
+   iterator's per-iteration profile timer — the source of `processing_time` for an
+   iterator endpoint (nats.js' callback path stops the timer the instant the
+   synchronous callback returns, never awaiting the promise). `.iterClosed` (svc.stop
+   draining) ends the loop; the `.next` `.catch` swallows that close-race."
+  [^js stats ^js qi handler]
+  (let [it (.call (unchecked-get qi (.-asyncIterator js/Symbol)) qi)]
+    (letfn [(step []
+              (-> (.next it)
+                  (.then (fn [^js res]
+                           (when-not (.-done res)
+                             (let [^js msg (.-value res)]
+                               (-> (js/Promise. (fn [resolve _] (resolve (handler (msg->raw msg)))))
+                                   (.then (fn [_] (step)))
+                                   (.catch (fn [e]
+                                             ;; nats.js' callback path auto-replies a 500 AND
+                                             ;; counts the error on a SYNCHRONOUS handler throw;
+                                             ;; on the iterator path both are ours, so count the
+                                             ;; error and reply the same 500 the JVM gets for free
+                                             ;; on a thrown or rejected handler (ADR 0025), then
+                                             ;; keep driving the endpoint.
+                                             (when stats (.countError stats e))
+                                             (.respondError msg 500 (str (or (.-message e) e)) (js/Uint8Array.))
+                                             (step))))))))
+                  (.catch (fn [_] nil))))]
+      (step))))
+
 (defn- add-endpoint!
   "Add one prepared endpoint to the started Service `svc` (`:subject` already
-   defaulted by the facade, `:handler` already the low-level decode wrapper). The
-   function handler makes nats.js dispatch via a callback subscription, invoking
-   `(err, msg)` per request — the err arm closes the subscription, so deliver only
-   on a normal message. nats.js auto-replies a 500 on a SYNCHRONOUS handler throw
-   but does not await the handler's returned promise, so a rejected promise is
-   awaited here to auto-reply 500 too (ADR 0025); per-endpoint backpressure (gating
-   the next delivery on it) is still the serialization-gate slice's job."
+   defaulted by the facade, `:handler` already the low-level decode wrapper). nats.js
+   does NOT await a callback handler's returned promise, so a `{:handler …}`
+   subscription neither serializes per endpoint nor times the awaited duration (ADR
+   0007). Omitting the handler makes `.addEndpoint` hand back a QueuedIterator and the
+   endpoint iterator-driven instead; `drive-endpoint!` loops it, awaiting the handler
+   between pulls, so backpressure and awaited-duration stats both engage."
   [^js svc {:keys [name subject handler queue-group]}]
-  (let [opts #js {:subject subject
-                  :handler (fn [err ^js msg]
-                             (when-not err
-                               ;; nats.js auto-replies a 500 on a SYNCHRONOUS handler
-                               ;; throw, but does NOT await the handler's returned
-                               ;; promise — so a handler that REJECTS would leave the
-                               ;; caller hanging. Await it here and auto-reply 500
-                               ;; ourselves on rejection, so both failure modes land
-                               ;; the same error reply the JVM gets for free (ADR 0025).
-                               (let [r (handler (msg->raw msg))]
-                                 (when (and r (fn? (.-then r)))
-                                   (.catch r (fn [e]
-                                               (.respondError msg 500 (str (or (.-message e) e)) (js/Uint8Array.))))))))}]
-    (when queue-group (set! (.-queue opts) queue-group))
-    (.addEndpoint svc name opts)))
+  (let [opts #js {:subject subject}
+        _    (when queue-group (set! (.-queue opts) queue-group))
+        qi   (.addEndpoint svc name opts)]
+    (drive-endpoint! (endpoint-stats svc qi) qi handler)))
 
 (extend-type core/JsConnection
   proto/Service

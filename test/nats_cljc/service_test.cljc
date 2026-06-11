@@ -422,6 +422,85 @@
                         (p/catch (fn [e]
                                    (is false (str "drain test failed unexpectedly: " e))))))))))))
 
+;; ADR-0007 serialization gate: an endpoint handler is an ordinary push Handler, so
+;; delivery to ONE endpoint is serial and a returned promise applies backpressure —
+;; the next request to that endpoint waits for the prior handler's promise to settle.
+;; A slow async handler must therefore DELAY the next request to the same endpoint,
+;; and the endpoint's :processing-time-ns must reflect the AWAITED handler duration,
+;; not just the synchronous callback time. The JVM leg falls out of the dispatcher
+;; blocking on the CompletionStage; the JS leg drives the endpoint as an async
+;; iterable (road 2) rather than a callback, which nats.js does NOT await.
+;;
+;; KNOWN-BAD (watch red first): with the JS impl on a `{:handler …}` CALLBACK
+;; subscription, nats.js invokes the handler synchronously and does not await its
+;; promise — both requests' handlers enter ~together (gap ≈ 0, serial-gap assert
+;; fails) and :processing-time-ns reflects only the synchronous callback time (the
+;; awaited-duration assert fails). Driving the async iterable makes both go green.
+(deftest slow-handler-serializes-and-times-the-awaited-duration
+  (let [delay-ms   600
+        ;; allow scheduler slop: the gate has held if the 2nd handler entered at
+        ;; least most of the delay after the 1st, and the awaited duration shows up.
+        floor-ms   (long (* 0.6 delay-ms))
+        floor-ns   (* floor-ms 1000000)
+        config     {:name "gate_svc" :version "0.1.0"
+                    :endpoints [{:name "slow" :subject "tracer.svc.gate"
+                                 :handler (fn [_] :placeholder)}]}]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [entries (atom [])
+                 cfg (assoc-in config [:endpoints 0 :handler]
+                               (fn [msg]
+                                 (swap! entries conj (System/currentTimeMillis))
+                                 (java.util.concurrent.CompletableFuture/runAsync
+                                  (reify Runnable
+                                    (run [_]
+                                      (Thread/sleep delay-ms)
+                                      (service/respond conn msg {:ok true}))))))
+                 svc (deref (service/create conn cfg) 5000 ::timeout)]
+             (with-service svc
+               (fn []
+                 (let [a (nats/request conn "tracer.svc.gate" {} {:timeout-ms 10000})
+                       b (nats/request conn "tracer.svc.gate" {} {:timeout-ms 10000})]
+                   (is (not= ::timeout (deref a 10000 ::timeout)) "request A resolves")
+                   (is (not= ::timeout (deref b 10000 ::timeout)) "request B resolves")
+                   (let [[e1 e2] @entries]
+                     (is (= 2 (count @entries)) "both handler invocations were recorded")
+                     (is (>= (- e2 e1) floor-ms)
+                         "the 2nd handler did not enter until the 1st's awaited promise settled (serial delivery)"))
+                   (let [st (first (deref (service/stats conn {:name "gate_svc"}) 5000 ::timeout))
+                         ep (first (:endpoints st))]
+                     (is (>= (:processing-time-ns ep) floor-ns)
+                         ":processing-time-ns reflects the awaited handler duration, not the synchronous callback time"))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (let [entries (atom [])
+                        cfg (assoc-in config [:endpoints 0 :handler]
+                                      (fn [msg]
+                                        (swap! entries conj (js/Date.now))
+                                        (-> (p/delay delay-ms)
+                                            (p/then (fn [_] (service/respond conn msg {:ok true}))))))]
+                    (-> (service/create conn cfg)
+                        (p/then (fn [svc]
+                                  (with-service svc
+                                    (fn []
+                                      (let [a (nats/request conn "tracer.svc.gate" {} {:timeout-ms 10000})
+                                            b (nats/request conn "tracer.svc.gate" {} {:timeout-ms 10000})]
+                                        (p/let [_  a
+                                                _  b
+                                                ss (service/stats conn {:name "gate_svc"})]
+                                          (let [[e1 e2] @entries
+                                                ep (first (:endpoints (first ss)))]
+                                            (is (= 2 (count @entries)) "both handler invocations were recorded")
+                                            (is (>= (- e2 e1) floor-ms)
+                                                "the 2nd handler did not enter until the 1st's awaited promise settled (serial delivery)")
+                                            (is (>= (:processing-time-ns ep) floor-ns)
+                                                ":processing-time-ns reflects the awaited handler duration, not the synchronous callback time"))))))))
+                        (p/catch (fn [e]
+                                   (is false (str "serialization-gate test failed unexpectedly: " e))))))))))))
+
 ;; The Service handle carries a :stopped promise that resolves to nil once the
 ;; Service stops for any reason (ADR 0024) — the lifecycle parallel of the Watch
 ;; handle's :initialized. It is unresolved while the Service runs, and resolves to

@@ -1,12 +1,12 @@
 ---
 id: nts-01ktvp1ynk2f
 title: 'Node serialization gate: ADR-0007 backpressure on endpoint handlers'
-status: open
+status: in_progress
 type: task
 priority: 2
 mode: afk
 created: '2026-06-11T15:50:46.694833655Z'
-updated: '2026-06-11T15:50:46.694833655Z'
+updated: '2026-06-11T18:04:30.875642347Z'
 parent: nts-01ktvn87why4
 tags:
 - services
