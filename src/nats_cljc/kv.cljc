@@ -11,9 +11,9 @@
    (it `extend`s the KV protocol onto the platform Connection record); this facade
    calls the record through the protocol.
 
-   `get`, `update` (and, later, `keys`) shadow clojure.core — the jetstream `next`
+   `get`, `update`, and `keys` shadow clojure.core — the jetstream `next`
    precedent: the namespace-aliased call is the public name."
-  (:refer-clojure :exclude [get update])
+  (:refer-clojure :exclude [get update keys])
   (:require [nats-cljc.codec :as codec]
             [nats-cljc.impl.protocol :as proto]
             [nats-cljc.kv.impl.bucket :as bucket]
@@ -200,22 +200,33 @@
    decoded through the Bucket's one Codec — or to nil when the key is absent
    (never written, deleted, or purged): absence is a normal domain outcome to
    branch on with if-let, not an Error, and a STORED nil stays distinguishable as
-   `{:value nil ...}` (ADR 0023). The promise rejects pre-flight with a
-   validation `:type :invalid-key` (carrying `:key`) when `key` is malformed,
-   before any wire call (ADR 0015), and with `:type :codec-error` when the stored
-   bytes do not decode (ADR 0006)."
-  [handle key]
-  (-> (impl/resolved nil)
-      (impl/then (fn [_] (bucket/validate-key key)))
-      (impl/bind (fn [_] (proto/-kv-get handle key)))
-      (impl/then (fn [raw]
-                   (when raw
-                     {:bucket    (:bucket raw)
-                      :key       (:key raw)
-                      :value     (codec/decode (:codec handle) (:bytes raw))
-                      :revision  (:revision raw)
-                      :created   (:created raw)
-                      :operation (:operation raw)})))))
+   `{:value nil ...}` (ADR 0023).
+
+   `opts` may carry `:revision`, pinning the read to that exact past Revision —
+   cheap archaeology on the Bucket. A pinned read does NOT hide markers: pinned
+   to a delete/purge marker Revision it delivers the marker Entry, its
+   `:operation` (`:delete` / `:purge`) visible and `:value` nil undecoded
+   (identical on both legs — normalized, since the natives diverge here); a
+   Revision the Bucket never assigned, or one belonging to another key, resolves
+   to nil.
+
+   The promise rejects pre-flight with a validation `:type :invalid-key`
+   (carrying `:key`) when `key` is malformed, before any wire call (ADR 0015),
+   and with `:type :codec-error` when the stored bytes do not decode (ADR 0006)."
+  ([handle key] (get handle key {}))
+  ([handle key opts]
+   (-> (impl/resolved nil)
+       (impl/then (fn [_] (bucket/validate-key key)))
+       (impl/bind (fn [_] (proto/-kv-get handle key (:revision opts))))
+       (impl/then (fn [raw]
+                    (when raw
+                      {:bucket    (:bucket raw)
+                       :key       (:key raw)
+                       :value     (when (= :put (:operation raw))
+                                    (codec/decode (:codec handle) (:bytes raw)))
+                       :revision  (:revision raw)
+                       :created   (:created raw)
+                       :operation (:operation raw)}))))))
 
 (defn delete
   "Write a Tombstone for `key` in the Bucket `handle`, returning a
@@ -327,3 +338,14 @@
                             :operation (:operation raw)
                             :delta     (:delta raw)})
                          raws)))))
+
+(defn keys
+  "Enumerate the LIVE keys in the Bucket `handle`, returning a platform-native
+   promise that resolves to a fully-realized vector of key strings — deleted and
+   purged keys excluded, so a Bucket's live contents are enumerable (the
+   stream-names / consumer-names precedent; ADR 0023). `filter` is an optional
+   subject-style filter restricting the result (e.g. `\"user.>\"`); without it
+   every live key enumerates, and a filter matching nothing resolves to []."
+  ([handle] (keys handle nil))
+  ([handle filter]
+   (proto/-kv-keys handle filter)))

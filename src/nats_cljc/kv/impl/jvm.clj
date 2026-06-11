@@ -18,8 +18,9 @@
             [nats-cljc.kv.impl.bucket :as bucket]
             [nats-cljc.kv.impl.error :as kv-err])
   (:import [nats_cljc.impl.jvm JvmConnection]
-           [io.nats.client Connection JetStreamApiException KeyValue KeyValueManagement]
-           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry KeyValueStatus KeyValueWatcher KeyValueWatchOption StorageType]
+           [io.nats.client Connection JetStreamApiException JetStreamManagement KeyValue KeyValueManagement]
+           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry KeyValueStatus KeyValueWatcher KeyValueWatchOption MessageInfo StorageType]
+           [io.nats.client.support NatsKeyValueUtil]
            [io.nats.client.impl NatsKeyValueWatchSubscription]
            [java.io IOException]
            [java.time Duration ZonedDateTime]
@@ -40,8 +41,11 @@
 ;; The Bucket handle: the per-Bucket jnats `KeyValue` object the entry operations
 ;; dispatch over, plus the codec the Bucket binds (the context's — i.e. the
 ;; connection default) and the IO pool its blocking calls run on. `bucket` is the
-;; Bucket's name, carried so KV-faced errors can name it (ADR 0023).
-(defrecord JvmBucket [^KeyValue kv codec ^ExecutorService io-executor bucket])
+;; Bucket's name, carried so KV-faced errors can name it (ADR 0023). `jsm` is the
+;; substrate read seam the revision-pinned get needs: jnats' own revision get
+;; hides delete/purge markers behind null, so the marker entry is reconstructed
+;; from the backing stream's message (see `-kv-get`).
+(defrecord JvmBucket [^KeyValue kv codec ^ExecutorService io-executor bucket ^JetStreamManagement jsm])
 
 (extend-type JvmConnection
   proto/KV
@@ -188,10 +192,13 @@
 (defn- bucket-handle
   "Construct the Bucket handle for `bucket` on `ctx`. jnats' `keyValue(bucket)` is
    a cheap local construction (the existence check is the caller's — create's
-   server round-trip or open's forced getStatus), binding the context's codec."
+   server round-trip or open's forced getStatus), binding the context's codec.
+   `jetStreamManagement()` is the same cheap local construction, carried for the
+   revision-pinned get's substrate read."
   [ctx ^String bucket]
   (->JvmBucket (.keyValue ^Connection (:client ctx) bucket)
-               (:codec ctx) (:io-executor ctx) bucket))
+               (:codec ctx) (:io-executor ctx) bucket
+               (.jetStreamManagement ^Connection (:client ctx))))
 
 ;; The one canonical timestamp format on this leg (UTC, exactly three fractional
 ;; digits) — the same formatter the JetStream impl pins, duplicated rather than
@@ -281,12 +288,31 @@
     ;; resolves with.
     (off-thread (:io-executor bucket)
                 #(.put ^KeyValue (:kv bucket) ^String key ^bytes bytes)))
-  (-kv-get [bucket key]
-    ;; jnats' get already reads an absent OR tombstoned key as null (the portable
-    ;; absent-is-nil contract, ADR 0023), so the lift is a plain when-let.
+  (-kv-get [bucket key revision]
+    ;; Latest read: jnats' get already reads an absent OR tombstoned key as null
+    ;; (the portable absent-is-nil contract, ADR 0023), so the lift is a plain
+    ;; when-let. Pinned read: jnats' get(key, revision) hides delete/purge
+    ;; markers behind the SAME null (verified, not inferred), but the portable
+    ;; contract delivers the marker entry — so the pinned read goes to the
+    ;; backing stream's message instead, lifted through jnats' own public
+    ;; KeyValueEntry(MessageInfo) constructor: a marker keeps its :operation, a
+    ;; mismatched key reads as absent (the entry belongs to another key), and a
+    ;; Revision the stream never assigned raises the substrate's no-message-found
+    ;; 10037 — normalized to the same absent-is-nil here.
     (off-thread (:io-executor bucket)
-                #(when-let [e (.get ^KeyValue (:kv bucket) ^String key)]
-                   (entry->raw e))))
+                #(if revision
+                   (try
+                     (let [mi (.getMessage ^JetStreamManagement (:jsm bucket)
+                                           (NatsKeyValueUtil/toStreamName ^String (:bucket bucket))
+                                           (long revision))
+                           e  (KeyValueEntry. ^MessageInfo mi)]
+                       (when (= key (.getKey e))
+                         (entry->raw e)))
+                     (catch JetStreamApiException e
+                       (when (not= 10037 (.getApiErrorCode e))
+                         (throw e))))
+                   (when-let [e (.get ^KeyValue (:kv bucket) ^String key)]
+                     (entry->raw e)))))
   (-kv-create [bucket key bytes]
     ;; jnats' create models first-writer-wins as an update expecting revision 0
     ;; (retrying over a tombstone), raising wrong-last-sequence on a live key —
@@ -325,7 +351,17 @@
     (off-thread (:io-executor bucket)
                 #(mapv (fn [^KeyValueEntry e]
                          (assoc (entry->raw e) :delta (.getDelta e)))
-                       (.history ^KeyValue (:kv bucket) ^String key)))))
+                       (.history ^KeyValue (:kv bucket) ^String key))))
+  (-kv-keys [bucket filter]
+    ;; jnats' keys hands back the full List<String> of LIVE keys in one call —
+    ;; deleted and purged keys already excluded natively on both legs (verified,
+    ;; not inferred) — with the filtered overload taking the subject-style
+    ;; filter; an empty Bucket or a filter matching nothing is an empty list,
+    ;; never an error.
+    (off-thread (:io-executor bucket)
+                #(vec (if filter
+                        (.keys ^KeyValue (:kv bucket) ^String filter)
+                        (.keys ^KeyValue (:kv bucket)))))))
 
 (extend-type JvmBucket
   proto/BucketWatch

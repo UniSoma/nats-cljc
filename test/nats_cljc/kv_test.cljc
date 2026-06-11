@@ -983,6 +983,189 @@
                                                                                   (p/then (fn [r]
                                                                                             (is (nil? r) "purge with the latest Revision (the Tombstone's) resolves to nil"))))))))))))))))))))))))
 
+;; ─────────────────────────── History archaeology ────────────────────────────
+
+;; get pinned to a Revision reads the past: {:revision n} resolves to the Entry
+;; at that exact Revision — the archaeology read — while a Revision the Bucket
+;; never assigned to the key (or that belongs to another key) reads as absent,
+;; resolving nil on both legs.
+(deftest get-pinned-to-a-revision-reads-the-past
+  (let [bucket "TRACER_KV_GET_REV"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (let [rev1  (deref (kv/put handle "doc.k" {:v 1}) 5000 ::timeout)
+                       rev2  (deref (kv/put handle "doc.k" {:v 2}) 5000 ::timeout)
+                       other (deref (kv/put handle "doc.other" {:v 3}) 5000 ::timeout)
+                       past  (deref (kv/get handle "doc.k" {:revision rev1}) 5000 ::timeout)]
+                   (is (= {:v 1} (:value past))
+                       "get pinned to a past Revision decodes that Revision's value")
+                   (is (= rev1 (:revision past)) "the pinned Entry carries the pinned Revision")
+                   (is (= :put (:operation past)) "a live pinned Entry wears :operation :put")
+                   (is (= bucket (:bucket past)) "the pinned Entry names its Bucket")
+                   (is (= "doc.k" (:key past)) "the pinned Entry names its key")
+                   (is (string? (:created past)) ":created is the canonical timestamp string")
+                   (is (= {:v 2} (:value (deref (kv/get handle "doc.k" {:revision rev2}) 5000 ::timeout)))
+                       "pinning the latest Revision reads the latest value")
+                   (is (nil? (deref (kv/get handle "doc.k" {:revision other}) 5000 ::timeout))
+                       "a Revision belonging to another key reads as absent")
+                   (is (nil? (deref (kv/get handle "doc.k" {:revision 9999}) 5000 ::timeout))
+                       "a Revision the Bucket never assigned reads as absent")))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "doc.k" {:v 1})
+                                                      (p/then (fn [rev1]
+                                                                (-> (kv/put handle "doc.k" {:v 2})
+                                                                    (p/then (fn [rev2]
+                                                                              (-> (kv/put handle "doc.other" {:v 3})
+                                                                                  (p/then (fn [other]
+                                                                                            (-> (kv/get handle "doc.k" {:revision rev1})
+                                                                                                (p/then (fn [past]
+                                                                                                          (is (= {:v 1} (:value past))
+                                                                                                              "get pinned to a past Revision decodes that Revision's value")
+                                                                                                          (is (= rev1 (:revision past)) "the pinned Entry carries the pinned Revision")
+                                                                                                          (is (= :put (:operation past)) "a live pinned Entry wears :operation :put")
+                                                                                                          (is (= bucket (:bucket past)) "the pinned Entry names its Bucket")
+                                                                                                          (is (= "doc.k" (:key past)) "the pinned Entry names its key")
+                                                                                                          (is (string? (:created past)) ":created is the canonical timestamp string")
+                                                                                                          (kv/get handle "doc.k" {:revision rev2})))
+                                                                                                (p/then (fn [latest]
+                                                                                                          (is (= {:v 2} (:value latest))
+                                                                                                              "pinning the latest Revision reads the latest value")
+                                                                                                          (kv/get handle "doc.k" {:revision other})))
+                                                                                                (p/then (fn [wrong]
+                                                                                                          (is (nil? wrong) "a Revision belonging to another key reads as absent")
+                                                                                                          (kv/get handle "doc.k" {:revision 9999})))
+                                                                                                (p/then (fn [absent]
+                                                                                                          (is (nil? absent) "a Revision the Bucket never assigned reads as absent")))))))))))))))))))))))))))
+
+;; The shared marker-pinned assertions: a get pinned to a delete/purge marker
+;; Revision delivers the MARKER Entry — :operation visible, :value nil — rather
+;; than hiding it behind nil, identically on both legs (pinned here because the
+;; natives diverge: nats.js' revision get surfaces the marker, jnats' hides it).
+(defn- assert-pinned-marker [bucket key op marker]
+  (is (some? marker) "get pinned to a marker Revision delivers the marker Entry")
+  (is (= op (:operation marker)) "the marker Entry's :operation is visible")
+  (is (nil? (:value marker)) "the marker Entry carries :value nil")
+  (is (= bucket (:bucket marker)) "the marker Entry names its Bucket")
+  (is (= key (:key marker)) "the marker Entry names its key")
+  (is (string? (:created marker)) ":created is the canonical timestamp string"))
+
+;; get pinned to a marker Revision is archaeology too: the Tombstone a delete
+;; wrote and the marker a purge left both deliver as marker Entries (their
+;; Revision read from history, where the marker is the newest Entry).
+(deftest get-pinned-to-a-marker-revision-delivers-the-marker
+  (let [bucket "TRACER_KV_GET_MARKER"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "doc.k" {:v 1}) 5000 ::timeout)
+                 (deref (kv/delete handle "doc.k") 5000 ::timeout)
+                 (deref (kv/put handle "doc.gone" {:v 2}) 5000 ::timeout)
+                 (deref (kv/purge handle "doc.gone") 5000 ::timeout)
+                 (let [del-rev   (:revision (last (deref (kv/history handle "doc.k") 5000 ::timeout)))
+                       purge-rev (:revision (last (deref (kv/history handle "doc.gone") 5000 ::timeout)))]
+                   (assert-pinned-marker bucket "doc.k" :delete
+                                         (deref (kv/get handle "doc.k" {:revision del-rev}) 5000 ::timeout))
+                   (assert-pinned-marker bucket "doc.gone" :purge
+                                         (deref (kv/get handle "doc.gone" {:revision purge-rev}) 5000 ::timeout))))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "doc.k" {:v 1})
+                                                      (p/then (fn [_] (kv/delete handle "doc.k")))
+                                                      (p/then (fn [_] (kv/put handle "doc.gone" {:v 2})))
+                                                      (p/then (fn [_] (kv/purge handle "doc.gone")))
+                                                      (p/then (fn [_] (kv/history handle "doc.k")))
+                                                      (p/then (fn [entries]
+                                                                (kv/get handle "doc.k" {:revision (:revision (last entries))})))
+                                                      (p/then (fn [marker]
+                                                                (assert-pinned-marker bucket "doc.k" :delete marker)
+                                                                (kv/history handle "doc.gone")))
+                                                      (p/then (fn [entries]
+                                                                (kv/get handle "doc.gone" {:revision (:revision (last entries))})))
+                                                      (p/then (fn [marker]
+                                                                (assert-pinned-marker bucket "doc.gone" :purge marker))))))))))))))))))
+
+;; keys enumerates a Bucket's LIVE contents: a fully-realized vector of key
+;; strings — deleted and purged keys excluded — optionally restricted by a
+;; subject-style filter, with no match resolving to [] (the stream-names /
+;; consumer-names precedent).
+(deftest keys-enumerates-live-keys
+  (let [bucket "TRACER_KV_KEYS"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "user.alpha" {:v 1}) 5000 ::timeout)
+                 (deref (kv/put handle "user.beta" {:v 2}) 5000 ::timeout)
+                 (deref (kv/put handle "config.delta" {:v 3}) 5000 ::timeout)
+                 (deref (kv/delete handle "user.beta") 5000 ::timeout)
+                 (deref (kv/put handle "config.gone" {:v 4}) 5000 ::timeout)
+                 (deref (kv/purge handle "config.gone") 5000 ::timeout)
+                 (let [ks (deref (kv/keys handle) 5000 ::timeout)]
+                   (is (vector? ks) "keys resolves to a fully-realized vector")
+                   (is (= #{"user.alpha" "config.delta"} (set ks))
+                       "keys enumerates the live keys; deleted and purged keys are excluded"))
+                 (is (= ["user.alpha"] (deref (kv/keys handle "user.>") 5000 ::timeout))
+                     "a subject-style filter restricts keys to the matching live keys")
+                 (is (= [] (deref (kv/keys handle "missing.>") 5000 ::timeout))
+                     "a filter matching nothing resolves to []"))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "user.alpha" {:v 1})
+                                                      (p/then (fn [_] (kv/put handle "user.beta" {:v 2})))
+                                                      (p/then (fn [_] (kv/put handle "config.delta" {:v 3})))
+                                                      (p/then (fn [_] (kv/delete handle "user.beta")))
+                                                      (p/then (fn [_] (kv/put handle "config.gone" {:v 4})))
+                                                      (p/then (fn [_] (kv/purge handle "config.gone")))
+                                                      (p/then (fn [_] (kv/keys handle)))
+                                                      (p/then (fn [ks]
+                                                                (is (vector? ks) "keys resolves to a fully-realized vector")
+                                                                (is (= #{"user.alpha" "config.delta"} (set ks))
+                                                                    "keys enumerates the live keys; deleted and purged keys are excluded")
+                                                                (kv/keys handle "user.>")))
+                                                      (p/then (fn [ks]
+                                                                (is (= ["user.alpha"] ks)
+                                                                    "a subject-style filter restricts keys to the matching live keys")
+                                                                (kv/keys handle "missing.>")))
+                                                      (p/then (fn [ks]
+                                                                (is (= [] ks) "a filter matching nothing resolves to []"))))))))))))))))))
+
 ;; ─────────────────────────────── Watch ────────────────────────────────
 
 ;; Deep-module unit (ADR 0015), no server: the watch :deliver seam — ONE closed

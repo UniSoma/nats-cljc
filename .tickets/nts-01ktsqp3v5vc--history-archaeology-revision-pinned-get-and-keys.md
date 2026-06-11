@@ -1,12 +1,12 @@
 ---
 id: nts-01ktsqp3v5vc
 title: 'History archaeology: revision-pinned get and keys'
-status: open
+status: in_progress
 type: feature
 priority: 1
 mode: afk
 created: '2026-06-10T21:40:47.072394769Z'
-updated: '2026-06-10T21:40:47.072394769Z'
+updated: '2026-06-11T00:32:41.277318902Z'
 parent: nts-01ktsner23xc
 tags:
 - kv

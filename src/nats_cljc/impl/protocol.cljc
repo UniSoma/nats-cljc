@@ -319,14 +319,25 @@
      to the new Revision as a bare number and rejects with
      `:type :wrong-revision` carrying the contested `:key` when the expected
      Revision is stale (ADR 0023).")
-  (-kv-get [bucket key]
-    "Read the latest entry for `key`, returning a native promise of a RAW entry
-     map `{:bucket :key :bytes :revision :created :operation}` — `:bytes` the
+  (-kv-get [bucket key revision]
+    "Read an entry for `key`, returning a native promise of a RAW entry map
+     `{:bucket :key :bytes :revision :created :operation}` — `:bytes` the
      undecoded wire value, `:created` the canonical ISO-8601 timestamp string,
-     `:operation` the keyword form of the entry's KV operation — or nil when the
-     key reads as absent: never written, deleted, or purged (ADR 0023). The leg
-     whose native get surfaces tombstones normalizes them to nil here, so absence
-     is one portable contract.")
+     `:operation` the keyword form of the entry's KV operation. `revision` nil is
+     the latest read: it resolves nil when the key reads as absent — never
+     written, deleted, or purged (ADR 0023); the leg whose native get surfaces
+     tombstones normalizes them to nil here, so absence is one portable contract.
+     A non-nil `revision` is the pinned read at that exact Revision: a
+     delete/purge marker DELIVERS as a raw entry with its `:operation` visible —
+     the leg whose native hides markers on a pinned read reconstructs them from
+     the stream substrate here — while a Revision the Bucket never assigned, or
+     one belonging to another key, resolves nil.")
+  (-kv-keys [bucket filter]
+    "Enumerate the LIVE keys in the Bucket — deleted and purged keys excluded —
+     returning a native promise of a fully-realized vector of key strings (the
+     stream-names precedent). `filter` is an optional subject-style filter
+     string restricting the result (nil for every key); a filter matching
+     nothing resolves to [].")
   (-kv-delete [bucket key revision]
     "Write a Tombstone for `key` — the key subsequently reads as absent while its
      history is retained — returning a native promise that resolves to nil.

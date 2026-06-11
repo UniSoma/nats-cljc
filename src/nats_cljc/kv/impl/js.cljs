@@ -186,6 +186,20 @@
    :created   (.toISOString (js/Date. (.-created e)))
    :operation (operation->kw (.-operation e))})
 
+(defn- drain-qi
+  "Drain a completing @nats-io/kv QueuedIterator as an async-iterable into the
+   fully-realized vector the portable enumeration contracts pin (`-kv-history`,
+   `-kv-keys`), each item through `lift`. Returns a js/Promise of the vector."
+  [^js qi lift]
+  (let [it (.call (unchecked-get qi (.-asyncIterator js/Symbol)) qi)]
+    (letfn [(step [acc]
+              (.then (.next it)
+                     (fn [^js r]
+                       (if (.-done r)
+                         acc
+                         (step (conj acc (lift (.-value r))))))))]
+      (step []))))
+
 (extend-type JsBucket
   proto/BucketEntries
   (-kv-put [bucket key bytes]
@@ -193,14 +207,24 @@
     ;; resolves with.
     (-> (.put ^js (:kv bucket) key bytes)
         with-kv-error))
-  (-kv-get [bucket key]
-    ;; Unlike jnats, nats.js' get surfaces a tombstoned key as an entry with a
-    ;; DEL/PURGE operation; the portable contract reads it as absent (ADR 0023),
-    ;; so anything that is not a live PUT normalizes to nil here.
-    (-> (.get ^js (:kv bucket) key)
+  (-kv-get [bucket key revision]
+    ;; Latest read: unlike jnats, nats.js' get surfaces a tombstoned key as an
+    ;; entry with a DEL/PURGE operation; the portable contract reads it as
+    ;; absent (ADR 0023), so anything that is not a live PUT normalizes to nil.
+    ;; Pinned read ({revision}): nats.js reads the backing stream's message at
+    ;; that sequence, so a delete/purge marker DELIVERS with its operation
+    ;; visible — exactly the portable contract — while a mismatched key or a
+    ;; Revision the stream never assigned resolves null (verified, not
+    ;; inferred), the same absent-is-nil. The opts object is string-keyed via
+    ;; clj->js, surviving advanced compilation.
+    (-> (if revision
+          (.get ^js (:kv bucket) key (clj->js {:revision revision}))
+          (.get ^js (:kv bucket) key))
         (.then (fn [^js e]
-                 (when (and e (= "PUT" (.-operation e)))
-                   (entry->raw e))))
+                 (cond
+                   (nil? e)                  nil
+                   revision                  (entry->raw e)
+                   (= "PUT" (.-operation e)) (entry->raw e))))
         with-kv-error))
   (-kv-create [bucket key bytes]
     ;; nats.js' create models first-writer-wins as a put expecting revision 0
@@ -242,15 +266,20 @@
     ;; advanced compilation.
     (-> (.history ^js (:kv bucket) (clj->js {:key key}))
         (.then (fn [^js qi]
-                 (let [it (.call (unchecked-get qi (.-asyncIterator js/Symbol)) qi)]
-                   (letfn [(step [acc]
-                             (.then (.next it)
-                                    (fn [^js r]
-                                      (if (.-done r)
-                                        acc
-                                        (step (conj acc (let [^js e (.-value r)]
-                                                          (assoc (entry->raw e) :delta (.-delta e)))))))))]
-                     (step [])))))
+                 (drain-qi qi (fn [^js e]
+                                (assoc (entry->raw e) :delta (.-delta e))))))
+        with-kv-error))
+  (-kv-keys [bucket filter]
+    ;; kv.keys(filter) resolves to a QueuedIterator of LIVE key strings —
+    ;; nats.js drops DEL/PURGE-marked entries natively, matching jnats' keys
+    ;; (verified, not inferred) — completing once caught up (an empty Bucket or
+    ;; a filter matching nothing yields nothing, never an error); the drain
+    ;; accumulates the fully-realized vector the portable contract pins. The
+    ;; unfiltered arity takes nats.js' own every-key default.
+    (-> (if filter
+          (.keys ^js (:kv bucket) filter)
+          (.keys ^js (:kv bucket)))
+        (.then (fn [^js qi] (drain-qi qi identity)))
         with-kv-error)))
 
 ;; The portable :deliver mode → @nats-io/kv's KvWatchInclude string. :latest is
