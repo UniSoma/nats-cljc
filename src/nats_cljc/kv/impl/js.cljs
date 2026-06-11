@@ -256,6 +256,15 @@
           (.purge ^js (:kv bucket) key))
         (.then (fn [_] nil))
         (with-cas-error key)))
+  (-kv-purge-deletes [bucket]
+    ;; kv.purgeDeletes(olderMillis) resolves a PurgeResponse (pinned to nil here
+    ;; — jnats' is void, so nil is the portable resolution); its default
+    ;; olderMillis keeps markers younger than a 30-minute grace, so the explicit
+    ;; 0 pins the portable remove-all-now contract — every Tombstoned key's
+    ;; history goes, marker included, regardless of age.
+    (-> (.purgeDeletes ^js (:kv bucket) 0)
+        (.then (fn [_] nil))
+        with-kv-error))
   (-kv-history [bucket key]
     ;; kv.history({key}) resolves to a QueuedIterator that completes once caught
     ;; up (an absent key yields nothing, never an error); the drain accumulates

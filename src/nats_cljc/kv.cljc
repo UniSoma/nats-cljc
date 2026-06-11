@@ -259,6 +259,18 @@
        (impl/then (fn [_] (bucket/validate-key key)))
        (impl/bind (fn [_] (proto/-kv-purge handle key (:revision opts)))))))
 
+(defn purge-deletes
+  "Remove every Tombstoned key's retained history from the Bucket `handle` —
+   marker included, regardless of the marker's age — returning a platform-native
+   promise that resolves to nil: the Bucket-wide janitor reclaiming the space
+   its deleted keys still hold, where the per-key `purge` targets one key (ADR
+   0023). Live keys keep their Entries untouched, and a Bucket with no
+   Tombstones is a safe no-op. Both natives default to a 30-minute grace before
+   a marker qualifies; the portable contract overrides it to none on both legs,
+   so removal is immediate and deterministic."
+  [handle]
+  (proto/-kv-purge-deletes handle))
+
 (defn- watch-entry
   "Lift a raw watch delivery into the portable Entry the Handler receives: the
    `history` shape — a live Entry's `:value` decoded through the Bucket's one

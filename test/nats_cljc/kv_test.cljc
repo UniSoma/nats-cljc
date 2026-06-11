@@ -913,6 +913,59 @@
                                                                 (is (nil? (:value (first entries)))
                                                                     "the purge marker carries :value nil"))))))))))))))))))
 
+;; purge-deletes is the Bucket-wide janitor (ADR 0023): it resolves to nil and
+;; removes every Tombstoned key's retained history — marker included, regardless
+;; of the marker's age — while live keys keep their Entries untouched, so a
+;; long-lived Bucket reclaims the space its deleted keys still hold.
+(deftest purge-deletes-removes-tombstoned-history-bucket-wide
+  (let [bucket "TRACER_KV_PURGE_DELETES"]
+    #?(:clj
+       (with-conn {:servers [server-url]}
+         (fn [conn]
+           (let [ctx    (deref (kv/kv conn) 5000 ::timeout)
+                 handle (deref (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5}) 5000 ::timeout)]
+             (with-bucket ctx bucket
+               (fn []
+                 (deref (kv/put handle "gone.k" {:v 1}) 5000 ::timeout)
+                 (deref (kv/delete handle "gone.k") 5000 ::timeout)
+                 (deref (kv/put handle "live.k" {:v 2}) 5000 ::timeout)
+                 (is (nil? (deref (kv/purge-deletes handle) 5000 ::timeout))
+                     "purge-deletes resolves to nil")
+                 (is (= [] (deref (kv/history handle "gone.k") 5000 ::timeout))
+                     "a Tombstoned key's history is removed, marker included")
+                 (is (= {:v 2} (:value (deref (kv/get handle "live.k") 5000 ::timeout)))
+                     "a live key's Entry survives untouched")
+                 (is (= ["live.k"] (deref (kv/keys handle) 5000 ::timeout))
+                     "only the live key remains enumerable"))))))
+       :cljs
+       (async done
+              (with-conn {:servers [server-url]} done
+                (fn [conn]
+                  (-> (kv/kv conn)
+                      (p/then (fn [ctx]
+                                (-> (kv/create-bucket ctx {:bucket bucket :storage :memory :history 5})
+                                    (p/then (fn [handle]
+                                              (with-bucket ctx bucket
+                                                (fn []
+                                                  (-> (kv/put handle "gone.k" {:v 1})
+                                                      (p/then (fn [_] (kv/delete handle "gone.k")))
+                                                      (p/then (fn [_] (kv/put handle "live.k" {:v 2})))
+                                                      (p/then (fn [_] (kv/purge-deletes handle)))
+                                                      (p/then (fn [r]
+                                                                (is (nil? r) "purge-deletes resolves to nil")
+                                                                (kv/history handle "gone.k")))
+                                                      (p/then (fn [entries]
+                                                                (is (= [] entries)
+                                                                    "a Tombstoned key's history is removed, marker included")
+                                                                (kv/get handle "live.k")))
+                                                      (p/then (fn [entry]
+                                                                (is (= {:v 2} (:value entry))
+                                                                    "a live key's Entry survives untouched")
+                                                                (kv/keys handle)))
+                                                      (p/then (fn [ks]
+                                                                (is (= ["live.k"] ks)
+                                                                    "only the live key remains enumerable"))))))))))))))))))
+
 ;; The destructive verbs take the optional :revision guard (ADR 0023): a stale
 ;; guard rejects with :wrong-revision carrying the :key — operators only remove
 ;; what they believe they are removing — while a current guard goes through and

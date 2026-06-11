@@ -19,7 +19,7 @@
             [nats-cljc.kv.impl.error :as kv-err])
   (:import [nats_cljc.impl.jvm JvmConnection]
            [io.nats.client Connection JetStreamApiException JetStreamManagement KeyValue KeyValueManagement]
-           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry KeyValueStatus KeyValueWatcher KeyValueWatchOption MessageInfo StorageType]
+           [io.nats.client.api ServerInfo KeyValueConfiguration KeyValueEntry KeyValuePurgeOptions KeyValueStatus KeyValueWatcher KeyValueWatchOption MessageInfo StorageType]
            [io.nats.client.support NatsKeyValueUtil]
            [io.nats.client.impl NatsKeyValueWatchSubscription]
            [java.io IOException]
@@ -343,6 +343,17 @@
                            (.purge ^KeyValue (:kv bucket) ^String key (long revision))
                            (.purge ^KeyValue (:kv bucket) ^String key))
                          nil)))
+  (-kv-purge-deletes [bucket]
+    ;; jnats' purgeDeletes is void; its no-arg form keeps markers younger than a
+    ;; 30-minute grace, so the explicit deleteMarkersNoThreshold options object
+    ;; pins the portable remove-all-now contract — every Tombstoned key's
+    ;; history goes, marker included, regardless of age.
+    (off-thread (:io-executor bucket)
+                #(do (.purgeDeletes ^KeyValue (:kv bucket)
+                                    (-> (KeyValuePurgeOptions/builder)
+                                        (.deleteMarkersNoThreshold)
+                                        (.build)))
+                     nil)))
   (-kv-history [bucket key]
     ;; jnats' history hands back the full List<KeyValueEntry> oldest-to-newest
     ;; in one call (an absent key is an empty list, never an error); the lift is

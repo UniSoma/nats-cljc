@@ -350,6 +350,12 @@
      native promise that resolves to nil. `revision` is the optional guard (nil
      for unguarded), rejecting with `:type :wrong-revision` carrying the
      contested `:key` when stale (ADR 0023).")
+  (-kv-purge-deletes [bucket]
+    "Remove every Tombstoned key's retained history from the Bucket — marker
+     included, regardless of the marker's age (the natives' default 30-minute
+     grace is overridden to none on both legs) — returning a native promise
+     that resolves to nil. Live keys keep their Entries untouched; a Bucket
+     with no Tombstones is a safe no-op.")
   (-kv-history [bucket key]
     "Read the retained history of `key`, returning a native promise of a
      fully-realized vector of RAW entry maps oldest-to-newest —
