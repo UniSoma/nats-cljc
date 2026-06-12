@@ -16,6 +16,15 @@
    :ns-regexp "-test$"
    :compiler-options {:output-feature-set :es-unsupported}}
 
+  ;; Examples Node target (examples/ — natsbyexample ports). The examples
+  ;; classpath comes from deps.edn's :examples alias, added per-invocation
+  ;; (`npx shadow-cljs -A:examples compile examples`, wrapped by
+  ;; `bb example:node <name>`) so the test/CI builds never see examples/.
+  :examples
+  {:target    :node-script
+   :main      examples.main/-main
+   :output-to "target/examples.js"}
+
   ;; Externs gate: an :advanced compile (alongside :core-bundle-check below). nats-cljc
   ;; ships as source, so the optimizing compile happens in each CONSUMER's build —
   ;; this repo's :none test compiles (node/browser) never run externs inference.

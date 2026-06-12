@@ -23,6 +23,17 @@
   {:doc "Local legs: JVM + Node (browser is CI-only, ADR 0010)."
    :depends [test:jvm test:node]}
 
+  example:jvm
+  {:doc "Run one example on the JVM leg — bb example:jvm messaging.pub-sub [args...]"
+   :task (let [[name & args] *command-line-args*]
+           (apply shell "clojure" "-M:examples" "-m" (str "examples." name) args))}
+
+  example:node
+  {:doc "Run one example on the Node leg — bb example:node messaging.pub-sub [args...] (compiles the shadow :examples build first)."
+   :task (let [[name & args] *command-line-args*]
+           (shell "npx shadow-cljs -A:examples:silence-unsafe compile examples")
+           (apply shell "node" "target/examples.js" name args))}
+
   lint
   {:doc "Lint src + test with clj-kondo."
    :task (shell "clj-kondo --lint src test")}
