@@ -263,10 +263,14 @@
   (-kv-purge-deletes [bucket]
     ;; kv.purgeDeletes(olderMillis) resolves a PurgeResponse (pinned to nil here
     ;; — jnats' is void, so nil is the portable resolution); its default
-    ;; olderMillis keeps markers younger than a 30-minute grace, so the explicit
-    ;; 0 pins the portable remove-all-now contract — every Tombstoned key's
-    ;; history goes, marker included, regardless of age.
-    (-> (.purgeDeletes ^js (:kv bucket) 0)
+    ;; olderMillis keeps markers younger than a 30-minute grace. nats.js keeps
+    ;; any marker with created >= Date.now() - olderMillis, so 0 still spares a
+    ;; marker stamped in the same millisecond as the comparison; the negative
+    ;; value pushes the cutoff 10 minutes into the future — jnats'
+    ;; deleteMarkersNoThreshold does the same internally — pinning the portable
+    ;; remove-all-now contract: every Tombstoned key's history goes, marker
+    ;; included, regardless of age.
+    (-> (.purgeDeletes ^js (:kv bucket) -600000)
         (.then (fn [_] nil))
         with-kv-error))
   (-kv-history [bucket key]
