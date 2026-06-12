@@ -1,12 +1,12 @@
 ---
 id: nts-01ktwvf42qxj
 title: 'README: add JetStream section'
-status: open
+status: in_progress
 type: chore
 priority: 4
 mode: afk
 created: '2026-06-12T02:44:35.536041522Z'
-updated: '2026-06-12T02:44:35.536041522Z'
+updated: '2026-06-12T02:55:03.677165907Z'
 tags:
 - docs
 links:

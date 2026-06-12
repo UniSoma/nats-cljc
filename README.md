@@ -209,6 +209,34 @@ The returned promise is a native `js/Promise`, so on CLJS you can use the langua
     (js/console.log (clj->js (:data reply)))))
 ```
 
+## JetStream (`nats-cljc.jetstream`)
+
+A portable facade over JetStream, the NATS persistence layer: **Streams** store published messages, **Consumers** replay them with acknowledged, at-least-once delivery. Everything flows through one context that holds both the data plane and the management plane, and obtaining it verifies JetStream is enabled — `(jet/jetstream conn)` rejects with `:jetstream-not-enabled` at the handle, never deferred to the first operation ([ADR 0017](./docs/adr/0017-jetstream-context-single-async-handle-verified-at-entry.md)).
+
+```clojure
+(require '[nats-cljc.jetstream :as jet])
+
+(p/let [ctx (jet/jetstream conn)                                  ; verified at entry
+        _   (jet/create-stream ctx {:name "ORDERS" :subjects ["orders.>"]})
+        _   (jet/create-consumer ctx "ORDERS" {:name "mailer" :ack-policy :explicit})
+        ack (jet/publish ctx "orders.created" {:id 42} {:msg-id "order-42"})
+        sub (jet/consume ctx "ORDERS" "mailer"
+              (fn [msg]
+                (process! (:data msg))
+                (jet/ack conn msg)))]                             ; sugar over core publish
+  (println "stored:" (:stream ack) (:seq ack)))                   ;=> stored: ORDERS 1
+```
+
+- **Streams and Consumers are closed data maps** — `create-stream`/`update-stream`/`stream-info`/`purge-stream`/`delete-stream`/`list-streams`, and create-only Consumer creation: durable by default, `{:durable? false}` for a server-named ephemeral ([ADR 0021](./docs/adr/0021-consumer-creation-contract.md)). An unrecognized key rejects pre-flight with a validation `:unknown-config-key` (ADR 0015); a config the *server* rejects is an operational `:jetstream-api-error` carrying `{:code :description}` ([ADR 0020](./docs/adr/0020-jetstream-error-model-extension.md)).
+- **Acked publish** — `publish` resolves to the PubAck `{:stream :seq :duplicate :domain}`. `:msg-id` gives server-side dedup (`:duplicate` true on a retry); `:expect` makes optimistic-concurrency assertions whose mismatch rejects with `:wrong-last-sequence`.
+- **Pull triad** — `next` (one message, or nil when the Consumer is empty), `fetch` (a bounded batch), `consume` (continuous delivery; the handle drains and unsubscribes exactly like a core Subscription). A delivered message is a plain map `{:subject :data :js}` with its JetStream metadata — stream sequence, delivery count, the ack subject — under `:js`. `consume` reuses the [promise-return handler](#backpressure-without-coreasync): a returned promise gates the next delivery *and* the refill, so the client's read rate gates its own pull rate — and there is no `:slow-consumer` in pull, unrequested messages simply wait on the server ([ADR 0018](./docs/adr/0018-jetstream-pull-reuses-the-promise-return-handler.md)).
+- **Acks are sugar over publish** — `ack`/`nak`/`term`/`working` publish the protocol payload (`+ACK`, `-NAK`, …) to the message's ack subject, byte-identical on both legs, synchronous and idempotent; `double-ack` is the request-shaped sibling that resolves true once the server confirms ([ADR 0019](./docs/adr/0019-jetstream-acks-are-sugar-over-publish.md)).
+- **Ordered consumer** — `ordered-consumer` for single-client, gap-free replay: a server-managed ephemeral taking no acknowledgements, auto-recreated should a sequence gap appear, plugging into the same triad via handle-first arities (`(jet/next handle)`, …).
+- **Direct get** — `get-message` reads a stored message straight from the Stream by `:seq` or `:last-by-subject` — no Consumer, nothing to ack; no match rejects with `:no-message-found`.
+- **Per-consume errors** — consume-time side-band conditions (`:heartbeats-missed`, `:consumer-deleted`, `:exceeded-limits`) reach the per-consume `:on-error` only, exactly like core's `:slow-consumer` row; terminal ones also end the consume (ADR 0020).
+
+On ClojureScript, `@nats-io/jetstream` is version-pinned and installed automatically alongside the core client — unconditionally, because JetStream is the other half of the NATS product, not a third-party add-on ([ADR 0016](./docs/adr/0016-jetstream-is-an-unconditional-nats-family-dependency.md)) — and a bundle that never requires `nats-cljc.jetstream` still ships zero JetStream bytes.
+
 ## KV (`nats-cljc.kv`)
 
 A portable facade over NATS Key/Value — the last-value registry built on JetStream. It speaks KV vocabulary throughout, never the stream substrate ([ADR 0023](./docs/adr/0023-kv-speaks-kv-vocabulary-not-its-stream-substrate.md)): Buckets and Revisions, `:bucket-not-found` rather than `:stream-not-found`, `:wrong-revision` rather than `:wrong-last-sequence`.
