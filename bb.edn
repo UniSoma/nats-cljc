@@ -34,6 +34,23 @@
            (shell "npx shadow-cljs -A:examples:silence-unsafe compile examples")
            (apply shell "node" "target/examples.js" name args))}
 
+  example:all
+  {:doc "Run every example on both legs, stopping at the first failure — JVM first (incl. the blocking JVM-only one, last), then Node compiled once. Names come from the examples.main dispatcher map, the canonical list."
+   :requires ([clojure.string :as str])
+   :task (let [key-re (re-pattern "^\\s*\\{?\"([a-z0-9.-]+)\"\\s")
+               names  (->> (slurp "examples/examples/main.cljs")
+                           str/split-lines
+                           (keep (fn [line] (second (re-find key-re line)))))]
+           (println "== JVM leg ==")
+           (doseq [n (concat names ["blocking.iterating-subscriptions"])]
+             (println "--" n)
+             (shell "clojure" "-M:examples" "-m" (str "examples." n)))
+           (println "== Node leg ==")
+           (shell "npx shadow-cljs -A:examples:silence-unsafe compile examples")
+           (doseq [n names]
+             (println "--" n)
+             (shell "node" "target/examples.js" n)))}
+
   lint
   {:doc "Lint src + test with clj-kondo."
    :task (shell "clj-kondo --lint src test")}
