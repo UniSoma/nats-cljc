@@ -44,6 +44,21 @@ node target/node-tests.js
 
 Node exercises the full CLJS path — facade, codec, and `nats-cljc.impl.js` over `@nats-io/nats-core` `wsconnect` — which is byte-for-byte the code the browser runs (ADR 0003). That's why local Node coverage is enough and we don't provision a browser locally.
 
+## Running a subset (inner loop only)
+
+Both legs can run selected test namespaces — useful while iterating on one area. **Before commit the rule is unchanged: the full suite on both legs.** A selective run proves your area works, not that you didn't break a neighbor; and a change to the shared plumbing (`nats-cljc.impl.*`, the protocols, `codec`, `test_support`) feeds every suite, so "affected" is everything anyway.
+
+```bash
+# JVM — the cognitect runner takes a namespace list:
+clojure -X:test :nses '[nats-cljc.service-test]'
+
+# Node — override the build's :ns-regexp per invocation:
+npx shadow-cljs -A:silence-unsafe compile node --config-merge '{:ns-regexp "service-test$"}'
+node target/node-tests.js
+```
+
+The JVM invocation still pays ~8–10s of JVM boot; the warm nREPL (`clojure-repl-evaluation.md`) is faster for the tightest loop — but after editing anything that defines a protocol or record, `require` with `:reload-all`, not `:reload`, or stale protocol instances produce bogus "No implementation of method" failures.
+
 ## Browser (CI only)
 
 The `:karma` target (headless Chrome over `ws://`) runs in CI, not locally — see ADR 0010 for the rationale. The commands the CI job runs are in `.github/workflows/ci.yml`.
