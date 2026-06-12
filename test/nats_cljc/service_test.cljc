@@ -461,7 +461,7 @@
                      (is (= 2 (count @entries)) "both handler invocations were recorded")
                      (is (>= (- e2 e1) floor-ms)
                          "the 2nd handler did not enter until the 1st's awaited promise settled (serial delivery)"))
-                   (let [st (first (deref (service/stats conn {:name "gate_svc"}) 10000 ::timeout))
+                   (let [st (first (deref (service/stats conn {:name "gate_svc" :max-results 1}) 10000 ::timeout))
                          ep (first (:endpoints st))]
                      (is (>= (:processing-time-ns ep) floor-ns)
                          ":processing-time-ns reflects the awaited handler duration, not the synchronous callback time"))))))))
@@ -483,7 +483,7 @@
                                             b (nats/request conn "tracer.svc.gate" {} {:timeout-ms 10000})]
                                         (p/let [_  a
                                                 _  b
-                                                ss (service/stats conn {:name "gate_svc"})]
+                                                ss (service/stats conn {:name "gate_svc" :max-results 1})]
                                           (let [[e1 e2] @entries
                                                 ep (first (:endpoints (first ss)))]
                                             (is (= 2 (count @entries)) "both handler invocations were recorded")
@@ -728,7 +728,9 @@
   (let [config {:name "disc_shape" :version "2.3.4" :description "shape probe"
                 :endpoints [{:name "echo" :subject "disc.shape.echo"
                              :handler (fn [_] :placeholder)}]}
-        opts   {:name "disc_shape"}
+        ;; :max-results 1 stops each gather at the one expected reply instead of
+        ;; waiting out the full default 5s fan-out window (15s for the triple).
+        opts   {:name "disc_shape" :max-results 1}
         ;; The portable assertions on the three results, identical on both legs.
         check  (fn [p i s]
                  (is (= 1 (count p)) "ping narrows to the one Service of that name")
@@ -785,7 +787,7 @@
                   :endpoints [{:name "echo" :subject "disc.meta.echo"
                                :metadata {:visibility "public"}
                                :handler (fn [_] :placeholder)}]}
-        opts     {:name "disc_meta"}
+        opts     {:name "disc_meta" :max-results 1}
         svc-meta {"region" "eu" "tier" "gold"}
         check    (fn [p i s]
                    (is (= svc-meta (:metadata (first p)))
@@ -837,11 +839,11 @@
            (let [svc (deref (service/create conn config) 5000 ::timeout)]
              (with-service svc
                (fn []
-                 (let [pn (deref (service/ping conn {:name "disc_narrow"}) 10000 ::timeout)
+                 (let [pn (deref (service/ping conn {:name "disc_narrow" :max-results 1}) 10000 ::timeout)
                        id (:id (first pn))]
                    (check pn
-                          (deref (service/ping conn {:name "disc_narrow" :id id}) 10000 ::timeout)
-                          (deref (service/ping conn {:name "disc_narrow" :id "no-such-id"}) 10000 ::timeout))))))))
+                          (deref (service/ping conn {:name "disc_narrow" :id id :max-results 1}) 10000 ::timeout)
+                          (deref (service/ping conn {:name "disc_narrow" :id "no-such-id" :timeout-ms 500}) 10000 ::timeout))))))))
        :cljs
        (async done
               (with-conn {:servers [server-url]} done
@@ -850,10 +852,10 @@
                       (p/then (fn [svc]
                                 (with-service svc
                                   (fn []
-                                    (p/let [pn (service/ping conn {:name "disc_narrow"})
+                                    (p/let [pn (service/ping conn {:name "disc_narrow" :max-results 1})
                                             id (:id (first pn))
-                                            pi (service/ping conn {:name "disc_narrow" :id id})
-                                            pw (service/ping conn {:name "disc_narrow" :id "no-such-id"})]
+                                            pi (service/ping conn {:name "disc_narrow" :id id :max-results 1})
+                                            pw (service/ping conn {:name "disc_narrow" :id "no-such-id" :timeout-ms 500})]
                                       (check pn pi pw))))))
                       (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
 
@@ -881,7 +883,7 @@
                (fn []
                  (with-service svc-b
                    (fn []
-                     (let [both (deref (service/ping conn {:name "disc_idonly"}) 10000 ::timeout)
+                     (let [both (deref (service/ping conn {:name "disc_idonly" :max-results 2}) 10000 ::timeout)
                            id   (:id (first both))]
                        (check both
                               (deref (service/ping conn (opts id)) 10000 ::timeout))))))))))
@@ -895,7 +897,7 @@
                           (fn []
                             (with-service svc-b
                               (fn []
-                                (p/let [both     (service/ping conn {:name "disc_idonly"})
+                                (p/let [both     (service/ping conn {:name "disc_idonly" :max-results 2})
                                         narrowed (service/ping conn (opts (:id (first both))))]
                                   (check both narrowed)))))))
                       (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
@@ -1014,7 +1016,7 @@
                (fn []
                  (doseq [s ["disc.cnt.ok" "disc.cnt.rerr" "disc.cnt.boom"]]
                    (deref (nats/request conn s {} {:timeout-ms 5000}) 5000 ::timeout))
-                 (let [st (first (deref (service/stats conn {:name "disc_counters"}) 10000 ::timeout))
+                 (let [st (first (deref (service/stats conn {:name "disc_counters" :max-results 1}) 10000 ::timeout))
                        by (into {} (map (juxt :name identity) (:endpoints st)))]
                    (check by)))))))
        :cljs
@@ -1035,7 +1037,7 @@
                                       (p/let [_  (nats/request conn "disc.cnt.ok" {} {:timeout-ms 5000})
                                               _  (nats/request conn "disc.cnt.rerr" {} {:timeout-ms 5000})
                                               _  (nats/request conn "disc.cnt.boom" {} {:timeout-ms 5000})
-                                              ss (service/stats conn {:name "disc_counters"})]
+                                              ss (service/stats conn {:name "disc_counters" :max-results 1})]
                                         (check (into {} (map (juxt :name identity) (:endpoints (first ss))))))))))
                         (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e))))))))))))
 
@@ -1053,9 +1055,9 @@
            (let [svc (deref (service/create conn config) 5000 ::timeout)]
              (with-service svc
                (fn []
-                 (check (deref (service/ping conn {:name "disc_zero"}) 10000 ::timeout)
-                        (deref (service/info conn {:name "disc_zero"}) 10000 ::timeout)
-                        (deref (service/stats conn {:name "disc_zero"}) 10000 ::timeout)))))))
+                 (check (deref (service/ping conn {:name "disc_zero" :max-results 1}) 10000 ::timeout)
+                        (deref (service/info conn {:name "disc_zero" :max-results 1}) 10000 ::timeout)
+                        (deref (service/stats conn {:name "disc_zero" :max-results 1}) 10000 ::timeout)))))))
        :cljs
        (async done
               (with-conn {:servers [server-url]} done
@@ -1064,9 +1066,9 @@
                       (p/then (fn [svc]
                                 (with-service svc
                                   (fn []
-                                    (p/let [p (service/ping conn {:name "disc_zero"})
-                                            i (service/info conn {:name "disc_zero"})
-                                            s (service/stats conn {:name "disc_zero"})]
+                                    (p/let [p (service/ping conn {:name "disc_zero" :max-results 1})
+                                            i (service/info conn {:name "disc_zero" :max-results 1})
+                                            s (service/stats conn {:name "disc_zero" :max-results 1})]
                                       (check p i s))))))
                       (p/catch (fn [e] (is false (str "discovery rejected unexpectedly: " e)))))))))))
 
