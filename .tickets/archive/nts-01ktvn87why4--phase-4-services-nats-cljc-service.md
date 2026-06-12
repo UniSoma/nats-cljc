@@ -1,12 +1,13 @@
 ---
 id: nts-01ktvn87why4
 title: 'Phase 4: services (nats-cljc.service)'
-status: open
+status: closed
 type: epic
 priority: 2
 mode: afk
 created: '2026-06-11T15:36:44.177203849Z'
-updated: '2026-06-11T19:16:56.408461582Z'
+updated: '2026-06-12T02:06:19.016215Z'
+closed: '2026-06-12T02:06:19.016215Z'
 tags:
 - services
 - prd
@@ -109,3 +110,7 @@ Add `nats-cljc.service`: a portable facade over the services framework in both w
 **2026-06-11T18:59:34.215717466Z**
 
 All 9 implementation slices shipped and closed (commits bf78bfb..0c2042a on main, unpushed). nats-cljc.service is complete: create/respond/respond-error/error, validation pre-flights (:invalid-version, :duplicate-endpoint), stop+drain+:stopped, ping/info/stats discovery, codec bind+override, ADR-0007 serial delivery. Node serialization gate resolved by driving the endpoint async iterator (nats.js 3.4.0 does NOT await the callback — verified red-before-green); recorded in ADR 0007. 0.5.0 release prepped locally (README/CHANGELOG/version/glossary). Epic stays OPEN pending the manual Clojars deploy: git tag v0.5.0 && git push --tags && clojure -T:build jar && clojure -T:build deploy. Follow-up debt noted: docs/cljdoc.edn ADR sidebar stale past 0015 (pre-existing) — worth its own docs ticket.
+
+**2026-06-12T02:06:19.016215Z**
+
+All 9 implementation slices plus 7 follow-up tickets shipped. nats-cljc.service is complete on JVM + Node: create/respond/respond-error/error, validation pre-flights, stop+drain+:stopped, ping/info/stats discovery, codec bind+override, ADR-0007 serial delivery (ADRs 0024-0026). Release 0.5.0 tagged, pushed, and deployed to Clojars; full suite green on both legs at the release point. Known follow-up debt: docs/cljdoc.edn ADR sidebar stale past 0015 (pre-existing, separate docs ticket).
