@@ -1,12 +1,13 @@
 ---
 id: nts-01ktwsa68gvy
 title: Replace cljdoc ADR sidebar list with a single ADR index entry
-status: in_progress
+status: closed
 type: chore
 priority: 4
 mode: afk
 created: '2026-06-12T02:06:56.784715588Z'
-updated: '2026-06-12T02:45:27.591234890Z'
+updated: '2026-06-12T02:48:52.184041799Z'
+closed: '2026-06-12T02:48:52.184041799Z'
 tags:
 - docs
 links:
@@ -24,3 +25,9 @@ Decided (grilling session 2026-06-12):
 - No ADR for this decision (trivially reversible); rationale lives in the cljdoc.edn header comment.
 - README's 'Design docs' section already links docs/adr/ — GitHub renders the new index there automatically, no README change needed.
 - Verify the cljdoc config renders.
+
+## Notes
+
+**2026-06-12T02:48:52.184041799Z**
+
+Replaced the stale per-ADR cljdoc sidebar list with a single 'Design decisions' entry publishing docs/adr/README.md, a flat numeric index of all 26 ADRs (0005/0010 omission retired — index links resolve to GitHub blob URLs, so ADR content is GitHub-only now). Added adr-index-test (JVM .clj, version-test pattern) asserting every docs/adr/NNNN-*.md appears in the index; verified red on a dummy ADR before green. cljdoc.edn parses, all four :file entries and all 26 index links resolve. Full suites green on JVM (237 tests) and Node (206). Shipped in 1556d57. Follow-up split out: nts-01ktwvf42qxj (README JetStream section).
