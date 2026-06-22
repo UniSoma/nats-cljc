@@ -21,9 +21,9 @@
    :extra-deps  {io.github.cognitect-labs/test-runner
                  {:git/tag "v0.5.1"
                   :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}
-                 funcool/promesa          {:mvn/version "11.0.678"}
+                 funcool/promesa           {:mvn/version "11.0.678"}
                  com.cognitect/transit-clj {:mvn/version "1.1.357"}
-                 org.clojure/data.json    {:mvn/version "2.5.2"}}
+                 org.clojure/data.json     {:mvn/version "2.5.2"}}
    :main-opts   ["-m" "cognitect.test-runner"]
    :exec-fn     cognitect.test-runner.api/test}
 
@@ -33,9 +33,9 @@
    ;; transit-cljs backs the opt-in `:transit` codec on cljs (it pulls the
    ;; com.cognitect/transit-js classpath JS transitively). data.json is JVM-only
    ;; — the `:json` codec uses ambient js/JSON on cljs. Both test-scoped.
-   :extra-deps  {org.clojure/clojurescript {:mvn/version "1.12.145"}
-                 thheller/shadow-cljs      {:mvn/version "3.4.11"}
-                 funcool/promesa           {:mvn/version "11.0.678"}
+   :extra-deps  {org.clojure/clojurescript  {:mvn/version "1.12.145"}
+                 thheller/shadow-cljs       {:mvn/version "3.4.11"}
+                 funcool/promesa            {:mvn/version "11.0.678"}
                  com.cognitect/transit-cljs {:mvn/version "0.8.280"}}}
 
   ;; Opt-in JVM flag for shadow-cljs runs (the bb test:node / test:browser tasks

@@ -2,7 +2,8 @@
   "Node entry point for the examples: `node target/examples.js <name> [args...]`,
    where <name> is the example ns minus the `examples.` prefix, e.g.
    `messaging.pub-sub`. The JVM-only blocking example is deliberately absent."
-  (:require [examples.messaging.pub-sub :as pub-sub]
+  (:require [promesa.core :as p]
+            [examples.messaging.pub-sub :as pub-sub]
             [examples.messaging.request-reply :as request-reply]
             [examples.messaging.json-payloads :as json-payloads]
             [examples.jetstream.limits-stream :as limits-stream]
@@ -29,7 +30,14 @@
 
 (defn -main [& [name & args]]
   (if-let [run (get examples name)]
-    (apply run args)
+    ;; Each example's -main returns a promesa promise. promesa's cljs promises are
+    ;; its own PromiseImpl, not native js/Promise — so a rejection nobody awaits is
+    ;; invisible to Node's unhandledRejection detector and a failed example would
+    ;; otherwise exit 0 silently. Attach a terminal catch so any failure is loud.
+    (-> (p/do (apply run args))
+        (p/catch (fn [e]
+                   (js/console.error (str "Example " name " failed:") e)
+                   (set! (.-exitCode js/process) 1))))
     (do (println (if name (str "Unknown example: " name) "Usage: node target/examples.js <name> [args...]"))
         (println "Available:")
         (doseq [k (sort (keys examples))] (println " " k))
