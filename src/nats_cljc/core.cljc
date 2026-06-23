@@ -20,11 +20,63 @@
   "0.5.0")
 
 (defn connect
-  "Open a connection to the NATS server(s) in `:servers`, returning a
-   platform-native promise (CompletableFuture on the JVM, js/Promise on
-   ClojureScript) that resolves to a Connection. The connection's default codec
-   is `:codec` (default `:edn`). Transport is fixed per platform: TCP on the JVM,
-   WebSocket on ClojureScript (ADR 0001)."
+  "Open a connection to a NATS server and return a platform-native promise
+   (CompletableFuture on the JVM, js/Promise on ClojureScript) that resolves to a
+   Connection — the value every publish/subscribe/request flows through. Transport
+   is fixed per platform: TCP on the JVM, WebSocket on ClojureScript, so `:servers`
+   URLs use the matching scheme (ADR 0001).
+
+   `opts` is a map; every key is optional except `:servers`:
+
+   - `:servers` — vector of server URL strings: `[\"nats://127.0.0.1:4222\"]` on the
+     JVM, `[\"ws://127.0.0.1:8080\"]` on ClojureScript. A bare string is accepted and
+     normalized to a one-element vector.
+   - `:codec` — the connection's default codec keyword: encodes published data and
+     decodes deliveries. Built-ins `:edn` (default), `:json`, `:transit`; any op
+     takes a per-call `:codec` override (ADR 0011). An unresolvable codec rejects
+     this promise.
+   - `:name` — string label for the connection, shown in server monitoring.
+   - `:auth` — credentials map selecting exactly one auth method by its
+     discriminating key (omit for an anonymous connection); see the table below.
+   - `:reconnect` — map `{:max <int> :wait-ms <ms> :jitter-ms <ms>}` tuning
+     automatic reconnection. `:max` is the attempt count with two sentinels — `0`
+     disables reconnection, `-1` is unlimited; `:wait-ms` is the per-attempt delay
+     and `:jitter-ms` its random spread. Any absent key keeps the underlying
+     client's own default, and those differ (JVM 60 attempts, Node/browser 10), so
+     omitting `:max` is NOT identical across platforms. A `:max` outside
+     `[-1, 2147483647]` throws `:type :invalid-max`.
+   - `:on-status` — 1-arg fn receiving connection-lifecycle Status events as bare
+     `{:type ...}` maps. Canonical `:type`s: `:connected`, `:disconnected`,
+     `:reconnecting`, `:reconnected`, `:closed`, `:error`, `:lame-duck`,
+     `:servers-changed`; the `:error` event carries the offending Error under
+     `:error`. React to each `:type` as an edge, not a counter — cadence differs
+     per platform.
+
+   The `:auth` map selects one method by its discriminating key:
+
+   | `:auth` map | Method |
+   | --- | --- |
+   | `{:token \"...\"}` | token auth |
+   | `{:user \"...\" :pass \"...\"}` | user/password auth |
+   | `{:nkey \"...\" :seed \"...\"}` | nkey auth — `:seed` signs server nonces; a `:nkey` that does not match its `:seed` rejects with `:auth-invalid` |
+   | `{:jwt \"...\" :seed \"...\"}` | JWT auth — user JWT plus the nkey `:seed` that signs |
+   | `{:creds \"...\"}` | the CONTENTS of a NATS credentials (.creds) file as a string (not a path) |
+
+   Rejects with `:type :connect-failed` when the server-side connect fails, or
+   `:type :auth-invalid` when client-side credential validation fails before any
+   dial. CONTEXT.md (Connection, Reconnect, Status event) and ADR 0001/0002 are
+   supplemental rationale, not required to call this.
+
+   Example (JVM; on ClojureScript await the promise instead of deref):
+
+   ```clojure
+   @(connect {:servers   [\"nats://127.0.0.1:4222\"]
+              :codec     :json
+              :name      \"orders-service\"
+              :auth      {:creds (slurp \"app.creds\")}
+              :reconnect {:max -1 :wait-ms 250}
+              :on-status #(println :status (:type %))})
+   ```"
   [opts]
   ;; Resolve the default codec once here (ADR 0011) and store the resolved
   ;; `Prepared` on the connection, so steady-state encode/decode never deref the

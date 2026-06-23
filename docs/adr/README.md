@@ -28,3 +28,4 @@ Every architecture decision and the trade-off behind it, in chronological order.
 - [0024 · Service has no context and verifies nothing at entry](0024-service-has-no-context-and-verifies-nothing-at-entry.md)
 - [0025 · Service application errors are reply payloads, not normalized Errors](0025-service-application-errors-are-reply-payloads-not-normalized-errors.md)
 - [0026 · Services joins the unconditional NATS family (3.4.0 floor)](0026-services-joins-the-unconditional-nats-family.md)
+- [0027 · Public docstrings are self-contained](0027-docstrings-are-self-contained.md)
