@@ -64,6 +64,9 @@ source-vs-cljdoc tradeoff to manage.
 
 ## Consequences
 
+- The authoring checklist that operationalizes this ADR lives at
+  [docs/agents/writing-docstrings.md](../agents/writing-docstrings.md). Reach for
+  that when writing a docstring; this ADR records the decision behind it.
 - The standard governs the **entire** public surface (`nats.core`, `jetstream`,
   `kv`, `service`, `codec`); docstrings that predate it and fall short are out of
   spec, to be brought into line as follow-up work rather than in one sweep.

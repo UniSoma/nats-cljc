@@ -6,7 +6,7 @@ type: task
 priority: 2
 mode: hitl
 created: '2026-06-23T19:34:15.646097214Z'
-updated: '2026-06-23T19:43:13.601760279Z'
+updated: '2026-06-23T23:05:52.850540385Z'
 tags:
 - docs
 - examples
@@ -36,3 +36,7 @@ Done when: every public var in the listed namespaces satisfies the checklist; cl
 **2026-06-23T19:43:13.601760279Z**
 
 Formatting requirement added to ADR 0027 (verified by rendering connect through cljdoc's flexmark+metagetta pipeline): docstrings are Markdown on cljdoc. The audit must produce cljdoc-correct formatting, not just self-contained content — no space-aligned columns (use Markdown tables for complex option maps, e.g. connect's :auth, or prose bullet lists), code examples in fenced ```clojure blocks (not indentation-only, which collapses below cljdoc's 4-space threshold), backtick all args/keywords, and [[ns/var]] wikilinks for sibling-var references. connect's docstring is the corrected role model.
+
+**2026-06-23T23:05:52.850540385Z**
+
+Authoring checklist for this audit now lives at docs/agents/writing-docstrings.md — it operationalizes ADR 0027 (self-containment: purpose, every option key, return shape, failure behavior, example) plus the cljdoc Markdown rules and Clojure Style Guide conventions. Use it as the per-var rubric when auditing.

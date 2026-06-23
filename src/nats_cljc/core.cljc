@@ -22,7 +22,7 @@
 (defn connect
   "Open a connection to a NATS server and return a platform-native promise
    (CompletableFuture on the JVM, js/Promise on ClojureScript) that resolves to a
-   Connection — the value every publish/subscribe/request flows through. Transport
+   Connection — the value every [[publish]]/[[subscribe]]/[[request]] flows through. Transport
    is fixed per platform: TCP on the JVM, WebSocket on ClojureScript, so `:servers`
    URLs use the matching scheme (ADR 0001).
 
