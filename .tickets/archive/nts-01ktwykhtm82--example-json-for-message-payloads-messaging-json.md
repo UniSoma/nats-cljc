@@ -6,7 +6,7 @@ type: task
 priority: 2
 mode: hitl
 created: '2026-06-12T03:39:26.420166887Z'
-updated: '2026-06-23T18:47:55.197118524Z'
+updated: '2026-06-23T19:33:24.782613555Z'
 closed: '2026-06-23T18:47:55.197118524Z'
 parent: nts-01ktwyk19r7p
 tags:
@@ -50,3 +50,13 @@ win: the codec seam collapses upstream's manual Marshal/Unmarshal to a plain pub
 **2026-06-23T18:47:55.197118524Z**
 
 Ported messaging.json-payloads to nats-cljc; runs on both legs (JVM + Node), exact-ordered output 10/10 JVM + 6/6 Node, clj-kondo clean. Two labeled blocks: strict-path (:json codec auto-decode, bad payload -> :on-error :codec-error, dropped per ADR 0006) and salvage-path (:bytes + inline codec/decode :json, catch -> raw bytes->str fallback, the upstream Deno/Rust/Python move). Paths sequenced with a single (p/delay 200) between them — keeps the two dispatcher threads from interleaving and lets the strict :on-error print before salvage starts; salvage trails into run-example's connection drain. See the two retained notes for the shipped shape and the drain/flush mechanism findings (incl. a sub-drain gap candidate).
+
+**2026-06-23T19:33:24.782613555Z**
+
+Finding #1 drain — Mode 2 + severity VERIFIED via probe (both legs, ci/nats.conf), probes reverted. Slow handler (200ms), publish 5, drain conn once handler#1 in-flight.
+
+MODE 2 (buffered-message fate): NOT discarded. On Node the detached consume loop keeps draining nats.js's CLIENT-SIDE iterator buffer after drain() resolves — final started=5/completed=5 — even when close() is called immediately after drain. So no delivery loss to the handler. Mode 2 = (a), not (b). The fix is NOT 'drain the loop queue'.
+
+MODE 1 confirmed on Node: drain() resolves EARLY (snapshot at drain-resolve: started=1 completed=0) — does NOT await the in-flight handler. JVM drain IS a barrier (drain-resolve: started=5 completed=5).
+
+SEVERITY (the real defect, sharper than the original framing): a handler that USES the connection in its async tail (publish a reply, ack) has that work SILENTLY DROPPED on Node. Second probe: responder publishes to a sink observed on a separate conn. Node sink=0 (both with and without close, deterministic x3); JVM sink=5. Mechanism: handler tail runs after drain has closed/is draining the conn → publish is best-effort → nil (ADR 0014). So it's not message-delivery loss; it's the loss of conn-dependent side effects of in-flight handlers — exactly the graceful-shutdown guarantee drain exists to provide. Strong case for FIX over document (Q3).
