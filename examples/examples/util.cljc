@@ -25,9 +25,9 @@
    cljs it returns the promise and lets Node's event loop drain it (the
    examples.main dispatcher awaits it and reports a rejection). flush runs only on
    the success path — a body that rejects goes straight to drain via p/finally."
-  ([body] (run-example {:servers [default-url]} body))
+  ([body] (run-example {} body))
   ([conn-opts body]
-    (-> (p/let [conn (nats.core/connect conn-opts)]
+    (-> (p/let [conn (nats.core/connect (merge {:servers [default-url]} conn-opts))]
           (-> (p/do (body conn))
             (p/then (fn [_] (nats.core/flush conn)))
             (p/finally (fn [_ _] (nats.core/drain conn)))))
