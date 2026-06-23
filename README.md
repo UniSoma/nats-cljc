@@ -51,6 +51,8 @@ One-shot operations return the **platform-native promise** — a `js/Promise` on
   funcool/promesa {:mvn/version "11.0.678"}
   ```
   then use `p/let` / `p/catch` as shown throughout this README.
+
+  > **ClojureScript caveat:** a promesa chain whose rejection nobody observes fails *silently* — promesa's CLJS promise is its own type, not a native `js/Promise`, so Node's `unhandledRejection` never fires and the process exits `0` (a bare native rejection *would* surface). Terminate every top-level promesa chain with `p/catch`, or hand it to an awaiting boundary.
 - **ClojureScript only — native `await`** (1.12.145+), on the very same value — see [below](#clojurescript-only-native-await).
 - **JVM only — `deref`.** `@(nats/connect …)` blocks for the result; or use the [blocking convenience layer](#jvm-only-blocking-convenience-layer) for synchronous ergonomics throughout.
 
