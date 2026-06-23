@@ -6,9 +6,11 @@ type: epic
 priority: 2
 mode: hitl
 created: '2026-06-12T03:39:09.496708442Z'
-updated: '2026-06-12T03:39:35.715376054Z'
+updated: '2026-06-23T19:34:15.646097214Z'
 tags:
 - examples
+links:
+- nts-01kvtzksb69t
 ---
 
 ## Description
