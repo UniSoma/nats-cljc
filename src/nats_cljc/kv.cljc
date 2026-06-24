@@ -14,13 +14,13 @@
    `get`, `update`, and `keys` shadow clojure.core — the jetstream `next`
    precedent: the namespace-aliased call is the public name."
   (:refer-clojure :exclude [get update keys])
-  (:require [nats-cljc.codec :as codec]
-            [nats-cljc.impl.protocol :as proto]
-            [nats-cljc.kv.impl.bucket :as bucket]
-            #?(:clj  [nats-cljc.impl.jvm :as impl]
+  (:require #?(:clj  [nats-cljc.impl.jvm :as impl]
                :cljs [nats-cljc.impl.js :as impl])
-            #?(:clj  [nats-cljc.kv.impl.jvm]
-               :cljs [nats-cljc.kv.impl.js])))
+    #?(:clj  [nats-cljc.kv.impl.jvm]
+       :cljs [nats-cljc.kv.impl.js])
+    [nats-cljc.codec :as codec]
+    [nats-cljc.impl.protocol :as proto]
+    [nats-cljc.kv.impl.bucket :as bucket]))
 
 (defn kv
   "Obtain the KV context for `conn`, returning a platform-native promise
@@ -61,68 +61,96 @@
    handle — the value every entry operation takes, binding the Bucket's one
    Codec: the connection's default, unless `opts` carries a `:codec` override
    (a registry keyword or `ICodec` instance), which then governs all reads and
-   writes through this handle (per-Bucket only — no per-op override). Config
-   keys: `:bucket` (required, the Bucket's name), `:description`, `:history`
-   (revisions kept per key), `:ttl-ms` (integer milliseconds), `:max-value-size`,
-   `:max-bucket-size` (bytes), `:storage` (`:file` | `:memory`), `:replicas`, and
-   `:compression?`. The map is closed: an unrecognized key rejects the promise
+   writes through this handle (per-Bucket only — no per-op override).
+
+   - `ctx` — a KV context from [[kv]].
+   - `config` — map described below.
+   - `opts` (optional map): `:codec` is a registry keyword or `ICodec`, default
+     `conn`'s codec; it binds the returned Bucket handle.
+
+   `config` keys:
+
+   | key                | type             | default  | effect                                            |
+   |--------------------|------------------|----------|---------------------------------------------------|
+   | `:bucket`          | string           | required | the Bucket's name.                                |
+   | `:description`     | string           | none     | human-readable label.                             |
+   | `:history`         | int              | server   | revisions kept per key.                           |
+   | `:ttl-ms`          | int (ms)         | none     | per-entry time-to-live in milliseconds.           |
+   | `:max-value-size`  | int (bytes)      | none     | largest single value allowed.                     |
+   | `:max-bucket-size` | int (bytes)      | none     | largest total Bucket size allowed.                |
+   | `:storage`         | `:file` `:memory`| `:file`  | backing storage tier.                             |
+   | `:replicas`        | int              | `1`      | replica count.                                    |
+   | `:compression?`    | boolean          | `false`  | enable storage compression.                       |
+
+   The map is closed: an unrecognized key rejects the promise
    with a validation `:type :unknown-config-key`, an omitted `:bucket` with
-   `:missing-required-key`, and a malformed Bucket name with `:invalid-name`, all
-   pre-flight before any native call (ADR 0015). A config the SERVER rejects
-   surfaces as an operational `:type :jetstream-api-error` carrying
-   `{:code :description}` (ADR 0020)."
+   `:missing-required-key`, a malformed Bucket name with `:invalid-name`, or an
+   unresolvable `opts :codec` with `:codec-error`, all pre-flight before any native
+   call (ADR 0015). A config the SERVER rejects surfaces as an operational `:type
+   :jetstream-api-error` carrying `{:code :description}` (ADR 0020)."
   ([ctx config] (create-bucket ctx config {}))
   ([ctx config opts]
-   (-> (impl/resolved nil)
-       (impl/then (fn [_]
-                    (bucket/validate-config config)
-                    (codec-override opts)))
-       (impl/bind (fn [override]
-                    (impl/then (proto/-create-bucket ctx config)
-                               #(bind-codec % override)))))))
+    (-> (impl/resolved nil)
+      (impl/then (fn [_]
+                   (bucket/validate-config config)
+                   (codec-override opts)))
+      (impl/bind (fn [override]
+                   (impl/then (proto/-create-bucket ctx config)
+                     #(bind-codec % override)))))))
 
 (defn open-bucket
-  "Open the existing Bucket named `bucket` on the KV context `ctx`, returning a
-   platform-native promise that resolves to a Bucket handle (see `create-bucket`
-   — including the `opts` `:codec` override the handle binds in place of the
-   connection default). Opening VERIFIES the Bucket exists, so the promise
-   rejects with an operational `:type :bucket-not-found` when it does not (ADR
-   0023) — at the handle, never deferred to the first entry operation — and
-   pre-flight with a validation `:type :invalid-name` when `bucket` is malformed
-   (ADR 0015)."
+  "Open the existing Bucket named `bucket` on KV context `ctx`.
+
+   - `ctx` — a KV context from [[kv]].
+   - `bucket` — Bucket name string.
+   - `opts` (optional map): `:codec` is a registry keyword or `ICodec`, default
+     `conn`'s codec; it binds the returned Bucket handle.
+
+   Returns a platform-native promise that resolves to a Bucket handle. Opening
+   verifies the Bucket exists, so the promise rejects with operational `:type
+   :bucket-not-found` when it does not (ADR 0023), pre-flight validation `:type
+   :invalid-name` when `bucket` is malformed, or `:codec-error` when `opts :codec`
+   cannot resolve (ADR 0015)."
   ([ctx bucket] (open-bucket ctx bucket {}))
   ([ctx bucket opts]
-   (-> (impl/resolved nil)
-       (impl/then (fn [_]
-                    (bucket/validate-name bucket)
-                    (codec-override opts)))
-       (impl/bind (fn [override]
-                    (impl/then (proto/-open-bucket ctx bucket)
-                               #(bind-codec % override)))))))
+    (-> (impl/resolved nil)
+      (impl/then (fn [_]
+                   (bucket/validate-name bucket)
+                   (codec-override opts)))
+      (impl/bind (fn [override]
+                   (impl/then (proto/-open-bucket ctx bucket)
+                     #(bind-codec % override)))))))
 
 (defn delete-bucket
-  "Delete the Bucket named `bucket` on the KV context `ctx` — decommissioning the
-   Bucket and every entry in it — returning a platform-native promise that
-   resolves to nil once it is gone. The promise rejects with an operational
-   `:type :bucket-not-found` when no such Bucket exists (ADR 0023), and
-   pre-flight with a validation `:type :invalid-name` when `bucket` is malformed
-   (ADR 0015)."
+  "Delete the Bucket named `bucket` on KV context `ctx`.
+
+   `ctx` is a KV context from [[kv]] and `bucket` is a Bucket name string. Returns
+   a platform-native promise that resolves to nil once the Bucket and every entry
+   in it are gone. The promise rejects with operational `:type :bucket-not-found`
+   when no such Bucket exists (ADR 0023), and pre-flight validation `:type
+   :invalid-name` when `bucket` is malformed (ADR 0015)."
   [ctx bucket]
   (-> (impl/resolved nil)
-      (impl/then (fn [_] (bucket/validate-name bucket)))
-      (impl/bind (fn [_] (proto/-delete-bucket ctx bucket)))))
+    (impl/then (fn [_] (bucket/validate-name bucket)))
+    (impl/bind (fn [_] (proto/-delete-bucket ctx bucket)))))
 
 (defn bucket-names
-  "Enumerate the Buckets on the KV context `ctx`, returning a platform-native
-   promise that resolves to a vector of Bucket name strings — the KV twin of
-   `stream-names`, fully realized rather than paged."
+  "Enumerate Bucket names on KV context `ctx`.
+
+   `ctx` is a KV context from [[kv]]. Returns a platform-native promise resolving
+   to a fully realized vector of Bucket name strings. The promise rejects with
+   operational `:type :jetstream-api-error` carrying `{:code :description}` when
+   the server-side listing fails (ADR 0020)."
   [ctx]
   (proto/-bucket-names ctx))
 
 (defn list-buckets
-  "Enumerate the Buckets on the KV context `ctx`, returning a platform-native
-   promise that resolves to a vector of normalized status maps (see
-   `bucket-status`), one per Bucket — the KV twin of `list-streams`."
+  "Enumerate Buckets on KV context `ctx`.
+
+   `ctx` is a KV context from [[kv]]. Returns a platform-native promise resolving
+   to a vector of normalized status maps, each shaped like [[bucket-status]]. The
+   promise rejects with operational `:type :jetstream-api-error` carrying `{:code
+   :description}` when the server-side listing fails (ADR 0020)."
   [ctx]
   (proto/-list-buckets ctx))
 
@@ -139,8 +167,8 @@
    when `bucket` is malformed (ADR 0015)."
   [ctx bucket]
   (-> (impl/resolved nil)
-      (impl/then (fn [_] (bucket/validate-name bucket)))
-      (impl/bind (fn [_] (proto/-bucket-status ctx bucket)))))
+    (impl/then (fn [_] (bucket/validate-name bucket)))
+    (impl/bind (fn [_] (proto/-bucket-status ctx bucket)))))
 
 (defn put
   "Write `value` under `key` in the Bucket `handle`, encoded through the Bucket's
@@ -149,13 +177,16 @@
    follow-up compare-and-set. The promise rejects pre-flight with a validation
    `:type :invalid-key` (carrying `:key`) when `key` is malformed, before any
    wire call (ADR 0015), and with `:type :codec-error` when the value does not
-   encode (ADR 0006)."
+   encode (ADR 0006). A server-side write rejection (e.g. the encoded value
+   exceeds the Bucket's `:max-value-size` / `:max-bucket-size`) surfaces as an
+   operational `:type :jetstream-api-error` carrying `{:code :description}` (ADR
+   0020); if the Bucket no longer exists, `:type :bucket-not-found` (ADR 0023)."
   [handle key value]
   (-> (impl/resolved nil)
-      (impl/then (fn [_]
-                   (bucket/validate-key key)
-                   (codec/encode (:codec handle) value)))
-      (impl/bind (fn [bytes] (proto/-kv-put handle key bytes)))))
+    (impl/then (fn [_]
+                 (bucket/validate-key key)
+                 (codec/encode (:codec handle) value)))
+    (impl/bind (fn [bytes] (proto/-kv-put handle key bytes)))))
 
 (defn create
   "Write `value` under `key` in the Bucket `handle` only when the key is ABSENT
@@ -170,10 +201,10 @@
    (ADR 0006)."
   [handle key value]
   (-> (impl/resolved nil)
-      (impl/then (fn [_]
-                   (bucket/validate-key key)
-                   (codec/encode (:codec handle) value)))
-      (impl/bind (fn [bytes] (proto/-kv-create handle key bytes)))))
+    (impl/then (fn [_]
+                 (bucket/validate-key key)
+                 (codec/encode (:codec handle) value)))
+    (impl/bind (fn [bytes] (proto/-kv-create handle key bytes)))))
 
 (defn update
   "Write `value` under `key` in the Bucket `handle` only when `revision` is
@@ -188,10 +219,10 @@
    when the value does not encode (ADR 0006)."
   [handle key value revision]
   (-> (impl/resolved nil)
-      (impl/then (fn [_]
-                   (bucket/validate-key key)
-                   (codec/encode (:codec handle) value)))
-      (impl/bind (fn [bytes] (proto/-kv-update handle key bytes revision)))))
+    (impl/then (fn [_]
+                 (bucket/validate-key key)
+                 (codec/encode (:codec handle) value)))
+    (impl/bind (fn [bytes] (proto/-kv-update handle key bytes revision)))))
 
 (defn get
   "Read the latest Entry for `key` from the Bucket `handle`, returning a
@@ -202,72 +233,92 @@
    branch on with if-let, not an Error, and a STORED nil stays distinguishable as
    `{:value nil ...}` (ADR 0023).
 
-   `opts` may carry `:revision`, pinning the read to that exact past Revision —
-   cheap archaeology on the Bucket. A pinned read does NOT hide markers: pinned
-   to a delete/purge marker Revision it delivers the marker Entry, its
-   `:operation` (`:delete` / `:purge`) visible and `:value` nil undecoded
-   (identical on both legs — normalized, since the natives diverge here); a
-   Revision the Bucket never assigned, or one belonging to another key, resolves
-   to nil.
+   `opts` (optional map):
+
+   | key         | type | default | effect |
+   |-------------|------|---------|--------|
+   | `:revision` | int  | latest  | Pin the read to that exact past Revision. |
+
+   A pinned read does NOT hide markers: pinned to a delete/purge marker Revision it
+   delivers the marker Entry, its `:operation` (`:delete` / `:purge`) visible and
+   `:value` nil undecoded (identical on both legs — normalized, since the natives
+   diverge here); a Revision the Bucket never assigned, or one belonging to another
+   key, resolves to nil.
 
    The promise rejects pre-flight with a validation `:type :invalid-key`
    (carrying `:key`) when `key` is malformed, before any wire call (ADR 0015),
-   and with `:type :codec-error` when the stored bytes do not decode (ADR 0006)."
+   and with `:type :codec-error` when the stored bytes do not decode (ADR 0006).
+   If the Bucket no longer exists, rejects with an operational
+   `:type :bucket-not-found` (ADR 0023)."
   ([handle key] (get handle key {}))
   ([handle key opts]
-   (-> (impl/resolved nil)
-       (impl/then (fn [_] (bucket/validate-key key)))
-       (impl/bind (fn [_] (proto/-kv-get handle key (:revision opts))))
-       (impl/then (fn [raw]
-                    (when raw
-                      {:bucket    (:bucket raw)
-                       :key       (:key raw)
-                       :value     (when (= :put (:operation raw))
-                                    (codec/decode (:codec handle) (:bytes raw)))
-                       :revision  (:revision raw)
-                       :created   (:created raw)
-                       :operation (:operation raw)}))))))
+    (-> (impl/resolved nil)
+      (impl/then (fn [_] (bucket/validate-key key)))
+      (impl/bind (fn [_] (proto/-kv-get handle key (:revision opts))))
+      (impl/then (fn [raw]
+                   (when raw
+                     {:bucket    (:bucket raw)
+                      :key       (:key raw)
+                      :value     (when (= :put (:operation raw))
+                                   (codec/decode (:codec handle) (:bytes raw)))
+                      :revision  (:revision raw)
+                      :created   (:created raw)
+                      :operation (:operation raw)}))))))
 
 (defn delete
-  "Write a Tombstone for `key` in the Bucket `handle`, returning a
-   platform-native promise that resolves to nil: the key subsequently reads as
-   absent via `get`, while `history` retains the Tombstone — so deletion stays
-   observable to history readers and watchers (ADR 0023). `opts` may carry the
-   optional `:revision` guard: when present the Tombstone lands only if it is
-   still the key's latest Revision, and a stale guard rejects with the
-   operational `:type :wrong-revision` carrying the contested `:key` — operators
-   only remove what they believe they are removing. The promise also rejects
-   pre-flight with a validation `:type :invalid-key` (carrying `:key`) when
-   `key` is malformed (ADR 0015)."
+  "Write a Tombstone for `key` in Bucket `handle`.
+
+   Returns a platform-native promise that resolves to nil. The key subsequently
+   reads as absent via [[get]], while [[history]] retains the Tombstone (ADR 0023).
+
+   `opts` (optional map):
+
+   | key         | type | default | effect |
+   |-------------|------|---------|--------|
+   | `:revision` | int  | none    | Only delete if this is still the key's latest Revision. |
+
+   A stale revision guard rejects with operational `:type :wrong-revision`
+   carrying `:key`. The promise also rejects pre-flight with validation `:type
+   :invalid-key` carrying `:key` when `key` is malformed (ADR 0015)."
   ([handle key] (delete handle key {}))
   ([handle key opts]
-   (-> (impl/resolved nil)
-       (impl/then (fn [_] (bucket/validate-key key)))
-       (impl/bind (fn [_] (proto/-kv-delete handle key (:revision opts)))))))
+    (-> (impl/resolved nil)
+      (impl/then (fn [_] (bucket/validate-key key)))
+      (impl/bind (fn [_] (proto/-kv-delete handle key (:revision opts)))))))
 
 (defn purge
-  "Erase the history of `key` in the Bucket `handle` down to a single purge
-   marker — reclaiming space for good, where `delete` keeps history readable —
-   returning a platform-native promise that resolves to nil (ADR 0023). `opts`
-   may carry the optional `:revision` guard, exactly as on `delete`: a stale
-   guard rejects with the operational `:type :wrong-revision` carrying the
-   contested `:key`. The promise also rejects pre-flight with a validation
-   `:type :invalid-key` (carrying `:key`) when `key` is malformed (ADR 0015)."
+  "Erase `key`'s history in Bucket `handle` down to a single purge marker.
+
+   Returns a platform-native promise that resolves to nil, reclaiming space where
+   [[delete]] keeps history readable (ADR 0023).
+
+   `opts` (optional map):
+
+   | key         | type | default | effect |
+   |-------------|------|---------|--------|
+   | `:revision` | int  | none    | Only purge if this is still the key's latest Revision. |
+
+   A stale revision guard rejects with operational `:type :wrong-revision`
+   carrying `:key`. The promise also rejects pre-flight with validation `:type
+   :invalid-key` carrying `:key` when `key` is malformed (ADR 0015)."
   ([handle key] (purge handle key {}))
   ([handle key opts]
-   (-> (impl/resolved nil)
-       (impl/then (fn [_] (bucket/validate-key key)))
-       (impl/bind (fn [_] (proto/-kv-purge handle key (:revision opts)))))))
+    (-> (impl/resolved nil)
+      (impl/then (fn [_] (bucket/validate-key key)))
+      (impl/bind (fn [_] (proto/-kv-purge handle key (:revision opts)))))))
 
 (defn purge-deletes
-  "Remove every Tombstoned key's retained history from the Bucket `handle` —
-   marker included, regardless of the marker's age — returning a platform-native
-   promise that resolves to nil: the Bucket-wide janitor reclaiming the space
-   its deleted keys still hold, where the per-key `purge` targets one key (ADR
-   0023). Live keys keep their Entries untouched, and a Bucket with no
-   Tombstones is a safe no-op. Both natives default to a 30-minute grace before
-   a marker qualifies; the portable contract overrides it to none on both legs,
-   so removal is immediate and deterministic."
+  "Remove every Tombstoned key's retained history from Bucket `handle`.
+
+   `handle` is a Bucket handle from [[create-bucket]] or [[open-bucket]]. Returns a
+   platform-native promise resolving to nil. The marker is removed too, regardless
+   of age. Live keys keep their Entries untouched, and a Bucket with no Tombstones
+   is a safe no-op. Both natives default to a 30-minute grace before a marker
+   qualifies; the portable contract overrides it to none on both legs, so removal
+   is immediate and deterministic (ADR 0023).
+
+   Takes no options. Server-side failures surface as KV/JetStream operational
+   errors, including `:type :bucket-not-found` when the Bucket no longer exists."
   [handle]
   (proto/-kv-purge-deletes handle))
 
@@ -312,46 +363,40 @@
    completes — the \"cache is warm\" signal, so cache builders populate first and
    serve reads after — and which `stop` ends, idempotently.
 
-   `opts` may carry the one CLOSED `:deliver` mode replacing the natives' flag
-   set: `:latest` (the default) replays each key's current value then streams
-   updates, `:history` replays the full retained history first, `:updates`
-   streams only new changes (its `:initialized` resolves immediately — nothing
-   replays). Any other value rejects pre-flight with a validation
-   `:type :invalid-deliver` carrying the offending `:deliver`, before any native
-   call (ADR 0015).
+   `opts` (optional map):
 
-   `:keys` restricts the Watch to one subject-style key pattern (e.g.
-   `\"user.>\"`) or a non-empty vector of patterns, delivering their union —
-   replay and stream alike; without it every key is watched. An EMPTY vector
-   rejects pre-flight with a validation `:type :invalid-keys` carrying the
-   offending `:keys` (ADR 0015) — the union of zero patterns matches nothing,
-   never every key. `:ignore-deletes?` true
-   suppresses Tombstone and purge-marker deliveries (the default delivers them,
-   `:operation` visible) — cache maintainers skip markers, event-log consumers
-   observe them. `:on-error` is this Watch's async-failure sink (ADR 0006/0007,
-   the core-subscription semantics): a decode failure, a throwing `handler`, or
-   a rejecting handler promise reaches it as the bare value when set, else the
-   connection's `:on-status` as an `:error` event — never both — and the Watch
-   survives to deliver the next Entry."
+   | key                | type                             | default   | effect |
+   |--------------------|----------------------------------|-----------|--------|
+   | `:deliver`         | `:latest`/`:history`/`:updates` | `:latest` | Select initial replay: current value per key, full retained history, or only new updates. |
+   | `:keys`            | string or non-empty vector       | all keys  | Subject-style key pattern(s), e.g. `user.>`; the union is watched. |
+   | `:ignore-deletes?` | boolean                          | `false`   | Suppress Tombstone and purge-marker deliveries when true. |
+   | `:on-error`        | 1-arg fn                         | none      | Async-failure sink for decode, throwing handler, or rejected handler promise. |
+
+   Invalid `:deliver` rejects pre-flight with validation `:type :invalid-deliver`
+   carrying `:deliver`. An empty `:keys` vector rejects pre-flight with `:type
+   :invalid-keys` carrying `:keys` (ADR 0015). Async failures reach `:on-error` as
+   the bare value when set, else the connection's `:on-status` as an `:error`
+   event — never both — and the Watch survives to deliver the next Entry."
   ([handle handler] (watch handle handler {}))
   ([handle handler opts]
-   (-> (impl/resolved nil)
-       (impl/then (fn [_]
-                    (bucket/validate-watch-keys (:keys opts))
-                    (bucket/validate-deliver (:deliver opts :latest))))
-       (impl/bind (fn [deliver]
-                    (proto/-kv-watch handle
-                                     {:deliver         deliver
-                                      :keys            (watch-keys (:keys opts))
-                                      :ignore-deletes? (boolean (:ignore-deletes? opts))
-                                      :on-error        (:on-error opts)}
-                                     (fn [raw] (handler (watch-entry handle raw)))))))))
+    (-> (impl/resolved nil)
+      (impl/then (fn [_]
+                   (bucket/validate-watch-keys (:keys opts))
+                   (bucket/validate-deliver (:deliver opts :latest))))
+      (impl/bind (fn [deliver]
+                   (proto/-kv-watch handle
+                     {:deliver         deliver
+                      :keys            (watch-keys (:keys opts))
+                      :ignore-deletes? (boolean (:ignore-deletes? opts))
+                      :on-error        (:on-error opts)}
+                     (fn [raw] (handler (watch-entry handle raw)))))))))
 
 (defn stop
-  "End the Watch behind `watch-handle` (the value `watch` resolved to), ceasing
-   delivery to its Handler. Fire-and-forget — returns nil synchronously — and
-   idempotent: stopping an already-ended Watch is a safe no-op (ADR 0012
-   spirit), so teardown never needs racy liveness guards."
+  "End the Watch behind `watch-handle`.
+
+   `watch-handle` is the value [[watch]] resolved to. Stops delivery to its
+   handler. Returns nil synchronously. Takes no options. Idempotent: stopping an
+   already-ended Watch is a safe no-op (ADR 0012)."
   [watch-handle]
   (proto/-watch-stop watch-handle))
 
@@ -367,30 +412,35 @@
    bounds retained history per the Bucket's `:history`, 64 max per key). The
    promise rejects pre-flight with a validation `:type :invalid-key` (carrying
    `:key`) when `key` is malformed (ADR 0015), and with `:type :codec-error`
-   when a retained value does not decode (ADR 0006)."
+   when a retained value does not decode (ADR 0006). If the Bucket no longer
+   exists, rejects with an operational `:type :bucket-not-found` (ADR 0023)."
   [handle key]
   (-> (impl/resolved nil)
-      (impl/then (fn [_] (bucket/validate-key key)))
-      (impl/bind (fn [_] (proto/-kv-history handle key)))
-      (impl/then (fn [raws]
-                   (mapv (fn [raw]
-                           {:bucket    (:bucket raw)
-                            :key       (:key raw)
-                            :value     (when (= :put (:operation raw))
-                                         (codec/decode (:codec handle) (:bytes raw)))
-                            :revision  (:revision raw)
-                            :created   (:created raw)
-                            :operation (:operation raw)
-                            :delta     (:delta raw)})
-                         raws)))))
+    (impl/then (fn [_] (bucket/validate-key key)))
+    (impl/bind (fn [_] (proto/-kv-history handle key)))
+    (impl/then (fn [raws]
+                 (mapv (fn [raw]
+                         {:bucket    (:bucket raw)
+                          :key       (:key raw)
+                          :value     (when (= :put (:operation raw))
+                                       (codec/decode (:codec handle) (:bytes raw)))
+                          :revision  (:revision raw)
+                          :created   (:created raw)
+                          :operation (:operation raw)
+                          :delta     (:delta raw)})
+                   raws)))))
 
 (defn keys
-  "Enumerate the LIVE keys in the Bucket `handle`, returning a platform-native
-   promise that resolves to a fully-realized vector of key strings — deleted and
-   purged keys excluded, so a Bucket's live contents are enumerable (the
-   stream-names / consumer-names precedent; ADR 0023). `filter` is an optional
-   subject-style filter restricting the result (e.g. `\"user.>\"`); without it
-   every live key enumerates, and a filter matching nothing resolves to []."
+  "Enumerate the live keys in Bucket `handle`.
+
+   `filter` is an optional subject-style string, default nil, restricting the
+   result (e.g. `user.>`). Without it, every live key enumerates. Deleted and
+   purged keys are excluded.
+
+   Returns a platform-native promise resolving to a fully realized vector of key
+   strings; a filter matching nothing resolves to `[]`. Server-side failures
+   surface as KV/JetStream operational errors, including `:type :bucket-not-found`
+   when the Bucket no longer exists (ADR 0023)."
   ([handle] (keys handle nil))
   ([handle filter]
-   (proto/-kv-keys handle filter)))
+    (proto/-kv-keys handle filter)))

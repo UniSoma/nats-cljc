@@ -1,12 +1,13 @@
 ---
 id: nts-01kvtzksb69t
 title: Audit all public docstrings for self-containment (ADR 0027)
-status: open
+status: closed
 type: task
 priority: 2
 mode: hitl
 created: '2026-06-23T19:34:15.646097214Z'
-updated: '2026-06-23T23:05:52.850540385Z'
+updated: '2026-06-24T00:30:15.820074255Z'
+closed: '2026-06-24T00:30:15.820074255Z'
 tags:
 - docs
 - examples
@@ -40,3 +41,7 @@ Formatting requirement added to ADR 0027 (verified by rendering connect through 
 **2026-06-23T23:05:52.850540385Z**
 
 Authoring checklist for this audit now lives at docs/agents/writing-docstrings.md — it operationalizes ADR 0027 (self-containment: purpose, every option key, return shape, failure behavior, example) plus the cljdoc Markdown rules and Clojure Style Guide conventions. Use it as the per-var rubric when auditing.
+
+**2026-06-24T00:30:15.820074255Z**
+
+Audited every public docstring across core/codec/kv/jetstream/service + blocking.core against ADR 0027. core, codec, kv verified fully conformant (no changes needed; two fork-claimed gaps were hallucinations — kv/watch keys and create-bucket :max-bytes — disproven against source). Fixes applied: jetstream fetch/next :expires-ms default corrected 30000 -> native/client default (matches pull/validate-expires + consume) and create-stream example added; service info/stats broken table rows fixed, core/reply|request prose refs -> [[wikilinks]] in respond/respond-error/error/ping, ping bullets -> table; blocking flush/drain/close/subscribe wikilinks + connect/request/subscribe usage examples. clj-kondo clean across src+test. No silent/phantom option keys anywhere.

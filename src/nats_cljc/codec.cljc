@@ -22,15 +22,32 @@
 #?(:cljs (defonce ^:private text-decoder (js/TextDecoder.)))
 
 (defn str->bytes
-  "UTF-8-encode string `s` to wire bytes. The single UTF-8 bridge the built-in
-   codecs and the opt-in `:json`/`:transit` namespaces share; public so a custom
-   `ICodec` can produce honest wire bytes too."
+  "UTF-8-encode the string `s` to wire bytes — the shared UTF-8 bridge a custom
+   [[ICodec]] uses to produce honest wire bytes.
+
+   `s` is a string. Returns the platform-native wire-byte type: a primitive
+   `byte[]` on the JVM, a `js/Uint8Array` on ClojureScript. The inverse is
+   [[bytes->str]].
+
+   Throws if `s` is not a string: a `NullPointerException`/`ClassCastException` on
+   the JVM, a `TypeError` on ClojureScript (the platform encoder rejects it
+   directly — there is no normalized [[encode]] wrapper on this path)."
   [s]
   #?(:clj  (.getBytes ^String s java.nio.charset.StandardCharsets/UTF_8)
      :cljs (.encode text-encoder s)))
 
 (defn bytes->str
-  "UTF-8-decode wire bytes `b` to a string — the inverse of `str->bytes`."
+  "UTF-8-decode wire bytes `b` to a string — the inverse of [[str->bytes]] and the
+   shared decode-side UTF-8 bridge a custom [[ICodec]] can reuse.
+
+   `b` is the platform-native wire-byte type: a primitive `byte[]` on the JVM, a
+   `js/Uint8Array` (a Node `Buffer` is accepted, being a subclass) on ClojureScript.
+   Returns a string.
+
+   Throws if `b` is not the platform's byte type: a `NullPointerException` (for
+   `nil`) / `ClassCastException` (for a non-byte type) on the JVM, a `TypeError` on
+   ClojureScript (the platform decoder rejects it directly — there is no normalized
+   [[decode]] wrapper on this path)."
   [b]
   #?(:clj  (String. ^bytes b java.nio.charset.StandardCharsets/UTF_8)
      :cljs (.decode text-decoder b)))
@@ -48,11 +65,41 @@
      :cljs (instance? js/Uint8Array x)))
 
 (defprotocol ICodec
-  "The codec extension point (ADR 0011): a pair of pure conversions between a
-   Clojure value and wire bytes. Public — the moment a consumer ships a custom
-   codec, these method names are API."
-  (-encode [codec value] "Encode a Clojure value to wire bytes.")
-  (-decode [codec bytes] "Decode wire bytes to a Clojure value."))
+  "The codec extension point: a pair of pure conversions between a Clojure value and
+   wire bytes. Implement it on a record or via `reify` to ship a custom codec, then
+   either pass the instance directly wherever a codec keyword is accepted
+   (connection `:codec`, or a per-call `:codec` on publish/subscribe/request/reply)
+   or [[register!]] it under a keyword.
+
+   Two methods, both required:
+
+   - `(-encode [codec value])` — encode an arbitrary Clojure `value` to wire bytes;
+     return the platform-native byte type (a primitive `byte[]` on the JVM, a
+     `js/Uint8Array` on ClojureScript — use [[str->bytes]] for the UTF-8 bridge).
+   - `(-decode [codec bytes])` — decode wire `bytes` (the platform byte type) back
+     to a Clojure value.
+
+   Implementations need not normalize their own failures: [[encode]]/[[decode]] wrap
+   every method call and re-stamp any thrown exception as `:type :codec-error`
+   (ADR 0006/0011). These method names become public API the moment a consumer ships
+   a custom codec — changing them is a breaking change.
+
+   ```clojure
+   (defrecord UppercaseStringCodec []
+     ICodec
+     (-encode [_ value] (str->bytes (clojure.string/upper-case (str value))))
+     (-decode [_ bytes] (bytes->str bytes)))
+
+   (encode (->UppercaseStringCodec) \"hi\") ;; => wire bytes for \"HI\"
+   ```"
+  (-encode [codec value]
+    "Encode the Clojure `value` to wire bytes (platform-native `byte[]` /
+     `js/Uint8Array`). May throw freely — [[encode]] normalizes the failure to
+     `:type :codec-error`.")
+  (-decode [codec bytes]
+    "Decode wire `bytes` (platform-native `byte[]` / `js/Uint8Array`) to a Clojure
+     value. May throw freely — [[decode]] normalizes the failure to
+     `:type :codec-error`."))
 
 (defrecord ^:no-doc EdnCodec []
   ICodec
@@ -77,7 +124,7 @@
     (if (bytes-value? value)
       value
       (throw (ex-info (str ":bytes codec requires platform bytes, got " (type value))
-                      {:type :codec-error :codec :bytes}))))
+               {:type :codec-error :codec :bytes}))))
   (-decode [_ bytes] bytes))
 
 (defonce ^{:no-doc true :doc "Keyword -> ICodec. Both the built-ins (registered just below)
@@ -87,9 +134,24 @@
   (atom {}))
 
 (defn register!
-  "Register `codec` (an `ICodec`) under keyword `k`. The built-ins register
-   themselves below; opt-in codec namespaces call this at load time, so requiring
-   the namespace is what makes `k` resolvable."
+  "Register `codec` under the keyword `k` so it resolves by keyword in [[encode]],
+   [[decode]], a connection `:codec`, or a per-call `:codec` override (ADR 0011).
+
+   - `k` — the keyword to bind (e.g. `:msgpack`). Binding an existing key
+     overwrites it; the built-ins re-register `:edn`/`:string`/`:bytes` on every
+     load of this namespace.
+   - `codec` — any [[ICodec]] instance.
+
+   Returns `nil`. Mutates a process-global registry; opt-in codec namespaces call
+   this at load time, so `(require '...)` is what makes their keyword resolvable.
+   Throws nothing of its own (the `swap!` cannot fail for an arbitrary `codec`);
+   passing a non-`ICodec` succeeds here and instead surfaces later as a
+   `:type :codec-error` when [[encode]]/[[decode]] invokes the missing method.
+
+   ```clojure
+   (register! :uppercase (->UppercaseStringCodec))
+   (encode :uppercase \"hi\")
+   ```"
   [k codec]
   (swap! registry assoc k codec)
   nil)
@@ -140,12 +202,12 @@
     (instance? Prepared codec) (:impl codec)
     (keyword? codec)
     (or (get @registry codec)
-        (let [ns (opt-in-ns codec)]
-          (throw (ex-info (str "Codec " codec " is not loaded — (require '" ns ")")
-                          {:type :codec-error :codec codec :require ns}))))
+      (let [ns (opt-in-ns codec)]
+        (throw (ex-info (str "Codec " codec " is not loaded — (require '" ns ")")
+                 {:type :codec-error :codec codec :require ns}))))
     (satisfies? ICodec codec) codec
     :else (throw (ex-info (str "Unknown codec: " codec)
-                          {:type :codec-error :codec codec}))))
+                   {:type :codec-error :codec codec}))))
 
 (defn- codec-id
   "A stable, keyword-shaped identifier for `codec` in error ex-data: a `Prepared`
@@ -186,15 +248,41 @@
   (let [id (codec-id codec)]
     (if (= :codec-error (:type (ex-data e)))
       (ex-info (ex-message e)
-               {:type :codec-error :codec id :op op}
-               (ex-cause e))
+        {:type :codec-error :codec id :op op}
+        (ex-cause e))
       (ex-info (str "Codec " (name op) " failed for " id)
-               {:type :codec-error :codec id :op op}
-               e))))
+        {:type :codec-error :codec id :op op}
+        e))))
 
 (defn encode
-  "Encode a Clojure value to wire bytes using `codec` (a keyword or `ICodec`).
-   Any failure surfaces as `ex-info` `:type :codec-error`."
+  "Encode the Clojure `value` to wire bytes using `codec`.
+
+   - `codec` — a registry keyword (`:edn`/`:string`/`:bytes` built-in, or
+     `:json`/`:transit`/a custom key once its namespace is required) or any
+     [[ICodec]] instance.
+   - `value` — the Clojure value to encode; what is acceptable depends on the
+     codec (`:bytes` demands platform-native bytes, `:json`/`:transit` impose their
+     own constraints).
+
+   Returns the platform-native wire-byte type: a primitive `byte[]` on the JVM, a
+   `js/Uint8Array` on ClojureScript. The inverse is [[decode]].
+
+   Throws `ex-info` with `:type :codec-error` for every failure (the only canonical
+   type on this path, ADR 0006/0011), distinguished by `ex-data`:
+
+   - a keyword `codec` that misses the registry → no `:op`; carries `:codec` plus a
+     `:require '<ns>` hint naming the namespace whose `require` would register it
+     (`nats-cljc.codec.<name>` by convention), with an actionable message. The hint
+     is emitted for *any* unresolved keyword, so a typo'd key yields a hint for a
+     namespace that will not resolve. A non-keyword that is not an [[ICodec]] → no
+     `:op`, carries just `:codec`.
+   - a failure inside encoding → `:op :encode` plus the stable `:codec` id (the
+     keyword, or `:custom` for an instance codec). E.g. `(encode :bytes \"x\")`
+     throws because `:bytes` requires platform bytes.
+
+   ```clojure
+   (encode :json {:id 1}) ;; => wire bytes for {\"id\":1}
+   ```"
   [codec value]
   (let [c (resolve-codec codec)]
     (try
@@ -203,8 +291,33 @@
         (throw (->codec-error e codec :encode))))))
 
 (defn decode
-  "Decode wire bytes to a Clojure value using `codec` (a keyword or `ICodec`).
-   Any failure surfaces as `ex-info` `:type :codec-error`."
+  "Decode wire `bytes` to a Clojure value using `codec` — the inverse of [[encode]].
+
+   - `codec` — a registry keyword (`:edn`/`:string`/`:bytes` built-in, or
+     `:json`/`:transit`/a custom key once its namespace is required) or any
+     [[ICodec]] instance.
+   - `bytes` — the platform-native wire-byte type: a primitive `byte[]` on the JVM,
+     a `js/Uint8Array` on ClojureScript.
+
+   Returns the decoded Clojure value (its shape is the codec's: `:edn` reads with
+   clojure.edn / cljs.reader and never `eval`s; `:json` keywordizes keys and is
+   lossy; `:transit` round-trips keywords/sets/symbols).
+
+   Throws `ex-info` with `:type :codec-error` for every failure (the only canonical
+   type on this path, ADR 0006/0011), distinguished by `ex-data`:
+
+   - a keyword `codec` that misses the registry → no `:op`; carries `:codec` plus a
+     `:require '<ns>` hint naming the namespace whose `require` would register it
+     (`nats-cljc.codec.<name>` by convention), with an actionable message. The hint
+     is emitted for *any* unresolved keyword, so a typo'd key yields a hint for a
+     namespace that will not resolve. A non-keyword that is not an [[ICodec]] → no
+     `:op`, carries just `:codec`.
+   - a failure inside decoding (malformed bytes, a reader error) → `:op :decode`
+     plus the stable `:codec` id (the keyword, or `:custom` for an instance codec).
+
+   ```clojure
+   (decode :json (encode :json {:id 1})) ;; => {:id 1}
+   ```"
   [codec bytes]
   (let [c (resolve-codec codec)]
     (try
